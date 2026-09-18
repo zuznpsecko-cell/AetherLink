@@ -154,6 +154,41 @@
       0/0, `assembleDebug` 0/0, `grep -rn "not implemented\|TODO" crates/*/src`
       — пусто (кроме осознанных `#[ignore]` живых тестов).
 
+## Фаза I. Сборка сквозного тракта (VPN работает по-настоящему)
+
+Зависит: A–H (все компоненты готовы и покрыты). Требует прав только G3/D5.
+Цель: байт из приложения → TUN → сервер → цель и обратно, без стабов
+на горячем пути. Каждый шаг — Red → Green → ворота.
+
+- [ ] I1. Mux OPEN-кадры: `MuxManager::seal_open_tcp/seal_open_udp` +
+      `parse_open_{tcp,udp}` (цель узнаётся из кадра, а не из тестовой таблицы).
+      Red: roundtrip seal→parse в `mux/tests/`; Green: реализация поверх
+      `frame::types::Frame::{open_tcp,open_udp}`.
+- [ ] I2. Сервер слушает: `Server::bind(addr)` → `TcpListener`;
+      `serve_forever` (поток на соединение) строит `ServerCtx` из типизированного
+      конфига (`tls::load_cert_key` + `server_config`, `NonceCache`,
+      тело static из `local_static_root`-файла); маршруты учатся из OPEN-кадров
+      через `register_inbound`; релей dial-кэш уже есть в `accept.rs`.
+      Red: `server/tests/bind_serve.rs` — клиент против `bind` на localhost.
+- [ ] I3. Клиентский `up`, хвост транспорта: после шагов платформы —
+      `tls::connect_tls` + `handshake_client` + памп-поток
+      TUN fd ↔ TLS-поток (парсинг `smoltcp_wrapper`, `seal/open` через `MuxManager`).
+      Сокетные TCP-state-машины smoltcp — следующим refinement, начать
+      со stateless отображения пакет↔кадр + DNS-flow.
+- [ ] I4. Ключи сессии в mux тракте сервера: убедиться, что `tunnel_loop`
+      использует ключи именно этого handshake (сейчас так, зафиксировать тестом
+      на два параллельных соединения с разными PSK).
+- [ ] I5. Потоки в FFI: `aether_server_start` поднимает accept-loop в фоне
+      и отдаёт хендл; `stop` — join; `client up/down` — аналогично, без
+      блокировки вызывающего. Red: тесты на старт/стоп/дабл-старт.
+- [ ] I6. Живой E2E под правами (D5/G3 из плана): `up` → `curl` через туннель
+      → `down`; `kill -9` → cleanup → сеть жива; DNS только через туннель;
+      domain-direct: резолв через туннель, коннект напрямую.
+- [ ] I7. E2E-тест без прав как ворота CI: `bind` + handshake + 2 стрима
+      через `serve_connection`-путь (расширение `e2e_tunnel.rs`).
+
+Приёмка фазы I: `curl` через поднятый туннель на реальной паре + I7 зелёный.
+
 ## Карта заглушек → фазы
 
 | Файл | Заглушка | Фаза |

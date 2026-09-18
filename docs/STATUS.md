@@ -24,6 +24,7 @@ _Last Updated: 2026-09-18 (TDD green, fmt/clippy/checks clean)_
 | **Phase 14: Android** | ✅ Done (build) | minSdk 26, APK assembles with 3 ABIs + JNI; on-device test pending |
 | **Phase 15: Deploy Scripts** | ✅ Done | install/uninstall from dist + example configs + checks |
 | **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live runbook pending privs |
+| **Phase I: Assembly (VPN works)** | ⏳ Next | OPEN frames → bind/serve loop → client up tail → FFI threads → live E2E (see PLAN_FINAL_TDD.md) |
 
 ## Detailed Status
 
@@ -76,6 +77,7 @@ _Last Updated: 2026-09-18 (TDD green, fmt/clippy/checks clean)_
 
 ## Next Steps
 
-1. Live run under privileges (PLAN_FINAL_TDD.md D5/G3 checklist)
-2. On-device Android VpnService run
-3. Socket state machines on top of the tested packet pump
+1. Phase I1: mux OPEN frames (`seal_open_*`/`parse_open_*`)
+2. Phase I2: `Server::bind` + serve loop (port 443 goes live)
+3. Phase I3–I5: client up tail, per-connection keys, FFI threads
+4. Phase I6: live E2E under privileges (curl through the tunnel)
