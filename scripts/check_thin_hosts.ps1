@@ -93,7 +93,7 @@ Check "windows deploy mentions wintun" (Has-Text $winDeploy "(wintun|Wintun)")
 Check "windows deploy restores DNS" (Has-Text $winDeploy "(DNS|NRPT)")
 Check "windows uninstall removes state" (Has-Text $winUninstall "ProgramData")
 Check "unit runs published server" (Has-Text $linUnit "AetherLink\.Server")
-Check "unit points at LE wildcard" (Has-Text $linUnit "selmedia\.ru-wildcard")
+Check "unit reads server.yaml" (Has-Text $linUnit "server\.yaml")
 Check "deploy doc covers renewal" (Has-Text $deployDoc "(deploy-hook|renew)")
 
 # --- example configs carry §8 fields ---

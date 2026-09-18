@@ -19,6 +19,16 @@ for cfg in client.example.yaml server.example.yaml; do
 done
 # Copy the example server config to the live path (edit psk/listen before start).
 [ -f "$PREFIX/server.yaml" ] || cp -f "$ROOT/configs/server.example.yaml" "$PREFIX/server.yaml"
+# Resolve absolute TLS paths when provided (LE wildcard or self-signed);
+# otherwise the service would look for ./cert.pem relative to /.
+if [ -n "${TLS_CERT:-}" ] || [ -n "${TLS_KEY:-}" ]; then
+  if [ -z "${TLS_CERT:-}" ] || [ -z "${TLS_KEY:-}" ]; then
+    echo "Set both TLS_CERT and TLS_KEY, or neither." >&2
+    exit 2
+  fi
+  sed -i "s|^\(\s*tls_cert:\).*|\1 \"$TLS_CERT\"|; s|^\(\s*tls_key:\).*|\1 \"$TLS_KEY\"|" \
+    "$PREFIX/server.yaml"
+fi
 
 # systemd unit (installed + reloaded, not started: review server.yaml first).
 install -m 0644 "$ROOT/deploy/linux/aetherlink-server.service" /etc/systemd/system/

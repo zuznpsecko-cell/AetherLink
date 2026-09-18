@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Provision a public-trust wildcard cert for selmedia.ru via Let's Encrypt
-# DNS-01 + Cloudflare API. Idempotent: skips issuance while fresh.
+# Provision a public-trust wildcard cert via Let's Encrypt DNS-01 + Cloudflare API.
+# Idempotent: skips issuance while fresh.
 #
 # Prerequisites (one time, Cloudflare dashboard):
-#   My Profile -> API Tokens -> Create Token -> "Edit zone DNS" template,
-#   zone: selmedia.ru. Save the token, it is shown only once.
+#   My Profile -> API Tokens -> Create Token -> "Edit zone DNS" template
+#   for the zone. Save the token, it is shown only once.
 #
-# Usage: sudo ./scripts/provision_cert_ubuntu.sh
-# Result: /etc/letsencrypt/live/selmedia.ru-wildcard/{fullchain,privkey}.pem
+# Usage: sudo ./scripts/provision_cert_ubuntu.sh [domain]
+#    or: sudo DOMAIN=example.com ./scripts/provision_cert_ubuntu.sh
+# Result: /etc/letsencrypt/live/<domain>-wildcard/{fullchain,privkey}.pem
 set -euo pipefail
 
-DOMAIN="selmedia.ru"
-LINEAGE="selmedia.ru-wildcard"
+DOMAIN="${1:-${DOMAIN:-selmedia.ru}}"
+LINEAGE="$DOMAIN-wildcard"
 CRED="/etc/letsencrypt/cloudflare.ini"
 EMAIL="${EMAIL:-}"
 

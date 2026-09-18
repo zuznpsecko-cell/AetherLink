@@ -12,6 +12,9 @@ function Check($name, $cond) {
 function Has-Text($path, $pattern) {
     ((Get-Content $path) -join "`n") -match $pattern
 }
+function No-Text($path, $pattern) {
+    -not (Has-Text $path $pattern)
+}
 
 $winServer = "$root/scripts/run_server_windows.ps1"
 $winClient = "$root/scripts/run_client_windows.ps1"
@@ -50,6 +53,23 @@ Check "provision uses dns-01 via cloudflare" (Has-Text $provision "dns-cloudflar
 Check "provision targets selmedia wildcard" (Has-Text $provision "selmedia\.ru")
 Check "bundle script exists" (Test-Path -LiteralPath "$root/scripts/make_bundle.sh")
 Check "bundle packs dist" (Has-Text "$root/scripts/make_bundle.sh" "dist/ubuntu-server")
+
+$remoteInstall = "$root/deploy/linux/install-remote.sh"
+Check "remote installer exists" (Test-Path -LiteralPath $remoteInstall)
+Check "remote installs rustup" (Has-Text $remoteInstall "sh\.rustup\.rs|rustup")
+Check "remote installs dotnet" (Has-Text $remoteInstall "dotnet-sdk")
+Check "remote clones repo" (Has-Text $remoteInstall "git clone")
+Check "remote generates PSK" (Has-Text $remoteInstall "openssl rand")
+Check "remote self-signed fallback" (Has-Text $remoteInstall "req -x509")
+Check "remote enables service" (Has-Text $remoteInstall "systemctl enable")
+Check "remote opens firewall" (Has-Text $remoteInstall "ufw allow 443")
+Check "remote prints client config" (Has-Text $remoteInstall "server_addr")
+Check "remote takes DOMAIN param" (Has-Text $remoteInstall "DOMAIN=")
+Check "remote has Cloudflare branch" (Has-Text $remoteInstall "CLOUDFLARE_API_TOKEN")
+Check "remote has no hardcoded domain" (No-Text $remoteInstall "selmedia\.ru")
+Check "remote prompts interactively" (Has-Text $remoteInstall "read -rp")
+Check "remote reads token silently" (Has-Text $remoteInstall "read -rsp")
+Check "remote has --yes escape hatch" (Has-Text $remoteInstall "--yes")
 
 if ($fail -gt 0) { Write-Output "$fail checks failed"; exit 1 }
 Write-Output "all quickstart checks passed"

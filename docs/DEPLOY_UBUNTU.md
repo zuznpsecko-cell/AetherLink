@@ -2,6 +2,24 @@
 
 Пошагово, с нуля, под root. Итог: `systemctl`-сервис на 443 с wildcard-сертом.
 
+## -1. Одна команда (рекомендуется)
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/zuznpsecko-cell/AetherLink/main/deploy/linux/install-remote.sh)
+```
+
+Скрипт сначала спросит домен и Cloudflare-токен (токен вводится вслепую),
+покажет план и попросит подтверждение — и только потом ставит зависимости,
+собирает, выпускает LE-wildcard, генерит PSK и поднимает сервис.
+Без токена — self-signed серт. Полностью неинтерактивно:
+
+```bash
+DOMAIN=selmedia.ru CLOUDFLARE_API_TOKEN=xxx bash <(curl -Ls <url>) --yes
+```
+
+Домен задаётся параметром (`DOMAIN=`), жесткой привязки к `selmedia.ru` в
+скриптах нет. Ниже — те же шаги вручную, по частям.
+
 ## 0. Что нужно заранее
 
 - VPS: Ubuntu 22.04/24.04, root-доступ по SSH.
