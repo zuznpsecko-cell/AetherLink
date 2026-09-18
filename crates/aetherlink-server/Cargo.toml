@@ -1,0 +1,30 @@
+[package]
+name = "aetherlink-server"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink server library: authentication, static fallback, TCP/UDP relay, DNS upstream"
+
+[dependencies]
+aetherlink-core = { path = "../aetherlink-core" }
+aetherlink-crypto = { path = "../aetherlink-crypto" }
+aetherlink-frame = { path = "../aetherlink-frame" }
+aetherlink-mux = { path = "../aetherlink-mux" }
+aetherlink-protocol = { path = "../../protocol" }
+rustls = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+aetherlink-protocol = { path = "../../protocol" }
+rcgen = "0.13"
+rustls = { workspace = true }
+
+[lib]
+name = "aetherlink_server"

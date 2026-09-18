@@ -1,0 +1,19 @@
+[package]
+name = "aetherlink-protocol"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink protocol specifications and golden tests"
+
+[dependencies]
+serde = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+aetherlink-crypto = { path = "../crates/aetherlink-crypto" }
+aetherlink-frame = { path = "../crates/aetherlink-frame" }
+aetherlink-mux = { path = "../crates/aetherlink-mux" }
+pretty_assertions = { workspace = true }
+
+[lib]
+name = "aetherlink_protocol"

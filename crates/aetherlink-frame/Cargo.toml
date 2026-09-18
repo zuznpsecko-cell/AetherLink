@@ -1,0 +1,21 @@
+[package]
+name = "aetherlink-frame"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink frame codec: encoding/decoding of protocol frames"
+
+[dependencies]
+aetherlink-crypto = { path = "../aetherlink-crypto" }
+aetherlink-protocol = { path = "../../protocol" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+hex = { workspace = true }
+
+[lib]
+name = "aetherlink_frame"

@@ -1,0 +1,176 @@
+# PLAN_FINAL_TDD — AetherLink v1.5 до финала без заглушек
+
+Методология: каждый шаг — Red (падающий тест) → Green (минимум кода) → ворота
+(`cargo fmt --check`, `clippy --all-targets`, `cargo test --workspace`,
+`check_thin_hosts.ps1`, `check_quickstart.ps1`). Ни один шаг не закрыт без
+зелёных ворот. Порядок — от транспорта к краям: сначала то, от чего зависят
+остальные.
+
+Легенда статусов: DONE — реализовано и покрыто; STUB — честная заглушка
+с именованной ошибкой; TODO — отсутствует.
+
+---
+
+## Фаза A. Сессия: AUTH-хендшейк поверх TLS (ядро всего туннеля)
+
+Зависит: ни от чего нового (TLS, AUTH, ключи, mux готовы и покрыты).
+Блокирует: B, C, E2E.
+
+- [ ] A1. Red: `core/tests/session_handshake.rs` — клиент/сервер поверх
+      localhost-TLS (`tls::accept_tls`/`connect_tls` + rcgen):
+      PREFACE (`PROTOCOL_VERSION=1`) → AUTH frame (nonce+token) → сервер
+      `verify` → обе стороны `derive_traffic_keys` → DATA туда-обратно через
+      `MuxManager::seal_data`/`open_data` теми ключами; чужой PSK → Err;
+      повтор nonce → Err (NonceCache).
+- [ ] A2. Green: `core/session.rs` — `handshake_client(stream, psk, nonce)`,
+      `handshake_server(stream, psk, cache)`, отдающие
+      `(MuxManager, SessionKeys)`; PSK/secrets никогда в логах и ошибках.
+- [ ] A3. Ворота + `STATUS.md`: session STUB → DONE.
+
+Приёмка: handshake-тесты 5+/5, утечек секретов нет (grep по `psk|secret|key`
+в сообщениях ошибок).
+
+## Фаза B. Сервер: accept-loop (fallback + туннель)
+
+Зависит: A. Блокирует: E2E.
+
+- [ ] B1. Red: `server/tests/accept_loop.rs` — TCP-листенер localhost:
+      валидный AUTH → поток `tunnel`; мусор/плохой AUTH → `static`
+      (проверяется байтами первого ответа, без баннера туннеля);
+      OPEN_TCP → байты доходят до локального echo-таргета и обратно;
+      UDP DATAGRAM → echo через `relay_udp`.
+- [ ] B2. Green: `server/lib.rs::Server::{bind,serve_once}` поверх
+      `tls::accept_tls` + `fallback::decide` + `auth::verify` (+ NonceCache
+      TTL 5 мин) + `MuxManager` + `dial_tcp`/`relay_udp`/`dns::resolve`.
+      `Server::new` хранит конфиг; сеть стартует только в `serve_*`.
+- [ ] B3. Убрать `resolve`-стаб? Уже реализован (UDP relay). Остаётся
+      TCP-UDP-шины mux↔relay внутри serve-loop — часть B2.
+
+Приёмка: localhost-клиент получает echo через серверный туннель.
+
+## Фаза C. Клиент: полный `up` (пин → снапшот → TUN → TLS → AUTH → mux)
+
+Зависит: A, netstack-platform (D). Блокирует: E2E, FFI-up.
+
+- [ ] C1. Red: `client/tests/up_down.rs` — `up` без привилегий возвращает
+      `Err` и не оставляет следов (таблица маршрутов/DNS не тронуты —
+      проверка через platform-trait с fake-бэкендом, без root);
+      `down` после неуспешного `up` — Ok; повторный `up` — Ok no-op;
+      `force_cleanup` чистит fake-состояние.
+- [ ] C2. Green: `client/lifecycle.rs::up` — resolve server hostname
+      (системный DNS один раз до туннеля) → pin IP → `Snapshot::save` →
+      TUN (`netstack`) → pin route → direct-правила (`Ruleset`) → default
+      в TUN → DNS в туннель → TLS (`tls::connect_tls`) → `handshake_client`
+      → mux. Любая ошибка — rollback по `rollback_plan`, затем Err.
+      Mutex на reconfigure; идемпотентность up/down.
+- [ ] C3. `Client::up/status` в `client/lib.rs` — делегировать lifecycle;
+      `status` возвращает JSON (up/down, server, dns_mode).
+- [ ] C4. `client/config.rs` — схема §8 (server_addr, psk, pad_multiple,
+      keepalive, full_tunnel.*, routing.*) с валидацией обязательных полей.
+
+Приёмка: fake-бэкенд-тесты зелёные; на машине без прав — чистая ошибка.
+
+## Фаза D. Netstack platform: TUN + smoltcp-памп (нужны права)
+
+Зависит: ничего (идёт параллельно A–C). Требует: Linux root / Windows admin
+для живых проверок; юнит-уровень — без прав.
+
+- [ ] D1. Red: `netstack/tests/pump.rs` — IP-пакет (TCP SYN / UDP DNS)
+      через `smoltcp_wrapper` превращается в OPEN_TCP/OPEN_UDP + DATAGRAM
+      и обратно (ответ собирается в IP-пакет); таблица потоков expiring.
+- [ ] D2. Green: `netstack/smoltcp_wrapper.rs` — iface + TCP/UDP сокеты,
+      polls, mapping `MuxManager`↔sockets, DNS-перехват к `10.255.0.1:53`.
+- [ ] D3. Red: `netstack/tests/tun_io.rs` (помечены `#[ignore]` без прав) —
+      open/close устройства, чтение/запись IP-пакета loopback.
+- [ ] D4. Green: `netstack/tun.rs::TunInterface::open` — Linux
+      `/dev/net/tun` (ioctl), Windows — Wintun 0.14.1 (create adapter,
+      session, ring buffers → пакеты в core); `wintun.dll` рядом с хостом.
+- [ ] D5. Живая проверка под root/admin: `up` → ping/TCP через туннель,
+      `kill -9` → `force_cleanup` → сеть+DNS целы; снять `#[ignore]`
+      локально, в CI оставить ignore с пометкой.
+
+Приёмка: SQUID-памп-тесты зелёные без прав; живые — под правами вручную.
+
+## Фаза E. FFI: остаток C ABI
+
+Зависит: C (rules), D (tun fd), тесты — без прав.
+
+- [ ] E1. Red: `ffi/tests/ffi_surface.rs` — `rules_list/set/reload`
+      roundtrip через JSON; `set_log_callback` получает линию без секретов;
+      `android_set_tun_fd`/`set_split_config` валидируют хендл и аргументы.
+- [ ] E2. Green: `ffi/lib.rs` — rules поверх `client::routing::Ruleset`
+      (сериализация/парсинг, reload атомарен); log-callback без
+      PSK/session keys (проверяется тестом на красные слова);
+      `android_set_tun_fd`/`set_split_config` — валидация + staging
+      (применение — в D).
+- [ ] E3. JNI: пробросить то же через `ffi/jni.rs` + символы в `llvm-nm`
+      (чек уже есть в `check_thin_hosts.ps1`).
+
+Приёмка: все C ABI из §3 вызываются из тестов, TODO в `ffi/lib.rs` — ноль.
+
+## Фаза F. Конфиги ядра и .NET-поверхность
+
+- [ ] F1. `core/config.rs` — общая схема + `load(path)` (JSON→YAML fallback,
+      как в FFI `parse_config`; вынести общий парсер в core, FFI — тонкий
+      вызов).
+- [ ] F2. `Server::new`/`Client::new` принимают типизированный конфиг
+      вместо сырого `Value` (parse-don't-validate на границе).
+- [ ] F3. .NET: `status` в клиенте печатает JSON; `cleanup` уже есть;
+      пересобрать оба хоста 0/0 после изменений FFI.
+
+## Фаза G. E2E: байты сквозь весь тракт (главные ворота финала)
+
+Зависит: A–D. Требует прав только для TUN-ног; core-путь — без.
+
+- [ ] G1. Red: `tests/e2e_tunnel.rs` (корневой интеграционный):
+      сервер (localhost) + клиентский mux через `session::handshake_*`
+      → OPEN_TCP к локальному echo → `hello` туда-обратно;
+      UDP DATAGRAM → echo; DNS-запрос → canned-ответ через
+      `dns::resolve`-путь.
+- [ ] G2. Green: склейка (в основном уже есть из A–D) + фиксы по красному.
+- [ ] G3. Живой E2E под правами (ручной чек-лист в `docs/STATUS.md`):
+      `up` → `curl` через туннель → `down`; `kill -9` → cleanup → сеть жива;
+      DNS только через туннель (захват/счётчик); domain-direct: резолв через
+      туннель, коннект напрямую.
+
+Приёмка G1 зелёная в CI; G3 — подписанный чек-лист.
+
+## Фаза H. Deploy, доки, DoD
+
+- [ ] H1. `deploy/linux/install.sh`, `deploy/windows/install.ps1` — ставить
+      из `dist/` (publish-вывод), а не из корня; плюс `uninstall` инверсия.
+- [ ] H2. `configs/*.example.yaml` валидируются парсерами C4/F1 в тестах
+      (золотые конфиги).
+- [ ] H3. `docs/STATUS.md` — правда по фазам; `README` 10–20 строк запуска;
+      `DEPLOY_LINUX/WINDOWS` личный с нуля; `PLAN_TDD.md` — архивный пометить.
+- [ ] H4. DoD из AGENT_INSTRUCTIONS §11 по пунктам: 1 (один Rust core —
+      держит `check_thin_hosts.ps1`), 2 (FFI up/down/server — E1+G1),
+      3 (TCP+UDP — G1), 4 (DNS no-leak — G3), 5 (domain direct — G3),
+      6 (Wintun — D4), 7 (rollback — C1+D5), 8 (.NET self-contained — F3),
+      9 (Android split — on-device чек), 10 (G2 fallback — B1),
+      11 (`force_cleanup` — C1+D5), 12 (deploy-доки — H1–H3).
+- [ ] H5. Финальные ворота: `cargo test --workspace` 100% зелёных,
+      `clippy -D warnings`, `fmt --check`, оба чек-скрипта, `dotnet build`
+      0/0, `assembleDebug` 0/0, `grep -rn "not implemented\|TODO" crates/*/src`
+      — пусто (кроме осознанных `#[ignore]` живых тестов).
+
+## Карта заглушек → фазы
+
+| Файл | Заглушка | Фаза |
+|---|---|---|
+| `core/session.rs` | handshake + key schedule | A |
+| `core/config.rs` | схема/парсинг | F1 |
+| `server/lib.rs` | accept-loop (bind/serve) | B |
+| `client/lifecycle.rs` + `lib.rs` | `up`/`status` | C |
+| `client/config.rs` | схема §8 | C4 |
+| `netstack/smoltcp_wrapper.rs` | userspace stack + памп | D2 |
+| `netstack/tun.rs` + `manager.rs` | device ioctls / bring-up | D4/D5 |
+| `ffi/lib.rs` | rules, log cb, android fd/split | E |
+| `deploy/*` | установка из исходников, нет uninstall | H1 |
+
+## Риски и требования к среде
+
+- Linux root (или CAP_NET_ADMIN) — D5/G3; Windows admin + `wintun.dll` — D4/G3.
+- Android-устройство/ТВ — on-device чек split + VpnService (APK уже собирается).
+- Сеть для cargo/Gradle-зависимостей (уже кэшированы: registry, gradle-8.10.2, AGP).
+- Java для Gradle — JBR 21 от Rider (Gradle 8.10 не стартует на Java 25 из новой Studio).

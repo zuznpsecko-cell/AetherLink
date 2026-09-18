@@ -1,0 +1,24 @@
+client:
+  server_addr: "server.example.com:443"
+  outer_sni: "server.example.com"
+  psk: "change-me-high-entropy"
+  pad_multiple: 128
+  keepalive_s: 15
+  # wintun.dll location on Windows (side-by-side with the host exe).
+  wintun_dll_path: "./wintun.dll"
+
+full_tunnel:
+  enabled: true
+  mtu: 1400
+  kill_switch: false
+  restore_on_exit: true
+  include_private_lan_direct: true
+  # FIXED: only tunnel in v1.5; system DNS is forbidden while up.
+  dns_mode: tunnel
+
+routing:
+  default_action: tunnel
+  rules: []
+
+# Android only:
+# split_tunnel: { mode: all, apps: [] }

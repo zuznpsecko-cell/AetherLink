@@ -1,0 +1,66 @@
+# AetherLink v1.5 — keep the repo free of build outputs, secrets and local state.
+# Source of truth is always rebuilt: cargo build, dotnet publish, cargo ndk,
+# Gradle assemble. Nothing below is needed to reproduce a build.
+
+# --- Rust ---
+/target/
+**/*.rs.bk
+
+# --- .NET (bin/obj per project, publish goes to dist/) ---
+[Bb]in/
+[Oo]bj/
+*.user
+.vs/
+TestResults/
+
+# --- Publish / bundle outputs (rebuilt by scripts/) ---
+/dist/
+aetherlink-ubuntu-*.tar.gz
+
+# --- Android (local SDK wiring + build outputs + staged .so) ---
+local.properties
+.gradle/
+**/build/
+apps/android/app/src/main/jniLibs/*/*.so
+
+# --- Secrets: keys, certs, credentials (NEVER commit) ---
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*cloudflare.ini
+.env
+
+# --- Live configs: only *.example.yaml are tracked ---
+configs/*.yaml
+!configs/*.example.yaml
+/server.yaml
+/client.yaml
+
+# --- Crash-recovery / snapshot state ---
+state.json
+*.snapshot
+*.snapshot.xml
+*.snapshot.json
+
+# --- Host-placed runtime blobs (downloaded next to the repo, keep out) ---
+/*.dll
+/*.so
+/wintun.dll
+
+# --- Local tool state ---
+.cargo/
+.codegraph/
+.omo/
+.idea/
+.vscode/
+*.log
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.orig
+*.rej

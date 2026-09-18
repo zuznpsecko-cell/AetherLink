@@ -1,0 +1,30 @@
+[package]
+name = "aetherlink-core"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink core protocol: TLS transport, session management, protocol orchestration"
+
+[dependencies]
+aetherlink-crypto = { path = "../aetherlink-crypto" }
+aetherlink-frame = { path = "../aetherlink-frame" }
+aetherlink-mux = { path = "../aetherlink-mux" }
+aetherlink-netstack = { path = "../aetherlink-netstack" }
+aetherlink-protocol = { path = "../../protocol" }
+rustls = { workspace = true }
+rustls-pemfile = "2"
+webpki = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+rcgen = "0.13"
+
+[lib]
+name = "aetherlink_core"

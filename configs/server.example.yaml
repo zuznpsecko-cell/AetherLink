@@ -1,0 +1,11 @@
+server:
+  listen: "0.0.0.0:443"
+  tls_cert: "./cert.pem"
+  tls_key: "./key.pem"
+  psk: "change-me-high-entropy"
+  # Static web root for G2 fallback (no tunnel banner, static only).
+  local_static_root: "./fallback"
+  dns_upstream:
+    - "1.1.1.1:53"
+    - "8.8.8.8:53"
+  max_streams: 4096

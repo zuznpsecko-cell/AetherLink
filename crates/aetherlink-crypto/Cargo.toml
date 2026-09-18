@@ -1,0 +1,24 @@
+[package]
+name = "aetherlink-crypto"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink crypto primitives: HMAC-SHA256 auth, ChaCha20-Poly1305 AEAD, HKDF key schedule"
+
+[dependencies]
+hmac = { workspace = true }
+sha2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+hex = { workspace = true }
+subtle = "2.5"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lib]
+name = "aetherlink_crypto"

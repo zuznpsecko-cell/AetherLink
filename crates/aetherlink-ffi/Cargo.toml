@@ -1,0 +1,25 @@
+[package]
+name = "aetherlink-ffi"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink FFI C ABI exports for .NET, Android, and CLI consumers"
+
+[dependencies]
+aetherlink-client = { path = "../aetherlink-client" }
+aetherlink-server = { path = "../aetherlink-server" }
+aetherlink-core = { path = "../aetherlink-core" }
+libc = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+jni = { workspace = true }
+once_cell = "1.19"
+
+[lib]
+name = "aetherlink_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

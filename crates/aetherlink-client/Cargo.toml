@@ -1,0 +1,29 @@
+[package]
+name = "aetherlink-client"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink client library: full tunnel lifecycle, routing rules, DNS override, crash recovery"
+
+[dependencies]
+aetherlink-core = { path = "../aetherlink-core" }
+aetherlink-netstack = { path = "../aetherlink-netstack" }
+aetherlink-crypto = { path = "../aetherlink-crypto" }
+aetherlink-frame = { path = "../aetherlink-frame" }
+aetherlink-mux = { path = "../aetherlink-mux" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+once_cell = "1.19"
+serde_yaml = { workspace = true }
+ipnet = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lib]
+name = "aetherlink_client"

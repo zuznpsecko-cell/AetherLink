@@ -1,0 +1,21 @@
+[package]
+name = "aetherlink-mux"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink multiplexing layer: stream/flow management, flow control"
+
+[dependencies]
+aetherlink-frame = { path = "../aetherlink-frame" }
+aetherlink-crypto = { path = "../aetherlink-crypto" }
+aetherlink-protocol = { path = "../../protocol" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lib]
+name = "aetherlink_mux"
