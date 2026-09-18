@@ -135,7 +135,7 @@ fn e2e_two_streams_one_flow_plus_dns() {
     let port = listener.local_addr().expect("addr").port();
     let server = std::thread::spawn(move || {
         let (sock, _) = listener.accept().expect("accept");
-        assert_eq!(serve_connection(sock, &ctx(), &routes), Path::Tunnel);
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
     });
 
     // When: one handshake, two streams, one flow, all at once

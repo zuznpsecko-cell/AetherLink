@@ -90,3 +90,64 @@ fn bring_up_without_privilege_fails_cleanly() {
     assert!(m.bring_up(1400).is_err());
     assert!(!m.is_up());
 }
+
+#[test]
+fn tun_config_validation_rejects_garbage() {
+    use aetherlink_netstack::tun::TunConfig;
+    // Given: empty / overlong names and out-of-range MTUs
+    // When: validating → Then: named errors before any privilege is touched.
+    assert!(TunConfig {
+        name: String::new(),
+        mtu: 1400
+    }
+    .validate()
+    .is_err());
+    assert!(TunConfig {
+        name: "a".repeat(16),
+        mtu: 1400
+    }
+    .validate()
+    .is_err());
+    assert!(TunConfig {
+        name: "aether0".to_string(),
+        mtu: 0
+    }
+    .validate()
+    .is_err());
+    assert!(TunConfig {
+        name: "aether0".to_string(),
+        mtu: 9001
+    }
+    .validate()
+    .is_err());
+    // And: sane configs validate cleanly.
+    assert!(TunConfig {
+        name: "aether0".to_string(),
+        mtu: 1400
+    }
+    .validate()
+    .is_ok());
+    assert!(TunConfig {
+        name: "aether0".to_string(),
+        mtu: 1280
+    }
+    .validate()
+    .is_ok());
+}
+
+#[test]
+fn open_with_valid_config_still_needs_privilege() {
+    use aetherlink_netstack::tun::{TunConfig, TunInterface};
+    // Given: valid config, unprivileged process
+    // When: opening → Then: privilege error (ioctls land in platform task).
+    let err = TunInterface::open_with(&TunConfig {
+        name: "aether0".to_string(),
+        mtu: 1400,
+    })
+    .expect_err("must fail here");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("privilege") || msg.contains("admin") || msg.contains("root"),
+        "got: {msg}"
+    );
+}

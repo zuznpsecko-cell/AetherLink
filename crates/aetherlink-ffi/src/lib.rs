@@ -14,7 +14,7 @@ use std::os::raw::{c_char, c_int};
 use std::sync::Mutex;
 
 use aetherlink_client::Client;
-use aetherlink_server::Server;
+use aetherlink_server::{Server, ServerGuard};
 
 /// Opaque handle type for FFI
 pub type AetherHandle = usize;
@@ -40,7 +40,7 @@ static HANDLES: Lazy<Mutex<HandleMap>> = Lazy::new(|| Mutex::new(HandleMap::new(
 
 struct HandleMap {
     clients: std::collections::HashMap<usize, Client>,
-    servers: std::collections::HashMap<usize, Server>,
+    servers: std::collections::HashMap<usize, ServerGuard>,
     next_id: usize,
 }
 
@@ -60,10 +60,10 @@ impl HandleMap {
         id
     }
 
-    fn insert_server(&mut self, server: Server) -> usize {
+    fn insert_server(&mut self, guard: ServerGuard) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        self.servers.insert(id, server);
+        self.servers.insert(id, guard);
         id
     }
 
@@ -71,15 +71,7 @@ impl HandleMap {
         self.clients.get_mut(&handle)
     }
 
-    fn get_server(&mut self, handle: usize) -> Option<&mut Server> {
-        self.servers.get_mut(&handle)
-    }
-
-    fn remove_client(&mut self, handle: usize) -> Option<Client> {
-        self.clients.remove(&handle)
-    }
-
-    fn remove_server(&mut self, handle: usize) -> Option<Server> {
+    fn remove_server(&mut self, handle: usize) -> Option<ServerGuard> {
         self.servers.remove(&handle)
     }
 }
@@ -162,18 +154,36 @@ pub unsafe extern "C" fn aether_server_start(config_json: *const c_char) -> Aeth
         }
     };
 
-    let handle = HANDLES.lock().unwrap().insert_server(server);
+    // Bind + serve in background: start returns promptly with a live handle.
+    let bound = match server.bind() {
+        Ok(bound) => bound,
+        Err(e) => {
+            set_last_error(&format!("Server bind failed: {}", e));
+            return 0;
+        }
+    };
+    let handle = HANDLES
+        .lock()
+        .unwrap()
+        .insert_server(bound.serve_background());
+    ffi_log(0, "server start ok");
     handle
 }
 
 #[no_mangle]
 pub extern "C" fn aether_server_stop(handle: AetherHandle) -> c_int {
     let mut handles = HANDLES.lock().unwrap();
-    if handles.remove_server(handle).is_some() {
-        AetherError::Success as c_int
-    } else {
-        set_last_error("Invalid server handle");
-        AetherError::InvalidHandle as c_int
+    match handles.remove_server(handle) {
+        Some(guard) => {
+            guard.request_stop();
+            guard.join();
+            ffi_log(0, "server stop ok");
+            AetherError::Success as c_int
+        }
+        None => {
+            set_last_error("Invalid server handle");
+            AetherError::InvalidHandle as c_int
+        }
     }
 }
 

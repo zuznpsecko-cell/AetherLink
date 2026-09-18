@@ -13,6 +13,7 @@ aetherlink-netstack = { path = "../aetherlink-netstack" }
 aetherlink-protocol = { path = "../../protocol" }
 rustls = { workspace = true }
 rustls-pemfile = "2"
+webpki-roots = "1"
 webpki = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }

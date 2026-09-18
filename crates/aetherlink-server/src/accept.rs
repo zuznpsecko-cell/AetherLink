@@ -3,17 +3,16 @@
 //! * TLS handshake fails (plaintext probe) → [`Path::Closed`], nothing served;
 //! * AUTH fails → [`Path::Static`]: minimal static HTTP over the same TLS
 //!   connection, with no tunnel/proxy/vpn banner (G2);
-//! * AUTH ok → [`Path::Tunnel`]: mux frames routed to pre-registered dial
-//!   targets (test harness passes them in; OPEN-frame-driven registration
-//!   is a follow-up).
+//! * AUTH ok → [`Path::Tunnel`]: OPEN frames register ids and teach the
+//!   loop their dial targets; DATA and datagrams then flow through them.
 //!
 //! Scope note: each DATA/DATAGRAM frame is one request→one reply exchange
 //! (fits DNS and proxied request/response). Bidirectional streaming relay
-//! is a follow-up once OPEN-frame negotiation lands.
+//! is a follow-up.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,10 +70,13 @@ fn close_quietly(stream: &mut tls::ServerTlsStream) {
 }
 
 /// Serve one accepted TCP connection to a path decision.
+///
+/// `routes` starts empty on a live listener and is filled from the peer's
+/// OPEN frames; tests may pre-register entries instead.
 pub fn serve_connection(
     sock: TcpStream,
     ctx: &ServerCtx,
-    routes: &HashMap<u16, SocketAddr>,
+    routes: &mut HashMap<u16, SocketAddr>,
 ) -> Path {
     let mut stream = match tls::accept_tls(sock, &ctx.tls) {
         Ok(s) => s,
@@ -93,10 +95,14 @@ pub fn serve_connection(
 }
 
 /// Pump mux frames until EOF, protocol error, or GOAWAY/RST.
+///
+/// OPEN frames register the id and learn the dial target (server resolves
+/// domain targets via its own DNS, like any proxy); DATA and datagrams
+/// then flow through the learned routes.
 fn tunnel_loop(
     stream: &mut tls::ServerTlsStream,
     mut sess: session::ServerSession,
-    routes: &HashMap<u16, SocketAddr>,
+    routes: &mut HashMap<u16, SocketAddr>,
 ) {
     let mut relays: HashMap<u16, TcpStream> = HashMap::new();
     loop {
@@ -188,9 +194,50 @@ fn tunnel_loop(
             }
             FrameType::Ping => continue,
             FrameType::GoAway | FrameType::Rst => break,
-            _ => break, // OPEN/WINDOW/AUTH post-handshake: unsupported yet.
+            FrameType::OpenTcp => {
+                let target = match MuxManager::parse_open_tcp(sess.keys.rx_key(), &header, &ct) {
+                    Ok(target) => target,
+                    Err(_) => break,
+                };
+                let sock = match dial_addr(&target.addr, target.port) {
+                    Some(sock) => sock,
+                    None => break,
+                };
+                if sess
+                    .mux
+                    .register_inbound(header.stream_id, &target.addr, target.port, false)
+                    .is_err()
+                {
+                    break;
+                }
+                routes.insert(header.stream_id, sock);
+            }
+            FrameType::OpenUdp => {
+                let flow = match MuxManager::parse_open_udp(sess.keys.rx_key(), &header, &ct) {
+                    Ok(flow) => flow,
+                    Err(_) => break,
+                };
+                let sock = match dial_addr(&flow.addr, flow.port) {
+                    Some(sock) => sock,
+                    None => break,
+                };
+                if sess
+                    .mux
+                    .register_inbound(header.stream_id, &flow.addr, flow.port, true)
+                    .is_err()
+                {
+                    break;
+                }
+                routes.insert(header.stream_id, sock);
+            }
+            _ => break, // WINDOW/AUTH post-handshake: unsupported yet.
         }
     }
+}
+
+/// Resolve a dial target announced by the peer (server-side system DNS).
+fn dial_addr(addr: &str, port: u16) -> Option<SocketAddr> {
+    format!("{addr}:{port}").to_socket_addrs().ok()?.next()
 }
 
 /// One request→reply exchange with a cached TCP relay connection.

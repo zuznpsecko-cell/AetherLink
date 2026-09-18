@@ -108,7 +108,7 @@ fn valid_auth_reaches_tunnel_tcp_echo() {
     let server = std::thread::spawn(move || {
         let (sock, _) = listener.accept().expect("accept");
         // Then: valid AUTH yields the tunnel path.
-        assert_eq!(serve_connection(sock, &ctx(), &routes), Path::Tunnel);
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
     });
 
     // When: full client handshake + DATA for stream 1
@@ -143,7 +143,7 @@ fn bad_auth_gets_static_without_banner() {
         let (sock, _) = listener.accept().expect("accept");
         // Then: bad AUTH yields the static path.
         assert_eq!(
-            serve_connection(sock, &ctx(), &HashMap::new()),
+            serve_connection(sock, &ctx(), &mut HashMap::new()),
             Path::Static
         );
     });
@@ -185,7 +185,7 @@ fn plaintext_probe_is_closed() {
         let (sock, _) = listener.accept().expect("accept");
         // Then: non-TLS bytes are closed, nothing served.
         assert_eq!(
-            serve_connection(sock, &ctx(), &HashMap::new()),
+            serve_connection(sock, &ctx(), &mut HashMap::new()),
             Path::Closed
         );
     });
@@ -223,7 +223,7 @@ fn udp_datagram_relayed_transparently() {
     let port = listener.local_addr().expect("addr").port();
     let server = std::thread::spawn(move || {
         let (sock, _) = listener.accept().expect("accept");
-        assert_eq!(serve_connection(sock, &ctx(), &routes), Path::Tunnel);
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
     });
 
     // When: handshake + UDP datagram for flow 1

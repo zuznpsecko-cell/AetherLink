@@ -57,6 +57,9 @@ state.json
 .vscode/
 *.log
 
+# --- Agent recovery prompt: stored separately by owner, never in git ---
+AGENT_PROMPT.md
+
 # --- OS junk ---
 .DS_Store
 Thumbs.db

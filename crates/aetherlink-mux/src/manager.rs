@@ -12,8 +12,8 @@ use aetherlink_frame::types::{Frame, FramePayload};
 use aetherlink_frame::FRAME_HEADER_SIZE;
 use aetherlink_protocol::FrameType;
 
-use crate::flow;
-use crate::stream;
+use crate::flow::{self, UdpFlow};
+use crate::stream::{self, TcpStream};
 use crate::{MuxError, Result};
 
 /// Anti-replay window per id (FIXED >= 1024).
@@ -280,6 +280,141 @@ impl MuxManager {
         let frame = Frame::udp_datagram(id, payload.to_vec());
         let _ = seq;
         self.seal(key, id, FrameType::UdpDatagram, frame, pad_multiple)
+    }
+
+    /// Seal an OPEN frame: same wire path as `seal`, but fixed seq 0 with a
+    /// type-distinct nonce, so DATA sequencing is untouched.
+    fn seal_open(
+        &self,
+        key: &[u8],
+        id: u16,
+        frame_type: FrameType,
+        frame: Frame,
+        pad_multiple: usize,
+    ) -> Result<SealedFrame> {
+        let entry = self.entries.get(&id).ok_or(MuxError::StreamClosed(id))?;
+        if entry.is_udp != (frame_type == FrameType::OpenUdp) {
+            return Err(MuxError::StreamClosed(id));
+        }
+        let k = to_key(key)?;
+        let nonce = build_nonce(id, 0, frame_type);
+        let wire = codec::encode_frame(&frame, &k, &nonce, pad_multiple)
+            .map_err(|e| MuxError::Internal(e.to_string()))?;
+        let header = FrameHeader {
+            length: (wire.len() - FRAME_HEADER_SIZE) as u32,
+            frame_type,
+            flags: 0,
+            stream_id: id,
+            sequence: 0,
+        };
+        let ciphertext = wire[FRAME_HEADER_SIZE..].to_vec();
+        Ok(SealedFrame { header, ciphertext })
+    }
+
+    /// Seal OPEN_TCP announcing this stream's dial target to the peer.
+    pub fn seal_open_tcp(
+        &mut self,
+        key: &[u8],
+        id: u16,
+        pad_multiple: usize,
+    ) -> Result<SealedFrame> {
+        let (addr, port) = self
+            .entries
+            .get(&id)
+            .ok_or(MuxError::StreamClosed(id))
+            .and_then(|e| {
+                if e.is_udp {
+                    Err(MuxError::StreamClosed(id))
+                } else {
+                    Ok((e.addr.clone(), e.port))
+                }
+            })?;
+        let frame = Frame::open_tcp(id, 0, addr, port);
+        self.seal_open(key, id, FrameType::OpenTcp, frame, pad_multiple)
+    }
+
+    /// Seal OPEN_UDP announcing this flow's target to the peer.
+    pub fn seal_open_udp(
+        &mut self,
+        key: &[u8],
+        id: u16,
+        pad_multiple: usize,
+    ) -> Result<SealedFrame> {
+        let (addr, port) = self
+            .entries
+            .get(&id)
+            .ok_or(MuxError::FlowClosed(id))
+            .and_then(|e| {
+                if e.is_udp {
+                    Ok((e.addr.clone(), e.port))
+                } else {
+                    Err(MuxError::FlowClosed(id))
+                }
+            })?;
+        let frame = Frame::open_udp(id, addr, port);
+        self.seal_open(key, id, FrameType::OpenUdp, frame, pad_multiple)
+    }
+
+    /// Parse a peer's OPEN_TCP into a dial descriptor (no state touched).
+    ///
+    /// Enforces seq 0: the opener sends exactly one OPEN per id; anything
+    /// else is a replay or a confused peer — fail closed.
+    pub fn parse_open_tcp(
+        key: &[u8],
+        header: &FrameHeader,
+        ciphertext: &[u8],
+    ) -> Result<TcpStream> {
+        let frame = Self::open_frame(key, header, ciphertext, FrameType::OpenTcp)?;
+        match frame.payload {
+            FramePayload::OpenTcp { addr, port, .. } => Ok(TcpStream {
+                id: header.stream_id,
+                addr,
+                port,
+            }),
+            _ => Err(MuxError::Internal("wrong payload".to_string())),
+        }
+    }
+
+    /// Parse a peer's OPEN_UDP into a dial descriptor (no state touched).
+    pub fn parse_open_udp(key: &[u8], header: &FrameHeader, ciphertext: &[u8]) -> Result<UdpFlow> {
+        let frame = Self::open_frame(key, header, ciphertext, FrameType::OpenUdp)?;
+        match frame.payload {
+            FramePayload::OpenUdp { addr, port, .. } => Ok(UdpFlow {
+                id: header.stream_id,
+                addr,
+                port,
+            }),
+            _ => Err(MuxError::Internal("wrong payload".to_string())),
+        }
+    }
+
+    /// Shared OPEN decode: type + length + seq-0 checks, then AEAD open.
+    fn open_frame(
+        key: &[u8],
+        header: &FrameHeader,
+        ciphertext: &[u8],
+        expect: FrameType,
+    ) -> Result<Frame> {
+        if header.frame_type != expect {
+            return Err(MuxError::Internal("wrong frame type".to_string()));
+        }
+        if header.length as usize != ciphertext.len() {
+            return Err(MuxError::Internal("length mismatch".to_string()));
+        }
+        if header.sequence != 0 {
+            return Err(MuxError::Internal("open must be seq 0".to_string()));
+        }
+        let k = to_key(key)?;
+        let nonce = build_nonce(header.stream_id, 0, expect);
+        let mut wire = Vec::with_capacity(FRAME_HEADER_SIZE + ciphertext.len());
+        {
+            use bytes::BufMut;
+            let mut hb = bytes::BytesMut::new();
+            header.encode(&mut hb);
+            wire.extend_from_slice(&hb);
+        }
+        wire.extend_from_slice(ciphertext);
+        codec::decode_frame(&wire, &k, &nonce).map_err(|e| MuxError::Internal(e.to_string()))
     }
 
     fn open(

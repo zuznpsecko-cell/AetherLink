@@ -5,6 +5,7 @@
 
 pub mod manager;
 pub mod smoltcp_wrapper;
+pub mod sockets;
 pub mod tun;
 
 use thiserror::Error;

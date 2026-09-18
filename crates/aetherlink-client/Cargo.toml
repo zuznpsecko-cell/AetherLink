@@ -12,6 +12,7 @@ aetherlink-crypto = { path = "../aetherlink-crypto" }
 aetherlink-frame = { path = "../aetherlink-frame" }
 aetherlink-mux = { path = "../aetherlink-mux" }
 tokio = { workspace = true }
+rustls = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -24,6 +25,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+rustls = { workspace = true }
+rcgen = "0.13"
 
 [lib]
 name = "aetherlink_client"

@@ -72,6 +72,21 @@ pub fn client_config_tls12(verifier: Arc<dyn ServerCertVerifier>) -> Result<Clie
     Ok(cfg)
 }
 
+/// TLS1.3-only client config against the platform system roots.
+///
+/// Production default: the server must present a publicly trusted chain
+/// (e.g. Let's Encrypt via `provision_cert_ubuntu.sh`). Tests inject a
+/// custom verifier instead.
+pub fn system_client_config() -> Result<ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut cfg = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+    Ok(cfg)
+}
+
 /// Parse SNI host name.
 pub fn server_name(host: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(host)

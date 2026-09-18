@@ -7,15 +7,17 @@
 //! `down` is a safe no-op when the tunnel is not up. One global mutex
 //! serializes reconfiguration.
 
-use std::net::Ipv4Addr;
-use std::sync::Mutex;
+use std::net::{Ipv4Addr, TcpStream};
+use std::sync::{Arc, Mutex};
 
 use once_cell::sync::Lazy;
+use rustls::client::danger::ServerCertVerifier;
 
 use crate::config::ClientConfig;
 use crate::platform::Platform;
 use crate::routing::Matcher;
 use crate::{ClientError, Result};
+use aetherlink_core::{session, tls};
 
 /// Client TUN address inside `10.255.0.0/30` (DECISIONS D2).
 pub const CLIENT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 0, 2);
@@ -115,4 +117,41 @@ pub fn down(platform: &mut dyn Platform) -> Result<()> {
     }
     let _ = platform.tun_down();
     Ok(())
+}
+
+/// Live transport: connected TLS stream plus established session.
+pub struct ConnectedTunnel {
+    /// TLS stream (caller pumps mux frames through it).
+    pub stream: tls::ClientTlsStream,
+    /// Session: fresh mux plus traffic keys (`tx` = client→server).
+    pub sess: session::ClientSession,
+}
+
+/// Connect transport: TCP + TLS (SNI from config) + AUTH handshake.
+///
+/// Resolution happens once here, over system DNS, pre-tunnel. Pass `None`
+/// for the production system-roots verifier, `Some(..)` for tests.
+pub fn connect(
+    config: &ClientConfig,
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
+) -> Result<ConnectedTunnel> {
+    let (host, port) = config
+        .server_addr
+        .rsplit_once(':')
+        .ok_or_else(|| ClientError::ConfigError("server_addr must be host:port".to_string()))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| ClientError::ConfigError("server_addr port invalid".to_string()))?;
+    let sock = TcpStream::connect((host, port))
+        .map_err(|e| ClientError::PlatformError(format!("tcp connect: {e}")))?;
+    let name = tls::server_name(&config.outer_sni).map_err(ClientError::Core)?;
+    let tls_cfg = Arc::new(match verifier {
+        Some(verifier) => tls::client_config(verifier).map_err(ClientError::Core)?,
+        None => tls::system_client_config().map_err(ClientError::Core)?,
+    });
+    let mut stream = tls::connect_tls(sock, name, &tls_cfg).map_err(ClientError::Core)?;
+    let nonce = aetherlink_crypto::auth::generate_nonce();
+    let sess = session::handshake_client(&mut stream, config.psk.as_bytes(), &nonce)
+        .map_err(ClientError::Core)?;
+    Ok(ConnectedTunnel { stream, sess })
 }
