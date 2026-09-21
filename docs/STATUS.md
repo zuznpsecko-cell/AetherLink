@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-09-18 (TDD green, fmt/clippy/checks clean)_
+_Last Updated: 2026-09-21 (TDD 180/180 green, fmt clean, clippy warnings-only)_
 
 ## Overview
 
@@ -9,12 +9,12 @@ _Last Updated: 2026-09-18 (TDD green, fmt/clippy/checks clean)_
 | **Phase 0: Bootstrap** | ✅ Done | Workspace, strict lints, DECISIONS/STATUS/README |
 | **Phase 1: Crypto + Auth** | ✅ Done | HMAC AUTH + NonceCache, AEAD, HKDF, golden tests (33) |
 | **Phase 2: Frame Protocol** | ✅ Done | 24B header, len-prefix padding, ReplayWindow ≥1024 (19) |
-| **Phase 3: Mux Layer** | ✅ Done | TCP streams + UDP flows, anti-replay, virtual DNS (8) |
+| **Phase 3: Mux Layer** | ✅ Done | TCP streams + UDP flows, anti-replay, virtual DNS, OPEN frames (6+8) |
 | **Phase 4: Golden spec** | ✅ Done | `protocol/` canonical consts + integration vectors (5+6) |
 | **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, ALPN h2, sync I/O (3) |
 | **Phase A: Session handshake** | ✅ Done | PREFACE+AUTH → keys → mux DATA both ways (4) |
-| **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop (8+4+4) |
-| **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump tested; device ioctls + socket pump pending (needs privs) |
+| **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve (8+4+4+1) |
+| **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun open tested; live run + socket↔mux bridge (W3/W4) pending privs |
 | **Phase 8: Full Tunnel + Routing** | ✅ Done | Ruleset/DNS-policy/cleanup + full `up` over fake platform (8+11) |
 | **Phase 9: FFI API** | ✅ Done | C ABI smoke + rules/log-cb/android-fd + JNI symbols (5+5) |
 | **Phase 10: Client Integration** | ✅ Done | Typed config, lifecycle, status JSON |
@@ -42,11 +42,11 @@ _Last Updated: 2026-09-18 (TDD green, fmt/clippy/checks clean)_
 |-------|----------|------------|
 | aetherlink-crypto | ✅ | ✅ 33 |
 | aetherlink-frame | ✅ | ✅ 19 |
-| aetherlink-mux | ✅ | ✅ 8 |
-| aetherlink-netstack | ✅ | ✅ 5 + 6 |
+| aetherlink-mux | ✅ | ✅ 6 + 8 |
+| aetherlink-netstack | ✅ | ✅ 6 + 9 + 6 + 4 |
 | aetherlink-core | ✅ | ✅ 3 + 4 + 4 |
-| aetherlink-server | ✅ | ✅ 8 + 4 + 4 + 1 |
-| aetherlink-client | ✅ | ✅ 8 + 11 + 1 |
+| aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 |
+| aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 11 + 7 |
 | aetherlink-ffi | ✅ | ✅ 3 + 5 + 5 (+cdylib) |
 | aetherlink-protocol | ✅ | ✅ 6 + 5 |
 
@@ -59,7 +59,7 @@ _Last Updated: 2026-09-18 (TDD green, fmt/clippy/checks clean)_
 | 3 | TCP+UDP through tunnel (netstack) | 🔄 (mux+pump green; socket pump + live need privs) |
 | 4 | DNS when up only through tunnel (no leak test) | 🔄 (policy green; live capture pending privs) |
 | 5 | Domain direct: resolve via tunnel, connect direct | 🔄 (engine green; live pending privs) |
-| 6 | Wintun path Windows (like v2rayN) | 🔄 (pinned + staged; session pending privs) |
+| 6 | Wintun path Windows (like v2rayN) | 🔄 (crate 0.5.1 open path green; live session pending privs) |
 | 7 | Linux TUN full tunnel + rollback | 🔄 (planner green; live pending privs) |
 | 8 | .NET hosts self-contained win/linux | ✅ (both build 0/0) |
 | 9 | Android+TV split default all | 🔄 (APK builds; on-device pending) |
@@ -77,7 +77,7 @@ _Last Updated: 2026-09-18 (TDD green, fmt/clippy/checks clean)_
 
 ## Next Steps
 
-1. Phase I1: mux OPEN frames (`seal_open_*`/`parse_open_*`)
-2. Phase I2: `Server::bind` + serve loop (port 443 goes live)
-3. Phase I3–I5: client up tail, per-connection keys, FFI threads
-4. Phase I6: live E2E under privileges (curl through the tunnel)
+1. Phase W3: `DataPump` (TUN↔mux bridge) — `TunPackets` + `TunInterface` I/O
+   + `client/src/pump.rs`, RED-тесты с `FakeTun` (в работе)
+2. Phase W4: памп-потоки в `up()`/`down()` + живой чек-лист под админом
+3. Phase I6: live E2E под правами (curl через туннель)

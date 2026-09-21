@@ -86,15 +86,18 @@ Need to define frame types for UDP flows (including DNS).
 ## DEC-004: Wintun Version and License
 
 **Date:** 2025-01-18  
-**Status:** Pending (needs verification)
+**Status:** Accepted (open path verified; live session needs admin)
 
 ### Context
 Windows TUN implementation requires Wintun driver.
 
 ### Decision
-- Use `wintun` crate (official Rust bindings)
+- Use `wintun` crate 0.5 (latest available; there is no 0.14)
 - Bundle `wintun.dll` alongside executable (like v2rayN)
-- Load from current directory at runtime
+- Load order: next to the exe first, then default search rules; missing
+  DLL and missing admin both fail with named errors, never silently
+- API: `load_from_path`/`load` → `Adapter::open`, else `Adapter::create`
+  ("AetherLink") → `start_session(MAX_RING_CAPACITY)
 
 ### Rationale
 - Official Rust bindings maintained by WireGuard team

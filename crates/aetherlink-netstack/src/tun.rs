@@ -88,13 +88,30 @@ pub fn rollback_plan(log: &[AppliedChange]) -> Vec<RestoreOp> {
         .collect()
 }
 
-/// TUN interface handle (device ioctls land in the platform task).
-#[derive(Debug)]
+/// TUN interface handle (owns the driver session on Windows).
 pub struct TunInterface {
     /// Interface name.
     pub name: String,
     /// Interface MTU.
     pub mtu: u32,
+    /// Live Wintun session; `None` until the platform task wires packet I/O.
+    #[cfg(windows)]
+    session: Option<wintun::Session>,
+}
+
+impl std::fmt::Debug for TunInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunInterface")
+            .field("name", &self.name)
+            .field("mtu", &self.mtu)
+            .finish_non_exhaustive()
+    }
+}
+
+// wintun::Session must cross into the pump thread later; prove it now.
+#[cfg(windows)]
+fn _assert_session_send(session: wintun::Session) -> impl Send {
+    session
 }
 
 /// TUN creation parameters, validated before any privilege is touched.
@@ -139,12 +156,68 @@ impl TunInterface {
         })
     }
 
-    /// Open with explicit parameters (validated, then privilege-probed).
+    /// Open with explicit parameters (validated, then driver attempt).
     pub fn open_with(config: &TunConfig) -> Result<Self> {
         config.validate()?;
-        Err(NetstackError::TunError(format!(
-            "open {}: need root/CAP_NET_ADMIN on Linux or admin on Windows (platform bring-up pending)",
-            config.name
-        )))
+        #[cfg(windows)]
+        return Self::open_windows(config);
+        #[cfg(not(windows))]
+        return Err(NetstackError::TunError(
+            "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task".to_string(),
+        ));
+    }
+
+    /// Windows open: load wintun.dll (next to the exe, then CWD), open or
+    /// create the adapter (needs Administrator), start a ring session.
+    #[cfg(windows)]
+    fn open_windows(config: &TunConfig) -> Result<Self> {
+        let lib = Self::load_wintun()?;
+        let adapter = match wintun::Adapter::open(&lib, &config.name) {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                wintun::Adapter::create(&lib, &config.name, "AetherLink", None).map_err(|e| {
+                    NetstackError::TunError(format!(
+                        "wintun adapter '{}' needs Administrator rights: {e}",
+                        config.name
+                    ))
+                })?
+            }
+        };
+        let session = adapter
+            .start_session(wintun::MAX_RING_CAPACITY)
+            .map_err(|e| {
+                NetstackError::TunError(format!("wintun session failed (Administrator?): {e}"))
+            })?;
+        Ok(Self {
+            name: config.name.clone(),
+            mtu: config.mtu,
+            session: Some(session),
+        })
+    }
+
+    /// Load wintun.dll: first next to the current executable (installed
+    /// layout), then by default search rules (dev CWD).
+    #[cfg(windows)]
+    fn load_wintun() -> Result<wintun::Wintun> {
+        let mut tried = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let path = dir.join("wintun.dll");
+                tried.push(path.to_string_lossy().into_owned());
+                match unsafe { wintun::load_from_path(&path) } {
+                    Ok(lib) => return Ok(lib),
+                    Err(e) => {
+                        tried.push(format!("{e}"));
+                    }
+                }
+            }
+        }
+        match unsafe { wintun::load() } {
+            Ok(lib) => Ok(lib),
+            Err(e) => Err(NetstackError::TunError(format!(
+                "wintun.dll load failed (tried {}): {e}",
+                tried.join(", ")
+            ))),
+        }
     }
 }

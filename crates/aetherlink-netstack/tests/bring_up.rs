@@ -76,9 +76,51 @@ fn open_needs_privilege_and_says_so() {
     // Then: graceful privilege error, never a panic or half-created device
     let msg = err.to_string();
     assert!(
-        msg.contains("privilege") || msg.contains("admin") || msg.contains("root"),
+        msg.contains("privilege")
+            || msg.contains("admin")
+            || msg.contains("root")
+            || msg.contains("wintun"),
         "got: {msg}"
     );
+}
+
+#[test]
+#[cfg(windows)]
+fn open_attempts_real_driver_not_stub() {
+    use aetherlink_netstack::tun::{TunConfig, TunInterface};
+    // Given: valid config, wintun.dll beside the test binary CWD or not,
+    // but no admin rights in CI/dev.
+    // When: opening → Then: a REAL attempt happened — the error names the
+    // driver or the missing privilege, never a "pending" stub message.
+    let err = TunInterface::open_with(&TunConfig {
+        name: "aether0".to_string(),
+        mtu: 1400,
+    })
+    .expect_err("must fail unprivileged");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("pending"),
+        "no stub messages allowed, got: {msg}"
+    );
+    assert!(
+        msg.contains("wintun")
+            || msg.contains("Administrator")
+            || msg.contains("admin")
+            || msg.contains("privilege"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn open_validates_before_touching_driver() {
+    use aetherlink_netstack::tun::{TunConfig, TunInterface};
+    // Given: garbage config → Then: validation error, driver never touched.
+    let err = TunInterface::open_with(&TunConfig {
+        name: String::new(),
+        mtu: 1400,
+    })
+    .expect_err("empty name");
+    assert!(err.to_string().contains("bad tun name"), "got: {err}");
 }
 
 #[test]
@@ -147,7 +189,10 @@ fn open_with_valid_config_still_needs_privilege() {
     .expect_err("must fail here");
     let msg = err.to_string();
     assert!(
-        msg.contains("privilege") || msg.contains("admin") || msg.contains("root"),
+        msg.contains("privilege")
+            || msg.contains("admin")
+            || msg.contains("root")
+            || msg.contains("wintun"),
         "got: {msg}"
     );
 }

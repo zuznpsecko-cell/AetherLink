@@ -63,7 +63,7 @@ impl Client {
 
     /// Bring the tunnel up against the real platform (idempotent).
     pub fn up(&mut self) -> Result<()> {
-        let mut platform = platform::RealPlatform;
+        let mut platform = platform::RealPlatform::new();
         self.up_on(&mut platform)
     }
 
@@ -79,7 +79,7 @@ impl Client {
 
     /// Bring the tunnel down (safe no-op when not up).
     pub fn down(&mut self) -> Result<()> {
-        lifecycle::down(&mut platform::RealPlatform)?;
+        lifecycle::down(&mut platform::RealPlatform::new())?;
         self.up = false;
         Ok(())
     }

@@ -22,5 +22,8 @@ libc = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5"
+
 [lib]
 name = "aetherlink_netstack"

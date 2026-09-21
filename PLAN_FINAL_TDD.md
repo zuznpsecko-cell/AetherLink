@@ -83,8 +83,11 @@
 - [ ] D3. Red: `netstack/tests/tun_io.rs` (помечены `#[ignore]` без прав) —
       open/close устройства, чтение/запись IP-пакета loopback.
 - [ ] D4. Green: `netstack/tun.rs::TunInterface::open` — Linux
-      `/dev/net/tun` (ioctl), Windows — Wintun 0.14.1 (create adapter,
-      session, ring buffers → пакеты в core); `wintun.dll` рядом с хостом.
+      `/dev/net/tun` (ioctl; stub with named privilege error until a Linux
+      dev host exists), Windows — crate `wintun` **0.5.1** (latest real;
+      there is no 0.14): load order exe-dir → CWD, open-or-create adapter,
+      `start_session(MAX_RING_CAPACITY)`; `wintun.dll` рядом с хостом.
+      DONE on Windows except live run (see Phase W).
 - [ ] D5. Живая проверка под root/admin: `up` → ping/TCP через туннель,
       `kill -9` → `force_cleanup` → сеть+DNS целы; снять `#[ignore]`
       локально, в CI оставить ignore с пометкой.
@@ -189,6 +192,21 @@
 
 Приёмка фазы I: `curl` через поднятый туннель на реальной паре + I7 зелёный.
 
+## Фаза W. Windows bring-up без прав лишних (сделано, кроме живого прогона)
+
+- [x] W1. Парсинг `route print -4` / `ipconfig` без привязки к локали
+  (форма строк, а не заголовки) + билдеры аргументов `route`/`netsh`;
+  `RealPlatform`: snapshot/apply/restore поверх них
+  (`client/tests/windows_net.rs`, 7 тестов).
+- [x] W2. Открытие Wintun через крейт 0.5.1: load order, open-or-create,
+  session в хендле; без dll/прав — именованные ошибки
+  (`netstack/tests/bring_up.rs`, 9 тестов).
+- [ ] W3. `DataPump` (TUN↔mux мост): `TunPackets` трейт + `try_recv` /
+  `send_packet` у `TunInterface`, `client/src/pump.rs`, RED-тесты
+  с `FakeTun` в `client/tests/pump.rs`. Статус: тесты пишутся.
+- [ ] W4. Памп-потоки в `up()`/`down()` + ворота + живой чек-лист
+  для прогона под админом.
+
 ## Карта заглушек → фазы
 
 | Файл | Заглушка | Фаза |
@@ -198,8 +216,10 @@
 | `server/lib.rs` | accept-loop (bind/serve) | B |
 | `client/lifecycle.rs` + `lib.rs` | `up`/`status` | C |
 | `client/config.rs` | схема §8 | C4 |
-| `netstack/smoltcp_wrapper.rs` | userspace stack + памп | D2 |
-| `netstack/tun.rs` + `manager.rs` | device ioctls / bring-up | D4/D5 |
+| `netstack/smoltcp_wrapper.rs` | userspace stack + памп | D2 ✅ |
+| `netstack/tun.rs` open path | Windows wintun open (Linux ioctls — только под root) | W2 ✅ / D4🔄 |
+| `netstack/sockets.rs` | socket-level pump (TCP/UDP state machines) | D-sock ✅ (4 теста) |
+| TunPackets + DataPump + pump threads | мост TUN↔mux в `up()`/`down()` | W3/W4 ⏳ активное |
 | `ffi/lib.rs` | rules, log cb, android fd/split | E |
 | `deploy/*` | установка из исходников, нет uninstall | H1 |
 
