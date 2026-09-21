@@ -88,6 +88,7 @@ if (Test-Path -LiteralPath $nm) {
 Check "linux deploy restores DNS" (Has-Text $linDeploy "(resolv|systemd-resolved|DNS)")
 Check "linux deploy cleanup" (Has-Text $linDeploy "(cleanup|force_cleanup|state\.json)")
 Check "linux deploy installs unit" (Has-Text $linDeploy "aetherlink-server\.service")
+Check "linux deploy copies full publish dir" (Has-Text $linDeploy "dist/ubuntu-server/\.")
 Check "linux uninstall removes unit" (Has-Text $linUninstall "aetherlink-server\.service")
 Check "windows deploy mentions wintun" (Has-Text $winDeploy "(wintun|Wintun)")
 Check "windows deploy restores DNS" (Has-Text $winDeploy "(DNS|NRPT)")

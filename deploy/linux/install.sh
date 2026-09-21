@@ -10,10 +10,11 @@ STATE_DIR="/var/lib/aetherlink"
 STATE_FILE="$STATE_DIR/state.json"
 
 install -d "$PREFIX/server" "$PREFIX/client" "$STATE_DIR"
-install -m 0755 "$ROOT/dist/ubuntu-server/AetherLink.Server" "$PREFIX/server/"
-cp -f "$ROOT/dist/ubuntu-server/libaetherlink_core.so" "$PREFIX/server/" 2>/dev/null || true
-install -m 0755 "$ROOT/dist/ubuntu-client/AetherLink.Client" "$PREFIX/client/"
-cp -f "$ROOT/dist/ubuntu-client/libaetherlink_core.so" "$PREFIX/client/" 2>/dev/null || true
+# Self-contained publish is a whole directory (runtime + dlls next to the
+# apphost exe); copying just the exe yields "application does not exist".
+cp -a "$ROOT/dist/ubuntu-server/." "$PREFIX/server/"
+cp -a "$ROOT/dist/ubuntu-client/." "$PREFIX/client/"
+chmod 0755 "$PREFIX/server/AetherLink.Server" "$PREFIX/client/AetherLink.Client"
 for cfg in client.example.yaml server.example.yaml; do
   [ -f "$PREFIX/$cfg" ] || cp -f "$ROOT/configs/$cfg" "$PREFIX/$cfg"
 done

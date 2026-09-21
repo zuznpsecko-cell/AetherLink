@@ -103,8 +103,9 @@ cp -f target/release/libaetherlink_ffi.so dist/ubuntu-server/libaetherlink_core.
 
 echo "==> [6/8] Install to $PREFIX..."
 install -d "$PREFIX/server" "$STATE_DIR"
-install -m 0755 dist/ubuntu-server/AetherLink.Server "$PREFIX/server/"
-cp -f dist/ubuntu-server/libaetherlink_core.so "$PREFIX/server/"
+# Full publish dir (see install.sh): the apphost exe alone won't run.
+cp -a dist/ubuntu-server/. "$PREFIX/server/"
+chmod 0755 "$PREFIX/server/AetherLink.Server"
 mkdir -p "$PREFIX/server/fallback"
 [ -f "$PREFIX/server/fallback/index.html" ] || \
   echo "<html><body>AetherLink</body></html>" > "$PREFIX/server/fallback/index.html"
