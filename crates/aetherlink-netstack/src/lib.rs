@@ -3,10 +3,13 @@
 //! This crate provides TUN device management, smoltcp integration,
 //! and packet processing for the full tunnel data plane.
 
+pub mod debug;
 pub mod manager;
 pub mod smoltcp_wrapper;
 pub mod sockets;
 pub mod tun;
+
+pub use debug::{debug_enabled, debug_log};
 
 use thiserror::Error;
 

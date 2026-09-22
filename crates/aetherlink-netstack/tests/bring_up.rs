@@ -38,6 +38,33 @@ fn snapshot_roundtrip_via_state_file() {
 }
 
 #[test]
+fn up_state_roundtrip_carries_applied_log() {
+    // Given: snapshot + two applied changes
+    use aetherlink_netstack::tun::{AppliedChange, Snapshot, UpState};
+    let state = UpState {
+        snapshot: sample_snapshot(),
+        applied: vec![
+            AppliedChange::TunUp("aether0".to_string()),
+            AppliedChange::PinnedRoute("9.9.9.9".to_string()),
+        ],
+        dns_iface: "Ethernet 3".to_string(),
+    };
+    let path = std::env::temp_dir().join("aether-test-upstate.json");
+    // When: saved and loaded back
+    state.save(&path).expect("save");
+    let back = UpState::load(&path).expect("load");
+    // Then: identical (down/cleanup replay exactly this).
+    assert_eq!(back, state);
+    std::fs::remove_file(&path).ok();
+    // And: legacy bare-snapshot files do NOT parse as UpState (fail loud).
+    let legacy = std::env::temp_dir().join("aether-test-legacy.json");
+    sample_snapshot().save(&legacy).expect("save");
+    assert!(UpState::load(&legacy).is_err());
+    assert!(Snapshot::load(&legacy).is_ok());
+    std::fs::remove_file(&legacy).ok();
+}
+
+#[test]
 fn rollback_plan_reverses_lifo() {
     // Given: three applied changes in order
     let log = vec![
@@ -66,6 +93,32 @@ fn down_without_up_is_safe() {
     // Then: no-op Ok
     m.down().expect("down without up");
     assert!(!m.is_up());
+}
+
+#[test]
+fn rollback_plan_maps_direct_routes_to_removals() {
+    // Given: pin + direct-rule + default + dns applied in order
+    use aetherlink_netstack::tun::{rollback_plan, AppliedChange, RestoreOp};
+    let log = vec![
+        AppliedChange::TunUp("aether0".to_string()),
+        AppliedChange::PinnedRoute("9.9.9.9".to_string()),
+        AppliedChange::DirectRoute("10.0.0.0/8".to_string()),
+        AppliedChange::DefaultViaTun,
+        AppliedChange::DnsOverride(vec!["1.1.1.1".to_string()]),
+    ];
+    // When: planning rollback → Then: strict reverse, direct rule removed
+    // like a pin (same destination-based `route delete`).
+    let plan = rollback_plan(&log);
+    assert_eq!(
+        plan,
+        vec![
+            RestoreOp::RestoreDns(vec!["1.1.1.1".to_string()]),
+            RestoreOp::RemoveDefaultViaTun,
+            RestoreOp::RemovePinnedRoute("10.0.0.0/8".to_string()),
+            RestoreOp::RemovePinnedRoute("9.9.9.9".to_string()),
+            RestoreOp::TunDown("aether0".to_string()),
+        ]
+    );
 }
 
 #[test]

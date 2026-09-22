@@ -48,12 +48,14 @@ impl Snapshot {
 }
 
 /// One applied bring-up change (appended in application order).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppliedChange {
     /// TUN device created.
     TunUp(String),
     /// Server-IP pin route via physical gateway.
     PinnedRoute(String),
+    /// Custom direct rule route (`ip`, `base/prefix` or `lo-hi` display).
+    DirectRoute(String),
     /// Default route redirected into TUN.
     DefaultViaTun,
     /// System DNS overridden (previous servers carried for restore).
@@ -82,10 +84,69 @@ pub fn rollback_plan(log: &[AppliedChange]) -> Vec<RestoreOp> {
         .map(|change| match change {
             AppliedChange::TunUp(name) => RestoreOp::TunDown(name.clone()),
             AppliedChange::PinnedRoute(ip) => RestoreOp::RemovePinnedRoute(ip.clone()),
+            AppliedChange::DirectRoute(dest) => RestoreOp::RemovePinnedRoute(dest.clone()),
             AppliedChange::DefaultViaTun => RestoreOp::RemoveDefaultViaTun,
             AppliedChange::DnsOverride(servers) => RestoreOp::RestoreDns(servers.clone()),
         })
         .collect()
+}
+
+/// Previous default gateway from a snapshot, if one was captured.
+///
+/// Shared by bring-up (pin/direct routes go via it) and rollback (pin and
+/// direct removals need the same gateway back).
+#[must_use]
+pub fn previous_gateway(snap: &Snapshot) -> Option<std::net::Ipv4Addr> {
+    snap.routes
+        .iter()
+        .find(|r| r.dest == "default")
+        .and_then(|r| r.via.parse().ok())
+}
+
+/// Crash-recovery state: pre-up snapshot plus the applied-change log.
+///
+/// `down`/`force_cleanup` replay `rollback_plan(applied)` so recovery works
+/// even when the applying process is gone (only the file survives).
+/// `dns_iface` is the physical interface DNS was forced on: a fresh
+/// `cleanup` cannot re-derive it (the default route may point elsewhere by
+/// then, e.g. another VPN came up), so it is persisted, not re-looked-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpState {
+    /// Network state before `up`.
+    pub snapshot: Snapshot,
+    /// Mutations applied, in order (empty prefix = nothing applied yet).
+    pub applied: Vec<AppliedChange>,
+    /// Physical interface whose DNS was overridden.
+    pub dns_iface: String,
+}
+
+impl UpState {
+    /// Persist to the state file (pretty JSON).
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let raw = serde_json::to_string_pretty(self)
+            .map_err(|e| NetstackError::TunError(format!("state encode: {e}")))?;
+        std::fs::write(path, raw).map_err(NetstackError::Io)?;
+        Ok(())
+    }
+
+    /// Load persisted state.
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read(path).map_err(NetstackError::Io)?;
+        serde_json::from_slice(&raw)
+            .map_err(|e| NetstackError::TunError(format!("state decode: {e}")))
+    }
+}
+
+/// Packet I/O over a TUN device (W3 bridge contract).
+///
+/// `FakeTun` in tests implements this in memory; the real `TunInterface`
+/// drives wintun on Windows (Linux ioctls land in the platform task).
+/// `Send` so the handle crosses into pump threads.
+pub trait TunPackets: Send {
+    /// Non-blocking receive: `Ok(None)` means no packet queued.
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>>;
+    /// Send one raw IP packet into the device.
+    fn send_packet(&mut self, pkt: &[u8]) -> Result<()>;
 }
 
 /// TUN interface handle (owns the driver session on Windows).
@@ -96,7 +157,11 @@ pub struct TunInterface {
     pub mtu: u32,
     /// Live Wintun session; `None` until the platform task wires packet I/O.
     #[cfg(windows)]
-    session: Option<wintun::Session>,
+    session: Option<std::sync::Arc<wintun::Session>>,
+    /// Adapter handle, retained so `delete` needs no name lookup
+    /// (open-by-name is unreliable across runs; the handle is exact).
+    #[cfg(windows)]
+    adapter: Option<std::sync::Arc<wintun::Adapter>>,
 }
 
 impl std::fmt::Debug for TunInterface {
@@ -172,9 +237,17 @@ impl TunInterface {
     #[cfg(windows)]
     fn open_windows(config: &TunConfig) -> Result<Self> {
         let lib = Self::load_wintun()?;
+        crate::debug_log(&format!("wintun loaded for '{}'", config.name));
         let adapter = match wintun::Adapter::open(&lib, &config.name) {
-            Ok(adapter) => adapter,
-            Err(_) => {
+            Ok(adapter) => {
+                crate::debug_log(&format!("wintun open existing '{}'", config.name));
+                adapter
+            }
+            Err(e) => {
+                crate::debug_log(&format!(
+                    "wintun open '{}' missed ({e}), creating",
+                    config.name
+                ));
                 wintun::Adapter::create(&lib, &config.name, "AetherLink", None).map_err(|e| {
                     NetstackError::TunError(format!(
                         "wintun adapter '{}' needs Administrator rights: {e}",
@@ -183,6 +256,49 @@ impl TunInterface {
                 })?
             }
         };
+        // Wintun keeps an internal name ("aether0") apart from the Friendly
+        // Name `netsh` addresses ("Local Area Connection N" by default).
+        // Align them so `netsh interface ip set address` finds the device;
+        // the OS registers renames asynchronously, hence retries.
+        let mut last_err = String::new();
+        let mut named = false;
+        for attempt in 0..10 {
+            match adapter.get_name() {
+                Ok(current) if current == config.name => {
+                    crate::debug_log(&format!(
+                        "wintun friendly name already '{}' (attempt {attempt})",
+                        config.name
+                    ));
+                    named = true;
+                    break;
+                }
+                Ok(current) => {
+                    crate::debug_log(&format!(
+                        "wintun friendly name is '{current}', renaming to '{}' (attempt {attempt})",
+                        config.name
+                    ));
+                    match adapter.set_name(&config.name) {
+                        Ok(()) => {
+                            named = true;
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = format!("rename: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = format!("get_name: {e}");
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if !named {
+            return Err(NetstackError::TunError(format!(
+                "wintun adapter '{}' friendly-name sync failed: {last_err}",
+                config.name
+            )));
+        }
         let session = adapter
             .start_session(wintun::MAX_RING_CAPACITY)
             .map_err(|e| {
@@ -191,10 +307,98 @@ impl TunInterface {
         Ok(Self {
             name: config.name.clone(),
             mtu: config.mtu,
-            session: Some(session),
+            session: Some(std::sync::Arc::new(session)),
+            adapter: Some(adapter),
         })
     }
+}
 
+impl TunInterface {
+    /// End the session and delete the wintun adapter (no accumulation).
+    ///
+    /// Consumes the handle: session drops first (device goes dark), then the
+    /// last adapter ref unwraps for deletion. A foreign adapter (none held)
+    /// is left alone — crash recovery deletes nothing it didn't open.
+    pub fn delete(self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let name = self.name.clone();
+            drop(self.session);
+            match self.adapter {
+                Some(a) => match std::sync::Arc::try_unwrap(a) {
+                    Ok(adapter) => adapter.delete().map_err(|e| {
+                        NetstackError::TunError(format!("wintun delete '{name}': {e}"))
+                    }),
+                    Err(_) => Err(NetstackError::TunError(format!(
+                        "wintun delete '{name}': handle still shared"
+                    ))),
+                },
+                None => Ok(()),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            Err(NetstackError::TunError(
+                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+impl TunPackets for TunInterface {
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        #[cfg(windows)]
+        {
+            let sess = self
+                .session
+                .as_ref()
+                .ok_or_else(|| NetstackError::TunError("wintun session not open".to_string()))?;
+            sess.try_receive()
+                .map(|opt| opt.map(|p| p.bytes().to_vec()))
+                .map_err(|e| NetstackError::TunError(format!("wintun recv: {e}")))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            Err(NetstackError::TunError(
+                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
+                    .to_string(),
+            ))
+        }
+    }
+
+    fn send_packet(&mut self, pkt: &[u8]) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let sess = self
+                .session
+                .as_ref()
+                .ok_or_else(|| NetstackError::TunError("wintun session not open".to_string()))?;
+            let len = u16::try_from(pkt.len()).map_err(|_| {
+                NetstackError::InvalidPacket(format!("packet too large {}", pkt.len()))
+            })?;
+            let mut slot = sess
+                .allocate_send_packet(len)
+                .map_err(|e| NetstackError::TunError(format!("wintun alloc send: {e}")))?;
+            slot.bytes_mut().copy_from_slice(pkt);
+            sess.send_packet(slot);
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pkt;
+            let _ = self;
+            Err(NetstackError::TunError(
+                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+impl TunInterface {
     /// Load wintun.dll: first next to the current executable (installed
     /// layout), then by default search rules (dev CWD).
     #[cfg(windows)]
