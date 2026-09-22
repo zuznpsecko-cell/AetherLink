@@ -93,6 +93,17 @@ pub fn parse_route_print(output: &str) -> Result<RouteTable> {
     })
 }
 
+/// Strip a trailing parenthesized suffix (`(Preferred)`, `(Основной)`).
+fn clean_ip(value: &str) -> &str {
+    let v = value.trim();
+    if v.ends_with(')') {
+        if let Some(pos) = v.rfind('(') {
+            return v[..pos].trim();
+        }
+    }
+    v
+}
+
 /// Parse `ipconfig /all` output into `(dns_servers, adapter_name → ipv4)`.
 ///
 /// Locale-independent: matches on technical tokens (`DNS`, `IPv4`, absence
@@ -114,40 +125,42 @@ pub fn parse_ipconfig(output: &str) -> (Vec<String>, HashMap<String, String>) {
             in_dns = upper.contains("DNS");
             // Header lines carry no dots ("Ethernet adapter X:" in any language).
             if trimmed.ends_with(':') && !label.contains('.') {
+                // Adapter name follows the kind word ("adapter"/"адаптер");
+                // Russian prefixes the state ("Неизвестный адаптер X").
                 let lower = label.to_lowercase();
-                let name = if let Some(pos) = lower.find(" adapter ") {
-                    label[pos + " adapter ".len()..].trim().to_string()
-                } else {
-                    label
+                let cut = lower
+                    .rfind("adapter ")
+                    .map(|p| p + "adapter ".len())
+                    .or_else(|| lower.rfind("адаптер ").map(|p| p + "адаптер ".len()));
+                let name = match cut {
+                    Some(pos) => label[pos..].trim().to_string(),
+                    None => label
                         .split_whitespace()
                         .skip(1)
                         .collect::<Vec<_>>()
-                        .join(" ")
+                        .join(" "),
                 };
                 if !name.is_empty() {
                     adapter = Some(name);
                 }
                 continue;
             }
-            let value = value
-                .trim()
-                .trim_end_matches("(Preferred)")
-                .trim()
-                .to_string();
+            let value = value.trim();
+            let value = clean_ip(value);
             if in_dns {
                 if !value.is_empty() && value.parse::<Ipv4Addr>().is_ok() {
-                    dns.push(value);
+                    dns.push(value.to_string());
                 }
             } else if upper.contains("IPV4") {
                 if let (Some(name), Ok(_)) = (adapter.clone(), value.parse::<Ipv4Addr>()) {
-                    ifaces.insert(name, value);
+                    ifaces.insert(name, value.to_string());
                 }
             }
             continue;
         }
         // Bare continuation line: only meaningful inside a DNS block.
-        if in_dns && trimmed.parse::<Ipv4Addr>().is_ok() {
-            dns.push(trimmed.to_string());
+        if in_dns && clean_ip(trimmed).parse::<Ipv4Addr>().is_ok() {
+            dns.push(clean_ip(trimmed).to_string());
         } else {
             in_dns = false;
         }
@@ -228,6 +241,46 @@ pub fn dns_set_args(iface: &str, dns: &str) -> Vec<String> {
     ]
 }
 
+/// Arg vector for `netsh interface set interface` admin state.
+///
+/// A newborn wintun adapter is disabled (`netsh` answers "interface may be
+/// disabled"); enabling is a prerequisite for address assignment.
+pub fn iface_admin_args(name: &str, enable: bool) -> Result<Vec<String>> {
+    if name.is_empty() {
+        return Err(ClientError::RoutingError("tun name empty".to_string()));
+    }
+    Ok(vec![
+        "interface".to_string(),
+        "set".to_string(),
+        "interface".to_string(),
+        format!("name=\"{name}\""),
+        format!("admin={}", if enable { "enabled" } else { "disabled" }),
+    ])
+}
+
+/// Arg vector for `netsh interface ipv4 set address` (wintun-crate pattern).
+///
+/// Named params with a quoted name; no gateway (point-to-point TUN — a bare
+/// `none` gateway is a syntax error, found live). Matches the template the
+/// `wintun` crate itself uses in `set_network_addresses_tuple`.
+pub fn tun_addr_args(name: &str, ip: &str, prefix: u8) -> Result<Vec<String>> {
+    if name.is_empty() {
+        return Err(ClientError::RoutingError("tun name empty".to_string()));
+    }
+    ip.parse::<Ipv4Addr>()
+        .map_err(|_| ClientError::RoutingError(format!("bad tun ip {ip}")))?;
+    Ok(vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "address".to_string(),
+        format!("name=\"{name}\""),
+        "source=static".to_string(),
+        format!("address={ip}"),
+        format!("mask={}", prefix_to_mask(prefix)?),
+    ])
+}
+
 /// Run `route print -4` and parse it (read-only, no privileges needed).
 pub fn read_route_table() -> Result<RouteTable> {
     let out = Command::new("route")
@@ -240,8 +293,30 @@ pub fn read_route_table() -> Result<RouteTable> {
     parse_route_print(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Run `ipconfig /all` and return DNS servers (read-only, no privileges).
-pub fn read_dns() -> Result<Vec<String>> {
+/// Decode console-command output.
+///
+/// `ipconfig` under `cmd.exe` redirection writes UTF-16LE with a BOM;
+/// spawned directly it emits the OEM console page (IBM866 on RU Windows)
+/// with no BOM at all. Sniff BOM → UTF-16LE; valid UTF-8 passes through;
+/// otherwise OEM IBM866. `route` output is pure ASCII either way.
+#[must_use]
+pub fn decode_cmd_output(raw: &[u8]) -> String {
+    if raw.starts_with(&[0xFF, 0xFE]) {
+        let words: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&words)
+    } else if std::str::from_utf8(raw).is_ok() {
+        // Safe: just checked.
+        String::from_utf8_lossy(raw).into_owned()
+    } else {
+        encoding_rs::IBM866.decode(raw).0.into_owned()
+    }
+}
+
+/// Run `ipconfig /all` and return decoded text (read-only, no privileges).
+pub fn read_ipconfig_text() -> Result<String> {
     let out = Command::new("ipconfig")
         .args(["/all"])
         .output()
@@ -249,5 +324,10 @@ pub fn read_dns() -> Result<Vec<String>> {
     if !out.status.success() {
         return Err(ClientError::PlatformError("ipconfig failed".to_string()));
     }
-    Ok(parse_ipconfig(&String::from_utf8_lossy(&out.stdout)).0)
+    Ok(decode_cmd_output(&out.stdout))
+}
+
+/// Run `ipconfig /all` and return DNS servers (read-only, no privileges needed).
+pub fn read_dns() -> Result<Vec<String>> {
+    Ok(parse_ipconfig(&read_ipconfig_text()?).0)
 }

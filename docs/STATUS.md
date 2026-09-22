@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-09-21 (TDD 180/180 green, fmt clean, clippy warnings-only)_
+_Last Updated: 2026-09-22 (TDD 194/194 green, fmt clean, clippy warnings-only; Windows up/down live cycle green)_
 
 ## Overview
 
@@ -14,7 +14,7 @@ _Last Updated: 2026-09-21 (TDD 180/180 green, fmt clean, clippy warnings-only)_
 | **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, ALPN h2, sync I/O (3) |
 | **Phase A: Session handshake** | ✅ Done | PREFACE+AUTH → keys → mux DATA both ways (4) |
 | **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve (8+4+4+1) |
-| **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun open tested; live run + socket↔mux bridge (W3/W4) pending privs |
+| **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun open + TunPackets/DataPump + pump threads tested; Windows up/down live cycle green (LIVE_W4); traffic through tunnel pending transport attach |
 | **Phase 8: Full Tunnel + Routing** | ✅ Done | Ruleset/DNS-policy/cleanup + full `up` over fake platform (8+11) |
 | **Phase 9: FFI API** | ✅ Done | C ABI smoke + rules/log-cb/android-fd + JNI symbols (5+5) |
 | **Phase 10: Client Integration** | ✅ Done | Typed config, lifecycle, status JSON |
@@ -43,10 +43,10 @@ _Last Updated: 2026-09-21 (TDD 180/180 green, fmt clean, clippy warnings-only)_
 | aetherlink-crypto | ✅ | ✅ 33 |
 | aetherlink-frame | ✅ | ✅ 19 |
 | aetherlink-mux | ✅ | ✅ 6 + 8 |
-| aetherlink-netstack | ✅ | ✅ 6 + 9 + 6 + 4 |
+| aetherlink-netstack | ✅ | ✅ 1 + 11 + 6 + 4 |
 | aetherlink-core | ✅ | ✅ 3 + 4 + 4 |
 | aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 |
-| aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 11 + 7 |
+| aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 6 + 4 + 2 + 13 + 10 |
 | aetherlink-ffi | ✅ | ✅ 3 + 5 + 5 (+cdylib) |
 | aetherlink-protocol | ✅ | ✅ 6 + 5 |
 

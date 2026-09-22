@@ -5,8 +5,8 @@
 //! proves parsing against the real machine without privileges.
 
 use aetherlink_client::platform::windows::{
-    dns_set_args, parse_ipconfig, parse_route_print, prefix_to_mask, route_add_args,
-    route_delete_args,
+    dns_set_args, iface_admin_args, parse_ipconfig, parse_route_print, prefix_to_mask,
+    route_add_args, route_delete_args, tun_addr_args,
 };
 
 const ROUTE_PRINT: &str = "\
@@ -144,6 +144,83 @@ fn dns_arg_builders() {
             "static".to_string(),
             "10.255.0.1".to_string(),
         ],
+    );
+}
+
+#[test]
+fn tun_addr_arg_builder() {
+    // Given: wintun adapter name + TUN address
+    // When/Then: netsh static-address args, no gateway (point-to-point TUN).
+    assert_eq!(
+        tun_addr_args("aether0", "10.255.0.2", 30).expect("args"),
+        vec![
+            "interface".to_string(),
+            "ipv4".to_string(),
+            "set".to_string(),
+            "address".to_string(),
+            "name=\"aether0\"".to_string(),
+            "source=static".to_string(),
+            "address=10.255.0.2".to_string(),
+            "mask=255.255.255.252".to_string(),
+        ],
+    );
+    assert!(tun_addr_args("aether0", "999.0.0.1", 30).is_err());
+    assert!(tun_addr_args("", "10.255.0.2", 30).is_err());
+}
+
+#[test]
+fn iface_admin_arg_builder() {
+    // Given: newborn (disabled) wintun adapter
+    // Then: enable/disable args in the crate's quoted-name pattern.
+    assert_eq!(
+        iface_admin_args("aether0", true).expect("args"),
+        vec![
+            "interface".to_string(),
+            "set".to_string(),
+            "interface".to_string(),
+            "name=\"aether0\"".to_string(),
+            "admin=enabled".to_string(),
+        ],
+    );
+    assert_eq!(
+        iface_admin_args("aether0", false).expect("args")[4],
+        "admin=disabled".to_string(),
+    );
+    assert!(iface_admin_args("", true).is_err());
+}
+
+#[test]
+fn decode_utf16le_bom_ipconfig() {
+    // Given: ipconfig bytes as Windows really emits them (UTF-16LE + BOM)
+    let text = "Unknown adapter singbox_tun:\r\n   IPv4 Address. . . : 172.18.0.1(Preferred)\r\n";
+    let mut raw = vec![0xFF, 0xFE];
+    for w in text.encode_utf16() {
+        raw.extend_from_slice(&w.to_le_bytes());
+    }
+    // When: decoding -> Then: headers end with ':' again, IPv4 mapping parses.
+    let decoded = aetherlink_client::platform::windows::decode_cmd_output(&raw);
+    let (_, ifaces) = parse_ipconfig(&decoded);
+    assert_eq!(
+        ifaces.get("singbox_tun").map(String::as_str),
+        Some("172.18.0.1")
+    );
+    // And: plain UTF-8 passthrough still works.
+    assert_eq!(
+        aetherlink_client::platform::windows::decode_cmd_output(b"plain"),
+        "plain"
+    );
+    // And: OEM IBM866 (direct-spawn ipconfig on RU Windows) decodes to text.
+    let oem: Vec<u8> = vec![
+        0x8D, 0xA5, 0xA8, 0xA7, 0xA2, 0xA5, 0xE1, 0xE2, 0xAD, 0xEB,
+        0xA9, // Неизвестный
+        0x20, // space
+        0xA0, 0xA4, 0xA0, 0xAF, 0xE2, 0xA5, 0xE0, // адаптер
+        0x20, // space
+        b's', b'i', b'n', b'g', b'b', b'o', b'x', b'_', b't', b'u', b'n', b':',
+    ];
+    assert_eq!(
+        aetherlink_client::platform::windows::decode_cmd_output(&oem),
+        "Неизвестный адаптер singbox_tun:"
     );
 }
 

@@ -55,6 +55,7 @@ fn down_after_failed_up_is_safe() {
 #[test]
 fn repeated_up_is_noop_when_up() {
     // Given: working platform, client already up
+    let _ = std::fs::remove_file(temp_state("repeat"));
     let mut plat = FakePlatform::working(temp_state("repeat"));
     let mut client = aetherlink_client::Client::new_config(test_config());
     client.up_on(&mut plat).expect("first up");
@@ -83,6 +84,7 @@ fn rollback_restores_on_midway_failure() {
 #[test]
 fn server_ip_pinned_via_previous_gateway() {
     // Given: working platform, server name resolving to a fixed IP
+    let _ = std::fs::remove_file(temp_state("pin"));
     let mut plat = FakePlatform::working(temp_state("pin"));
     // When: up succeeds
     lifecycle::up(&mut plat, &test_config()).expect("up");
@@ -104,6 +106,7 @@ fn server_ip_pinned_via_previous_gateway() {
 #[test]
 fn dns_forced_to_virtual_resolver_on_up() {
     // Given: working platform
+    let _ = std::fs::remove_file(temp_state("dns"));
     let mut plat = FakePlatform::working(temp_state("dns"));
     // When: up succeeds → Then: system DNS is the virtual resolver only.
     lifecycle::up(&mut plat, &test_config()).expect("up");
@@ -116,11 +119,15 @@ fn successful_up_writes_snapshot_down_removes_it() {
     let path = temp_state("snap");
     let _ = std::fs::remove_file(&path);
     let mut plat = FakePlatform::working(path.clone());
-    // When: up → Then: snapshot file holds the pre-up state.
+    // When: up → Then: state file holds pre-up snapshot + applied log.
     lifecycle::up(&mut plat, &test_config()).expect("up");
     assert!(path.exists());
-    let snap = aetherlink_netstack::tun::Snapshot::load(&path).expect("load snapshot");
-    assert_eq!(snap.dns_servers, vec!["192.168.1.1".to_string()]);
+    let state = aetherlink_netstack::tun::UpState::load(&path).expect("load state");
+    assert_eq!(state.snapshot.dns_servers, vec!["192.168.1.1".to_string()]);
+    assert!(
+        !state.applied.is_empty(),
+        "applied log must record mutations"
+    );
     // When: down → Then: snapshot consumed, device gone.
     lifecycle::down(&mut plat).expect("down");
     assert!(!plat.tun_exists());
@@ -142,6 +149,25 @@ fn cleanup_consumes_state_file_idempotently() {
 }
 
 #[test]
+fn cleanup_replays_empty_applied_log() {
+    // Given: crash state with no applied mutations (fresh RealPlatform,
+    // no netsh calls possible — replay must be a silent no-op).
+    let path = temp_state("crash-empty");
+    let state = aetherlink_netstack::tun::UpState {
+        snapshot: aetherlink_netstack::tun::Snapshot {
+            routes: vec![],
+            dns_servers: vec!["192.168.1.1".to_string()],
+        },
+        applied: vec![],
+        dns_iface: String::new(),
+    };
+    state.save(&path).expect("save");
+    // When: force cleanup → Then: Ok, file consumed.
+    cleanup::force_cleanup_from(&path).expect("cleanup");
+    assert!(!path.exists());
+}
+
+#[test]
 fn resolve_happens_before_any_mutation() {
     // Given: platform failing DNS resolution itself
     let mut plat = FakePlatform::failing_at(Step::Resolve, temp_state("resolve"));
@@ -153,6 +179,7 @@ fn resolve_happens_before_any_mutation() {
 #[test]
 fn custom_ip_rule_installed_direct() {
     // Given: config with an ip direct-rule
+    let _ = std::fs::remove_file(temp_state("rules"));
     let mut plat = FakePlatform::working(temp_state("rules"));
     let cfg = ClientConfig::parse(&serde_json::json!({
         "server_addr": "example.com:443",
@@ -173,6 +200,19 @@ fn custom_ip_rule_installed_direct() {
 }
 
 #[test]
+fn up_refuses_when_state_file_exists() {
+    // Given: leftover state file from a previous (maybe crashed) up
+    let path = temp_state("double-up");
+    std::fs::write(&path, "{}").expect("plant state");
+    let mut plat = FakePlatform::working(path.clone());
+    // When: up → Then: Err before any mutation, file left for cleanup.
+    assert!(lifecycle::up(&mut plat, &test_config()).is_err());
+    assert_eq!(plat.applied_count(), 0);
+    assert!(path.exists(), "guard must not consume foreign state");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn client_status_reflects_lifecycle() {
     // Given: fresh client
     let mut client = aetherlink_client::Client::new_config(test_config());
@@ -180,6 +220,7 @@ fn client_status_reflects_lifecycle() {
         serde_json::from_str(&client.status().expect("status")).expect("json");
     assert_eq!(v["up"], false);
     // When: up on a working platform → Then: status flips.
+    let _ = std::fs::remove_file(temp_state("status"));
     let mut plat = FakePlatform::working(temp_state("status"));
     client.up_on(&mut plat).expect("up");
     let v: serde_json::Value =

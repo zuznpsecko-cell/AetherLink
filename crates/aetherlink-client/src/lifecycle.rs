@@ -18,6 +18,7 @@ use crate::platform::Platform;
 use crate::routing::Matcher;
 use crate::{ClientError, Result};
 use aetherlink_core::{session, tls};
+use aetherlink_netstack::tun::{previous_gateway, AppliedChange, UpState};
 
 /// Client TUN address inside `10.255.0.0/30` (DECISIONS D2).
 pub const CLIENT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 0, 2);
@@ -30,12 +31,21 @@ static RECONFIGURE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Bring the tunnel up against `platform`. Idempotent only via `Client`;
 /// calling `up` twice without `down` re-applies (platforms dedupe).
+///
+/// Refuses when a state file already exists (a previous `up` is live or died
+/// without cleanup): run `down`/`force_cleanup` first, never stack tunnels.
 pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
     let _guard = RECONFIGURE.lock().expect("reconfigure mutex");
     let (host, _port) = config
         .server_addr
         .rsplit_once(':')
         .ok_or_else(|| ClientError::ConfigError("server_addr must be host:port".to_string()))?;
+    let state_path = platform.state_path();
+    if state_path.exists() {
+        return Err(ClientError::PlatformError(
+            "tunnel already up or stale state file: run down/cleanup first".to_string(),
+        ));
+    }
     // 1. Resolve once, pre-tunnel (a single system-DNS use is allowed here).
     let ips = platform.resolve_host(host)?;
     let server_ip = ips
@@ -44,27 +54,52 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         .or_else(|| ips.first())
         .copied()
         .ok_or_else(|| ClientError::PlatformError("no server address".to_string()))?;
+    aetherlink_netstack::debug_log(&format!("up: server {host} -> {server_ip}"));
     // 2. Snapshot before touching anything.
     let snap = platform.snapshot()?;
-    let state_path = platform.state_path();
-    let failed = |platform: &mut dyn Platform| {
-        let _ = platform.restore(&snap);
+    aetherlink_netstack::debug_log("up: snapshot ok");
+    // Applied-change log, persisted after every mutation so a crash mid-up
+    // still leaves a replayable state file (DNS target = up-time iface).
+    let mut applied: Vec<AppliedChange> = Vec::new();
+    let dns_iface = platform.captured_iface().unwrap_or_default();
+    let persist = |applied: &[AppliedChange]| -> Result<()> {
+        UpState {
+            snapshot: snap.clone(),
+            applied: applied.to_vec(),
+            dns_iface: dns_iface.clone(),
+        }
+        .save(&state_path)
+        .map_err(ClientError::from)
+    };
+    let failed = |platform: &mut dyn Platform, applied: &[AppliedChange]| {
+        let state = UpState {
+            snapshot: snap.clone(),
+            applied: applied.to_vec(),
+            dns_iface: platform.captured_iface().unwrap_or_default(),
+        };
+        let _ = platform.restore_applied(&state);
         let _ = std::fs::remove_file(&state_path);
     };
     // 3. TUN device.
     if let Err(e) = platform.tun_up("aether0", CLIENT_TUN_IP, config.mtu) {
-        failed(platform);
+        failed(platform, &applied);
         return Err(e);
     }
-    // 4. Persist the snapshot: crash recovery starts being possible here.
-    if let Err(e) = snap.save(&state_path) {
-        failed(platform);
-        return Err(ClientError::from(e));
+    applied.push(AppliedChange::TunUp("aether0".to_string()));
+    if let Err(e) = persist(&applied) {
+        failed(platform, &applied);
+        return Err(e);
     }
+    aetherlink_netstack::debug_log("up: tun ok");
     // 5. Pin the server IP via the previous default gateway.
     if let Some(gateway) = previous_gateway(&snap) {
         if let Err(e) = platform.pin_route(server_ip, gateway) {
-            failed(platform);
+            failed(platform, &applied);
+            return Err(e);
+        }
+        applied.push(AppliedChange::PinnedRoute(server_ip.to_string()));
+        if let Err(e) = persist(&applied) {
+            failed(platform, &applied);
             return Err(e);
         }
     }
@@ -78,42 +113,60 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         };
         if let Some(gateway) = previous_gateway(&snap) {
             if let Err(e) = platform.add_route(&dest, gateway) {
-                failed(platform);
+                failed(platform, &applied);
+                return Err(e);
+            }
+            applied.push(AppliedChange::DirectRoute(dest));
+            if let Err(e) = persist(&applied) {
+                failed(platform, &applied);
                 return Err(e);
             }
         }
     }
     // 7. Default into the tunnel.
     if let Err(e) = platform.default_via_tun() {
-        failed(platform);
+        failed(platform, &applied);
         return Err(e);
     }
+    applied.push(AppliedChange::DefaultViaTun);
+    if let Err(e) = persist(&applied) {
+        failed(platform, &applied);
+        return Err(e);
+    }
+    aetherlink_netstack::debug_log("up: default-via-tun ok");
     // 8. DNS into the tunnel.
     if let Err(e) = platform.force_dns(VIRTUAL_DNS_IP) {
-        failed(platform);
+        failed(platform, &applied);
         return Err(e);
     }
+    applied.push(AppliedChange::DnsOverride(snap.dns_servers.clone()));
+    if let Err(e) = persist(&applied) {
+        failed(platform, &applied);
+        return Err(e);
+    }
+    aetherlink_netstack::debug_log("up: dns ok");
     Ok(())
 }
 
-/// Previous default gateway from a snapshot, if one was captured.
-fn previous_gateway(snap: &aetherlink_netstack::tun::Snapshot) -> Option<Ipv4Addr> {
-    snap.routes
-        .iter()
-        .find(|r| r.dest == "default")
-        .and_then(|r| r.via.parse().ok())
-}
-
-/// Down: restore the snapshot, consume the state file, destroy TUN.
+/// Down: replay the applied-change log, consume the state file, destroy TUN.
 ///
 /// Safe no-op when not up; every step is best-effort so teardown never
-/// fails its caller (idempotent by contract).
+/// fails its caller (idempotent by contract). Replay outcomes are traced
+/// (never silent) under `AETHERLINK_DEBUG`.
 pub fn down(platform: &mut dyn Platform) -> Result<()> {
     let _guard = RECONFIGURE.lock().expect("reconfigure mutex");
     let path = platform.state_path();
-    if let Ok(snap) = aetherlink_netstack::tun::Snapshot::load(&path) {
-        let _ = platform.restore(&snap);
-        let _ = std::fs::remove_file(&path);
+    match UpState::load(&path) {
+        Ok(state) => {
+            match platform.restore_applied(&state) {
+                Ok(()) => aetherlink_netstack::debug_log("down: replay ok"),
+                Err(e) => aetherlink_netstack::debug_log(&format!("down: replay issues: {e}")),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        Err(e) => {
+            aetherlink_netstack::debug_log(&format!("down: no state ({e}), tun teardown only"));
+        }
     }
     let _ = platform.tun_down();
     Ok(())

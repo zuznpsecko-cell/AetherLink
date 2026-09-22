@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
-use aetherlink_netstack::tun::{Route, Snapshot};
+use aetherlink_netstack::tun::{previous_gateway, RestoreOp};
+use aetherlink_netstack::tun::{rollback_plan, AppliedChange, Route, Snapshot};
 
 use crate::{ClientError, Result};
 
@@ -36,6 +37,23 @@ pub enum Step {
 
 fn pending(what: &str) -> ClientError {
     ClientError::PlatformError(format!("platform apply pending: {what}"))
+}
+
+/// Treat "route already exists" as success (stale/duplicate state converges).
+///
+/// Narrow match on purpose: only "already exists" (EN) / "уже существует"
+/// (RU) pass; every other failure still aborts `up`.
+fn tolerate_exists<T>(r: Result<T>, what: &str) -> Result<()> {
+    match r {
+        Ok(_) => Ok(()),
+        Err(ClientError::PlatformError(msg))
+            if msg.contains("already exists") || msg.contains("уже существует") =>
+        {
+            aetherlink_netstack::debug_log(&format!("route {what} exists, keeping"));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Default crash-recovery state file path per OS.
@@ -89,6 +107,22 @@ pub trait Platform: Send {
         Err(pending("restore"))
     }
 
+    /// Replay a persisted applied-change log against its snapshot.
+    ///
+    /// Crash-recovery path (`down` after a crash uses a fresh platform, so
+    /// per-instance state like `added_routes` is empty — the file is the
+    /// only truth). DNS goes back to `state.dns_iface` (persisted at `up`,
+    /// never re-derived: the default route may point elsewhere by now).
+    /// Default: legacy full restore, ignoring the log.
+    fn restore_applied(&mut self, state: &aetherlink_netstack::tun::UpState) -> Result<()> {
+        self.restore(&state.snapshot)
+    }
+
+    /// Physical interface captured at snapshot (DNS was/will be forced here).
+    fn captured_iface(&self) -> Option<String> {
+        None
+    }
+
     /// Crash-recovery state file path.
     fn state_path(&self) -> PathBuf {
         default_state_path()
@@ -100,6 +134,12 @@ pub trait Platform: Send {
 pub struct RealPlatform {
     /// Routes this instance added (for `restore`).
     added_routes: Vec<(String, String)>,
+    /// Physical default interface captured at `snapshot` time (before any
+    /// mutation moves the default route into TUN).
+    default_iface: Option<String>,
+    /// Live TUN session, held for the whole `up` (dropping it ends the
+    /// wintun session and the device goes dark, so it must outlive `up`).
+    tun: Option<aetherlink_netstack::tun::TunInterface>,
 }
 
 impl RealPlatform {
@@ -110,23 +150,40 @@ impl RealPlatform {
     }
 }
 
-/// Run a command, returning stdout or a named error (stderr snippet kept short).
+/// Run a command, returning stdout or a named error (both streams kept short).
 fn run(prog: &str, args: &[String]) -> Result<String> {
+    aetherlink_netstack::debug_log(&format!("run: {prog} {}", args.join(" ")));
     let out = std::process::Command::new(prog)
         .args(args)
         .output()
         .map_err(|e| ClientError::PlatformError(format!("spawn {prog}: {e}")))?;
     if !out.status.success() {
-        let tail = String::from_utf8_lossy(&out.stderr);
-        let tail: String = tail.chars().take(200).collect();
-        return Err(ClientError::PlatformError(format!("{prog} failed: {tail}")));
+        // netsh diagnostics go to stdout in the OEM page (cp866 here):
+        // decode properly or the message is mojibake.
+        let tail = |b: &[u8]| {
+            windows::decode_cmd_output(b)
+                .chars()
+                .take(500)
+                .collect::<String>()
+        };
+        aetherlink_netstack::debug_log(&format!(
+            "run failed: {prog} status={} out={} err={}",
+            out.status,
+            tail(&out.stdout),
+            tail(&out.stderr)
+        ));
+        return Err(ClientError::PlatformError(format!(
+            "{prog} failed: out={} err={}",
+            tail(&out.stdout),
+            tail(&out.stderr)
+        )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Resolve the local interface name owning `iface_ip` via ipconfig.
 fn iface_name_for(iface_ip: Ipv4Addr) -> Result<String> {
-    let out = run("ipconfig", &["/all".to_string()])?;
+    let out = windows::read_ipconfig_text()?;
     let (_, ifaces) = windows::parse_ipconfig(&out);
     let want = iface_ip.to_string();
     ifaces
@@ -139,6 +196,18 @@ fn iface_name_for(iface_ip: Ipv4Addr) -> Result<String> {
 impl RealPlatform {
     /// Interface name owning the default route (for `netsh` DNS targeting).
     fn default_iface(&self) -> Result<String> {
+        if let Some(name) = self.default_iface.clone() {
+            return Ok(name);
+        }
+        let table = windows::read_route_table()?;
+        let ip = table
+            .default_iface_ip()
+            .ok_or_else(|| ClientError::PlatformError("no default route".to_string()))?;
+        iface_name_for(ip)
+    }
+
+    /// Physical default interface name right now (pre-mutation calls only).
+    fn capture_default_iface() -> Result<String> {
         let table = windows::read_route_table()?;
         let ip = table
             .default_iface_ip()
@@ -166,16 +235,68 @@ impl Platform for RealPlatform {
     fn snapshot(&mut self) -> Result<Snapshot> {
         let table = windows::read_route_table()?;
         let dns = windows::read_dns()?;
+        // Capture the physical default interface BEFORE any mutation moves
+        // the default route into TUN (post-switch lookup finds no iface).
+        let iface = Self::capture_default_iface()?;
+        aetherlink_netstack::debug_log(&format!("snapshot: default_iface={iface} dns={dns:?}"));
+        self.default_iface = Some(iface);
         Ok(Snapshot {
             routes: table.routes,
             dns_servers: dns,
         })
     }
+    fn tun_up(&mut self, name: &str, addr: Ipv4Addr, _mtu: u32) -> Result<()> {
+        // Open first: the session must be alive while netsh works below,
+        // and the handle is stored (not dropped) so the device stays up.
+        let iface = aetherlink_netstack::tun::TunInterface::open(name)
+            .map_err(|e| ClientError::PlatformError(format!("tun open: {e}")))?;
+        // A newborn wintun adapter is disabled: enable first, then address
+        // it (/30 so pin/default-via-TUN resolve). A half-addressed adapter
+        // is reused by the next open-or-create, so just report. The OS
+        // registers newborn interfaces asynchronously: retry ~5s per step.
+        let enable_args = windows::iface_admin_args(name, true)?;
+        let addr_args = windows::tun_addr_args(name, &addr.to_string(), 30)?;
+        for args in [&enable_args, &addr_args] {
+            let mut last_err = ClientError::PlatformError("tun bring-up: no attempts".to_string());
+            let mut done = false;
+            for _ in 0..10 {
+                match run("netsh", args).map(|_| ()) {
+                    Ok(()) => {
+                        done = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+            if !done {
+                return Err(ClientError::PlatformError(format!(
+                    "tun {name}: {last_err}"
+                )));
+            }
+        }
+        self.tun = Some(iface);
+        aetherlink_netstack::debug_log(&format!("tun_up: {name} session held"));
+        Ok(())
+    }
 
-    fn tun_up(&mut self, name: &str, _addr: Ipv4Addr, _mtu: u32) -> Result<()> {
-        aetherlink_netstack::tun::TunInterface::open(name)
-            .map(|_| ())
-            .map_err(|e| ClientError::PlatformError(format!("tun open: {e}")))
+    fn tun_down(&mut self) -> Result<()> {
+        // Same as replay TunDown: end session + delete our adapter.
+        // Best-effort by contract (callers ignore the result), traced here.
+        match self.tun.take() {
+            Some(tun) => tun.delete().map_err(|e| {
+                let e = ClientError::PlatformError(format!("tun down: {e}"));
+                aetherlink_netstack::debug_log(&format!("{e}"));
+                e
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn captured_iface(&self) -> Option<String> {
+        self.default_iface.clone()
     }
 
     fn pin_route(&mut self, dest: IpAddr, via: Ipv4Addr) -> Result<()> {
@@ -188,7 +309,7 @@ impl Platform for RealPlatform {
             }
         };
         let args = windows::route_add_args(&dest, &via.to_string())?;
-        run("route", &args)?;
+        tolerate_exists(run("route", &args), &format!("pin {dest}"))?;
         self.added_routes.push((dest, via.to_string()));
         Ok(())
     }
@@ -208,7 +329,7 @@ impl Platform for RealPlatform {
             )));
         };
         let args = windows::route_add_args(&cidr, &via.to_string())?;
-        run("route", &args)?;
+        tolerate_exists(run("route", &args), &format!("route {cidr}"))?;
         self.added_routes.push((cidr, via.to_string()));
         Ok(())
     }
@@ -216,7 +337,7 @@ impl Platform for RealPlatform {
     fn default_via_tun(&mut self) -> Result<()> {
         let gw = crate::lifecycle::VIRTUAL_DNS_IP;
         let args = windows::route_add_args("0.0.0.0/0", &gw.to_string())?;
-        run("route", &args)?;
+        tolerate_exists(run("route", &args), "default-via-tun")?;
         self.added_routes
             .push(("0.0.0.0/0".to_string(), gw.to_string()));
         Ok(())
@@ -224,6 +345,7 @@ impl Platform for RealPlatform {
 
     fn force_dns(&mut self, dns_ip: Ipv4Addr) -> Result<()> {
         let iface = self.default_iface()?;
+        aetherlink_netstack::debug_log(&format!("force_dns: {dns_ip} on {iface}"));
         let args = windows::dns_set_args(&iface, &dns_ip.to_string());
         run("netsh", &args)?;
         Ok(())
@@ -236,12 +358,116 @@ impl Platform for RealPlatform {
         added.reverse();
         for (dest, gw) in added {
             if let Ok(args) = windows::route_delete_args(&dest, &gw) {
-                let _ = run("route", &args);
+                match run("route", &args) {
+                    Ok(_) => aetherlink_netstack::debug_log(&format!("restore: del {dest} ok")),
+                    Err(e) => aetherlink_netstack::debug_log(&format!("restore: del {dest}: {e}")),
+                }
             }
         }
         // Restore captured DNS explicitly (covers static origins too).
-        if let Ok(iface) = self.default_iface() {
-            for (i, server) in snap.dns_servers.iter().enumerate() {
+        let _ = self.restore_dns(&snap.dns_servers);
+        Ok(())
+    }
+
+    /// Replay a persisted applied-change log (crash recovery: per-instance
+    /// `added_routes` is empty, the file is the only truth). Best-effort per
+    /// op, but every outcome is traced; joined issues come back as `Err` so
+    /// `down` can log them instead of swallowing silently.
+    fn restore_applied(&mut self, state: &aetherlink_netstack::tun::UpState) -> Result<()> {
+        let snap = &state.snapshot;
+        let mut issues: Vec<String> = Vec::new();
+        for op in rollback_plan(&state.applied) {
+            let r = match &op {
+                RestoreOp::RemoveDefaultViaTun => {
+                    let gw = crate::lifecycle::VIRTUAL_DNS_IP.to_string();
+                    match windows::route_delete_args("0.0.0.0/0", &gw) {
+                        Ok(args) => run("route", &args).map(|_| ()),
+                        Err(e) => Err(e),
+                    }
+                }
+                RestoreOp::RemovePinnedRoute(dest) => {
+                    // `dest` is `ip` (pin) or `base/prefix` (direct rule);
+                    // removals go via the same previous gateway as apply.
+                    match previous_gateway(snap) {
+                        Some(gw) => {
+                            let cidr = if dest.contains('/') {
+                                dest.clone()
+                            } else if dest.parse::<Ipv4Addr>().is_ok() {
+                                format!("{dest}/32")
+                            } else {
+                                issues.push(format!("skip unparsable route {dest}"));
+                                continue;
+                            };
+                            match windows::route_delete_args(&cidr, &gw.to_string()) {
+                                Ok(args) => run("route", &args).map(|_| ()),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        None => {
+                            issues.push(format!("no previous gateway for {dest}"));
+                            continue;
+                        }
+                    }
+                }
+                RestoreOp::TunDown(_name) => {
+                    // End the session AND delete the adapter we opened:
+                    // TunDown via a live handle leaves no NIC behind.
+                    // (Crash recovery holds no handle — the adapter stays
+                    // for the next open-or-create to reuse.)
+                    match self.tun.take() {
+                        Some(tun) => tun
+                            .delete()
+                            .map_err(|e| ClientError::PlatformError(format!("tun down: {e}"))),
+                        None => {
+                            aetherlink_netstack::debug_log(
+                                "TunDown: no live handle, adapter left in place",
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+                RestoreOp::RestoreDns(servers) => {
+                    // Target the persisted up-time interface; only legacy
+                    // states without it fall back to a live lookup.
+                    if state.dns_iface.is_empty() {
+                        self.restore_dns(servers)
+                    } else {
+                        self.restore_dns_on(&state.dns_iface, servers)
+                    }
+                }
+            };
+            match r {
+                Ok(()) => aetherlink_netstack::debug_log(&format!("replay: {op:?} ok")),
+                Err(e) => {
+                    aetherlink_netstack::debug_log(&format!("replay: {op:?}: {e}"));
+                    issues.push(format!("{op:?}: {e}"));
+                }
+            }
+        }
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(ClientError::PlatformError(issues.join("; ")))
+        }
+    }
+}
+
+impl RealPlatform {
+    /// Restore captured DNS servers explicitly (covers static origins too).
+    /// Best-effort per server; joined failures come back as `Err`.
+    fn restore_dns(&self, servers: &[String]) -> Result<()> {
+        match self.default_iface() {
+            Ok(iface) => self.restore_dns_on(&iface, servers),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Restore DNS on an explicitly named interface (replay path: the
+    /// interface was persisted at `up`, never re-derived).
+    fn restore_dns_on(&self, iface: &str, servers: &[String]) -> Result<()> {
+        let mut issues: Vec<String> = Vec::new();
+        {
+            for (i, server) in servers.iter().enumerate() {
                 // `set ... static <dns>` for the primary,
                 // `add ... <dns> index=N` for the rest.
                 let mut args = windows::dns_set_args(&iface, server);
@@ -250,10 +476,20 @@ impl Platform for RealPlatform {
                     args.remove(5);
                     args.push(format!("index={}", i + 1));
                 }
-                let _ = run("netsh", &args);
+                match run("netsh", &args) {
+                    Ok(_) => aetherlink_netstack::debug_log(&format!("restore_dns: {server} ok")),
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!("restore_dns: {server}: {e}"));
+                        issues.push(format!("dns {server}: {e}"));
+                    }
+                }
             }
         }
-        Ok(())
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(ClientError::PlatformError(issues.join("; ")))
+        }
     }
 }
 

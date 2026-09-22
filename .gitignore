@@ -44,6 +44,9 @@ state.json
 *.snapshot.xml
 *.snapshot.json
 
+# --- Generated server smoke root (created by run_server_windows.ps1) ---
+/fallback/
+
 # --- Host-placed runtime blobs (downloaded next to the repo, keep out) ---
 /*.dll
 /*.so

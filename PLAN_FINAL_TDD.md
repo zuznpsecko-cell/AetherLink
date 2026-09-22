@@ -201,11 +201,32 @@
 - [x] W2. Открытие Wintun через крейт 0.5.1: load order, open-or-create,
   session в хендле; без dll/прав — именованные ошибки
   (`netstack/tests/bring_up.rs`, 9 тестов).
-- [ ] W3. `DataPump` (TUN↔mux мост): `TunPackets` трейт + `try_recv` /
-  `send_packet` у `TunInterface`, `client/src/pump.rs`, RED-тесты
-  с `FakeTun` в `client/tests/pump.rs`. Статус: тесты пишутся.
-- [ ] W4. Памп-потоки в `up()`/`down()` + ворота + живой чек-лист
-  для прогона под админом.
+- [x] W3. `DataPump` (TUN↔mux мост): `TunPackets` трейт + `try_recv` /
+  `send_packet` у `TunInterface` (`Arc<Session>` для wintun 0.5),
+  `client/src/pump.rs`, RED-тесты с `FakeTun` в `client/tests/pump.rs`
+  (TCP SYN→OPEN+DATA, UDP DNS→OPEN+DATAGRAM, mux→TUN обе стороны,
+  тампер/обрыв fail closed, 6 тестов green).
+- [x] W4. Памп-потоки в `up()`/`down()`: `client/src/threads.rs`
+  (`spawn_pump`/`PumpHandle::stop`, TUN->wire + wire->TUN, `tx`/`rx`
+  ключи сессии, тампер дропается без убийства цикла),
+  `Client::start_pump`/`stop_pump` (+ `down()` останавливает памп),
+  `client/tests/pump_threads.rs` (4 теста: обе стороны, двойной stop,
+  `down` останавливает памп), живой чек-лист `docs/LIVE_W4.md`,
+  команда `down` в thin-хосте (идемпотентна, Ctrl+C больше не нужен).
+- [x] W5. Памп внутри TLS: `DataPump::with_mux` (переиспользует mux сессии),
+  `threads::spawn_pump_tls` (одна нить владеет `ClientTlsStream`, ключи
+  `tx`/`rx` сессии, таймаут чтения 200мс), `Client::start_pump_tls`,
+  `client/tests/pump_tls.rs` (2 теста поверх настоящего localhost-TLS:
+  roundtrip туда-обратно, двойной stop).
+- [x] W6. Живой цикл Windows (2026-09-22, без V2RayN): `up` поднимает
+  `aether0` 10.255.0.2/30 + пин + LAN-direct + default в TUN + DNS в туннель;
+  `down`/`cleanup` проигрывают журнал `UpState` (маршруты, DNS на
+  persist-интерфейс, удаление адаптера) — чистый цикл доказан живым
+  прогоном. По пути починены: удержание wintun-сессии, friendly name,
+  OEM/cp866-декод `ipconfig`, `(Основной)`-суффиксы, регистрация newborn
+  NIC (enable), `force_cleanup` реально восстанавливает, guard двойного
+  `up`. Осталось: пришить `connect()+start_pump_tls()` в `up()` и гнать
+  трафик (curl/DNS через туннель).
 
 ## Карта заглушек → фазы
 
@@ -219,9 +240,15 @@
 | `netstack/smoltcp_wrapper.rs` | userspace stack + памп | D2 ✅ |
 | `netstack/tun.rs` open path | Windows wintun open (Linux ioctls — только под root) | W2 ✅ / D4🔄 |
 | `netstack/sockets.rs` | socket-level pump (TCP/UDP state machines) | D-sock ✅ (4 теста) |
-| TunPackets + DataPump + pump threads | мост TUN↔mux в `up()`/`down()` | W3/W4 ⏳ активное |
+| TunPackets + DataPump + pump threads | мост TUN↔mux в `up()`/`down()` | W3 ✅ / W4 ⏳ активное |
 | `ffi/lib.rs` | rules, log cb, android fd/split | E |
 | `deploy/*` | установка из исходников, нет uninstall | H1 |
+
+## Отложено (после доводки Windows-клиента)
+
+- Android SOCKS5 с ротацией: логин/пароль/порт генерируются перед каждым
+  стартом прокси, без авторизации доступа нет. Сейчас SOCKS5 в коде нет
+  вообще (ни Rust, ни Kotlin) — проектировать после живого `up` на Windows.
 
 ## Риски и требования к среде
 

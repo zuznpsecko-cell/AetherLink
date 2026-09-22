@@ -11,6 +11,7 @@ aetherlink-netstack = { path = "../aetherlink-netstack" }
 aetherlink-crypto = { path = "../aetherlink-crypto" }
 aetherlink-frame = { path = "../aetherlink-frame" }
 aetherlink-mux = { path = "../aetherlink-mux" }
+aetherlink-protocol = { path = "../../protocol" }
 tokio = { workspace = true }
 rustls = { workspace = true }
 bytes = { workspace = true }
@@ -22,6 +23,7 @@ serde_yaml = { workspace = true }
 ipnet = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
+encoding_rs = "0.8.41"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

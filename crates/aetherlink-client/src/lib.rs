@@ -8,9 +8,16 @@ pub mod config;
 pub mod dns;
 pub mod lifecycle;
 pub mod platform;
+pub mod pump;
 pub mod routing;
+pub mod threads;
+
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 
 use aetherlink_core::CoreError;
+use aetherlink_mux::MuxError;
+use aetherlink_netstack::tun::TunPackets;
 use aetherlink_netstack::NetstackError;
 use thiserror::Error;
 
@@ -21,6 +28,9 @@ pub enum ClientError {
 
     #[error("Netstack error: {0}")]
     Netstack(#[from] NetstackError),
+
+    #[error("Mux error: {0}")]
+    Mux(#[from] MuxError),
 
     #[error("Routing error: {0}")]
     RoutingError(String),
@@ -44,6 +54,8 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 pub struct Client {
     config: config::ClientConfig,
     up: bool,
+    pump: Option<threads::PumpHandle>,
+    platform: platform::RealPlatform,
 }
 
 impl Client {
@@ -52,19 +64,30 @@ impl Client {
         Ok(Self {
             config: config::ClientConfig::parse(&doc)?,
             up: false,
+            pump: None,
+            platform: platform::RealPlatform::new(),
         })
     }
 
     /// Create from an already-validated config (tests, embeds).
     #[must_use]
     pub fn new_config(config: config::ClientConfig) -> Self {
-        Self { config, up: false }
+        Self {
+            config,
+            up: false,
+            pump: None,
+            platform: platform::RealPlatform::new(),
+        }
     }
 
     /// Bring the tunnel up against the real platform (idempotent).
     pub fn up(&mut self) -> Result<()> {
-        let mut platform = platform::RealPlatform::new();
-        self.up_on(&mut platform)
+        if self.up {
+            return Ok(());
+        }
+        lifecycle::up(&mut self.platform, &self.config)?;
+        self.up = true;
+        Ok(())
     }
 
     /// Bring the tunnel up against an explicit platform (tests).
@@ -79,8 +102,63 @@ impl Client {
 
     /// Bring the tunnel down (safe no-op when not up).
     pub fn down(&mut self) -> Result<()> {
-        lifecycle::down(&mut platform::RealPlatform::new())?;
+        self.stop_pump();
+        lifecycle::down(&mut self.platform)?;
         self.up = false;
+        Ok(())
+    }
+
+    /// Attach pump threads over an established stream (W4).
+    ///
+    /// `tun` is shared with the caller; `tx` seals TUN->wire, `rx` opens
+    /// wire->TUN (session traffic keys). Idempotent: second call is a no-op
+    /// until `stop_pump`/`down`.
+    pub fn start_pump<T>(
+        &mut self,
+        tun: Arc<Mutex<T>>,
+        stream: TcpStream,
+        tx: [u8; 32],
+        rx: [u8; 32],
+    ) -> Result<()>
+    where
+        T: TunPackets + Send + 'static,
+    {
+        if self.pump.is_some() {
+            return Ok(());
+        }
+        let pad = self.config.pad_multiple;
+        let handle = threads::spawn_pump(tun, stream, tx, rx, pad)
+            .map_err(|e| ClientError::PlatformError(format!("pump spawn: {e}")))?;
+        self.pump = Some(handle);
+        Ok(())
+    }
+
+    /// Stop pump threads, if running (idempotent).
+    pub fn stop_pump(&mut self) {
+        if let Some(mut handle) = self.pump.take() {
+            handle.stop();
+        }
+    }
+
+    /// Attach the pump inside an established TLS session (production path).
+    ///
+    /// Takes a `lifecycle::connect` tunnel: session mux/keys move into the
+    /// pump thread. Idempotent like `start_pump`.
+    pub fn start_pump_tls<T>(
+        &mut self,
+        tun: Arc<Mutex<T>>,
+        tunnel: lifecycle::ConnectedTunnel,
+    ) -> Result<()>
+    where
+        T: TunPackets + Send + 'static,
+    {
+        if self.pump.is_some() {
+            return Ok(());
+        }
+        let pad = self.config.pad_multiple;
+        let handle = threads::spawn_pump_tls(tun, tunnel, pad)
+            .map_err(|e| ClientError::PlatformError(format!("tls pump spawn: {e}")))?;
+        self.pump = Some(handle);
         Ok(())
     }
 

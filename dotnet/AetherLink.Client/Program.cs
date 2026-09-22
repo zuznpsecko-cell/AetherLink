@@ -41,6 +41,8 @@ internal sealed class AetherClient : IDisposable
 {
     private nuint _handle;
 
+    internal nuint Handle => _handle;
+
     public AetherClient(string configJson)
     {
         _handle = Native.aether_client_create(configJson);
@@ -100,12 +102,27 @@ internal static class Program
                     using var done = new ManualResetEventSlim(false);
                     Console.CancelKeyPress += (_, e) => { e.Cancel = true; done.Set(); };
                     done.Wait();
+                    Console.WriteLine("Bringing tunnel down, restoring network/DNS...");
                 }
 
                 return 0;
             case "cleanup":
                 // Idempotent: restores routes+DNS from the persistent snapshot, even after a crash.
                 return Native.aether_client_force_cleanup() == 0 ? 0 : 1;
+            case "down":
+                // Graceful teardown without Ctrl+C wrestling: replays the
+                // state-file log through a fresh client, then reports.
+                using (var downClient = new AetherClient(configJson))
+                {
+                    if (Native.aether_client_down(downClient.Handle) != 0)
+                    {
+                        Console.Error.WriteLine($"down failed: {Native.LastError()}");
+                        return 1;
+                    }
+                }
+
+                Console.WriteLine("Tunnel down, network/DNS restored.");
+                return 0;
             case "status":
                 // Prints the status JSON of a freshly created (down) client.
                 using (var client = new AetherClient(configJson))
