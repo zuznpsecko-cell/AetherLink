@@ -72,13 +72,18 @@ internal sealed class AetherClient : IDisposable
         return Encoding.UTF8.GetString(buf, 0, end < 0 ? buf.Length : end);
     }
 
-    public void Dispose()
+    public void Down()
     {
         if (_handle != nuint.Zero)
         {
             _ = Native.aether_client_down(_handle);
             _handle = nuint.Zero;
         }
+    }
+
+    public void Dispose()
+    {
+        Down();
     }
 }
 
@@ -101,8 +106,24 @@ internal static class Program
                     Console.WriteLine("Tunnel up. Press Ctrl+C to bring it down (DNS/routes restored).");
                     using var done = new ManualResetEventSlim(false);
                     Console.CancelKeyPress += (_, e) => { e.Cancel = true; done.Set(); };
-                    done.Wait();
-                    Console.WriteLine("Bringing tunnel down, restoring network/DNS...");
+                    // Console close / logoff / shutdown: finally below may not
+                    // run, so best-effort down here too (hard kill still
+                    // relies on the UpState journal replay via down/cleanup).
+                    void OnProcessExit(object? sender, EventArgs e)
+                    {
+                        try { client.Down(); } catch { }
+                    }
+                    AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+                    try
+                    {
+                        done.Wait();
+                    }
+                    finally
+                    {
+                        AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+                        Console.WriteLine("Bringing tunnel down, restoring network/DNS...");
+                        try { client.Down(); } catch { }
+                    }
                 }
 
                 return 0;

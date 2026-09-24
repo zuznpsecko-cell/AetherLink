@@ -253,3 +253,42 @@ must be covered with one floor.
 - API 21 floor imposed by `addAllowedApplication`/`addDisallowedApplication`
   is satisfied with margin; going below 26 would only buy ancient TV boxes
   at the cost of version checks throughout the Kotlin layer
+---
+
+## DEC-012: TLS-Fidelity Hardening (G1/G2)
+
+**Date:** 2026-09-24
+**Status:** Accepted (supplements DEC-007 for the hardening phase)
+
+### Context
+DEC-007 settled TLS appearance on rustls defaults (best-effort) to unblock
+MVP. Live operation on restrictive networks showed the gap explicitly:
+handshakes succeed, but the connection is trivially distinguishable from
+generic browser HTTPS by ClientHello composition and fallback behavior.
+G1/G2 require the session to look like ordinary HTTPS traffic to both
+passive observation and unsolicited connection attempts.
+
+### Decision
+- Single TLS profile for the whole data plane, owned by Rust core:
+  fixed ALPN order, restricted TLS 1.3 cipher list, no unique
+  extensions/values, SNI strictly from config, uniform resumption policy.
+- Server fallback answers exactly like a generic static web server
+  (statuses, headers, timing, close semantics); no tunnel markers anywhere,
+  including error paths and timing side channels.
+- ClientHello composition covered by golden vectors (protocol/tests):
+  any deviation fails the build.
+- No per-host TLS stacks: thin hosts keep calling core over FFI
+  (enforced by `check_thin_hosts.ps1`).
+
+### Rationale
+- Compatibility framing: middleboxes, corporate proxies and antivirus TLS
+  interception all treat unusual handshakes as suspicious; looking exactly
+  like mainstream browsers maximizes connectivity everywhere.
+- One profile in one place (core) instead of per-host tweaks: fewer
+  fingerprints, single audit surface, tests stay deterministic.
+- Static-only fallback (no reverse proxy) keeps the unauthenticated
+  surface minimal and behaviorally identical to commodity hosting.
+
+### Non-goals (explicitly out of scope)
+- Custom per-browser ClientHello mimicry libraries; ECH; traffic decoys.
+  Revisit only with measured need, as separate DECs.

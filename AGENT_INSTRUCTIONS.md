@@ -108,13 +108,23 @@ Windows/Linux — без per-app split.
 
 ## 2. Инварианты видимости
 
-**G1** — on-path: TLS 1.3 + ciphertext, вид browser HTTPS.  
-**G2** — no/bad auth: web fallback static, без tunnel banner.  
+**G1** — on-path: TLS 1.3 + ciphertext, вид generic browser HTTPS. Соединение
+не должно отличаться от обычного HTTPS ни пассивным наблюдением (версии,
+ALPN, набор шифров, расширения ClientHello, поведение resumed-сессий), ни
+активными пробами без валидного AUTH.
+**G2** — no/bad auth: web fallback static, без tunnel banner. Ответ fallback
+неотличим от типового статического веб-сервера: те же статусы/заголовки,
+сопоставимые тайминги, закрытие по тем же правилам.
 **G3** — auth ok: mux внутри TLS.
 
 No-Proxy-Surface: без proxy headers/banners; fallback **по умолчанию только static** (не open reverse-proxy).
 
-TLS fingerprint: в **Rust core** (rustls + best-effort ClientHello profile). .NET не открывает свой SslStream для data plane туннеля — только FFI к core.
+TLS fidelity: в **Rust core** (единый TLS-профиль на весь data plane туннеля:
+фиксированный порядок ALPN, ограниченный набор шифров TLS 1.3, без уникальных
+расширений/значений, SNI только из конфига, resumption по общей политике).
+.NET не открывает свой SslStream для data plane туннеля — только FFI к core.
+Цель — максимальная совместимость с типовыми HTTPS-клиентами и сетевым
+оборудованием: соединение выглядит как обычный браузерный HTTPS-трафик.
 
 ---
 

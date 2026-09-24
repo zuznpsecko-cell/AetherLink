@@ -15,6 +15,7 @@ _Last Updated: 2026-09-22 (TDD 194/194 green, fmt clean, clippy warnings-only; W
 | **Phase A: Session handshake** | ✅ Done | PREFACE+AUTH → keys → mux DATA both ways (4) |
 | **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve (8+4+4+1) |
 | **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun open + TunPackets/DataPump + pump threads tested; Windows up/down live cycle green (LIVE_W4); traffic through tunnel pending transport attach |
+| **Phase T: TLS fidelity** | ⏳ Next | DEC-012 accepted; golden profile + fallback-shape tests pending (see PLAN_FINAL_TDD.md) |
 | **Phase 8: Full Tunnel + Routing** | ✅ Done | Ruleset/DNS-policy/cleanup + full `up` over fake platform (8+11) |
 | **Phase 9: FFI API** | ✅ Done | C ABI smoke + rules/log-cb/android-fd + JNI symbols (5+5) |
 | **Phase 10: Client Integration** | ✅ Done | Typed config, lifecycle, status JSON |

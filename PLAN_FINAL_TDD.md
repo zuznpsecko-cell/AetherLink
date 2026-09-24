@@ -256,3 +256,28 @@
 - Android-устройство/ТВ — on-device чек split + VpnService (APK уже собирается).
 - Сеть для cargo/Gradle-зависимостей (уже кэшированы: registry, gradle-8.10.2, AGP).
 - Java для Gradle — JBR 21 от Rider (Gradle 8.10 не стартует на Java 25 из новой Studio).
+
+## Phase T. TLS-fidelity hardening (G1/G2, DEC-012)
+
+Depends: W (live transport proven). Goal: the session is
+indistinguishable from generic browser HTTPS to passive observation and
+unsolicited connection attempts, with zero per-host TLS code.
+
+- [ ] T1. Red: `protocol/tests/tls_profile.rs` � golden vectors for the
+      single TLS profile: ALPN order, allowed TLS 1.3 ciphers, forbidden
+      extensions/values, SNI source rule. Any deviation fails the build.
+- [ ] T2. Green: `core/tls.rs` � one profile constructor used by client
+      and server paths; resumption policy unified; SNI strictly from
+      config (never derived from internals).
+- [ ] T3. Red: `server/tests/fallback_shape.rs` � unauthenticated probes
+      (bad AUTH, plaintext, wrong SNI) receive byte-comparable generic
+      static answers: statuses, headers, close semantics versus a reference
+      static server; no tunnel markers in body, headers, or timing class.
+- [ ] T4. Green: `server/accept.rs` + `fallback.rs` � shape fixes per red;
+      error paths (TLS alert vs close, AUTH reject vs static) unified.
+- [ ] T5. Gates + `STATUS.md`: fidelity phase DONE; `check_thin_hosts.ps1`
+      extended with a no-direct-TLS-in-hosts assertion if missing.
+
+Acceptance: golden + shape tests green in CI; live smoke (handshake +
+fallback probe via openssl) matches the reference byte-for-byte modulo
+cert/time fields.
