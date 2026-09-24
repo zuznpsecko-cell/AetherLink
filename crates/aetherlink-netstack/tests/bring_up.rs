@@ -48,6 +48,7 @@ fn up_state_roundtrip_carries_applied_log() {
             AppliedChange::PinnedRoute("9.9.9.9".to_string()),
         ],
         dns_iface: "Ethernet 3".to_string(),
+        tun_ifindex: Some(7),
     };
     let path = std::env::temp_dir().join("aether-test-upstate.json");
     // When: saved and loaded back

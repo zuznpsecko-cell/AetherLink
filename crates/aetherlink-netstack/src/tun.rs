@@ -118,6 +118,9 @@ pub struct UpState {
     pub applied: Vec<AppliedChange>,
     /// Physical interface whose DNS was overridden.
     pub dns_iface: String,
+    /// TUN adapter Win32 ifIndex at `up` time (egress binding for deletes
+    /// after a crash, when no live handle exists).
+    pub tun_ifindex: Option<u32>,
 }
 
 impl UpState {
@@ -314,6 +317,28 @@ impl TunInterface {
 }
 
 impl TunInterface {
+    /// Win32 interface index of the held adapter (for `route ... if N`
+    /// egress binding: Windows otherwise pins TUN-gatewayed routes to the
+    /// physical NIC and traffic bypasses the tunnel — seen live).
+    pub fn adapter_index(&self) -> Result<u32> {
+        #[cfg(windows)]
+        {
+            self.adapter
+                .as_ref()
+                .ok_or_else(|| NetstackError::TunError("no adapter held".to_string()))?
+                .get_adapter_index()
+                .map_err(|e| NetstackError::TunError(format!("adapter index: {e}")))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            Err(NetstackError::TunError(
+                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
+                    .to_string(),
+            ))
+        }
+    }
+
     /// End the session and delete the wintun adapter (no accumulation).
     ///
     /// Consumes the handle: session drops first (device goes dark), then the
@@ -356,8 +381,17 @@ impl TunPackets for TunInterface {
                 .as_ref()
                 .ok_or_else(|| NetstackError::TunError("wintun session not open".to_string()))?;
             sess.try_receive()
-                .map(|opt| opt.map(|p| p.bytes().to_vec()))
-                .map_err(|e| NetstackError::TunError(format!("wintun recv: {e}")))
+                .map(|opt| {
+                    opt.map(|p| {
+                        let b = p.bytes().to_vec();
+                        crate::debug_log(&format!("tun: recv {}B", b.len()));
+                        b
+                    })
+                })
+                .map_err(|e| {
+                    crate::debug_log(&format!("tun: recv failed: {e}"));
+                    NetstackError::TunError(format!("wintun recv: {e}"))
+                })
         }
         #[cfg(not(windows))]
         {
@@ -379,11 +413,13 @@ impl TunPackets for TunInterface {
             let len = u16::try_from(pkt.len()).map_err(|_| {
                 NetstackError::InvalidPacket(format!("packet too large {}", pkt.len()))
             })?;
-            let mut slot = sess
-                .allocate_send_packet(len)
-                .map_err(|e| NetstackError::TunError(format!("wintun alloc send: {e}")))?;
+            let mut slot = sess.allocate_send_packet(len).map_err(|e| {
+                crate::debug_log(&format!("tun: alloc send failed: {e}"));
+                NetstackError::TunError(format!("wintun alloc send: {e}"))
+            })?;
             slot.bytes_mut().copy_from_slice(pkt);
             sess.send_packet(slot);
+            crate::debug_log(&format!("tun: sent {}B", pkt.len()));
             Ok(())
         }
         #[cfg(not(windows))]
