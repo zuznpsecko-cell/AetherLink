@@ -160,6 +160,7 @@ fn cleanup_replays_empty_applied_log() {
         },
         applied: vec![],
         dns_iface: String::new(),
+        tun_ifindex: None,
     };
     state.save(&path).expect("save");
     // When: force cleanup → Then: Ok, file consumed.
@@ -209,6 +210,19 @@ fn up_refuses_when_state_file_exists() {
     assert!(lifecycle::up(&mut plat, &test_config()).is_err());
     assert_eq!(plat.applied_count(), 0);
     assert!(path.exists(), "guard must not consume foreign state");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn up_refuses_stale_tunnel_dns() {
+    // Given: snapshot DNS already pointing at the virtual resolver
+    // (previous teardown never finished)
+    let path = temp_state("stale-dns");
+    let _ = std::fs::remove_file(&path);
+    let mut plat = FakePlatform::working(path.clone()).with_dns(vec!["10.255.0.1".to_string()]);
+    // When: up → Then: Err before any mutation.
+    assert!(lifecycle::up(&mut plat, &test_config()).is_err());
+    assert_eq!(plat.applied_count(), 0);
     std::fs::remove_file(&path).ok();
 }
 

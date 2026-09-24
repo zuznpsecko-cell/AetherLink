@@ -193,3 +193,94 @@ fn write_one(
     stream.write_all(ciphertext).expect("write ct");
     stream.flush().expect("flush");
 }
+
+#[test]
+fn attach_pump_wires_tun_through_tls_session() {
+    // Given: TLS server echoing DATA like a tunnel endpoint
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        key.cert.der().to_vec(),
+    )];
+    let key_der = key.key_pair.serialize_der();
+    let server_cfg =
+        Arc::new(aetherlink_core::tls::server_config(chain, &key_der).expect("server cfg"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let cache = NonceCache::new();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut stream = aetherlink_core::tls::accept_tls(sock, &server_cfg).expect("server tls");
+        let mut sess = aetherlink_core::session::handshake_server(&mut stream, PSK, &cache)
+            .expect("server hs");
+        let (open_h, open_c) = read_one(&mut stream);
+        let tcp = aetherlink_mux::manager::MuxManager::parse_open_tcp(
+            sess.keys.rx_key(),
+            &open_h,
+            &open_c,
+        )
+        .expect("open parses");
+        sess.mux
+            .register_inbound(tcp.id, &tcp.addr, tcp.port, false)
+            .expect("register");
+        let (data_h, data_c) = read_one(&mut stream);
+        let pt = sess
+            .mux
+            .open_data(sess.keys.rx_key(), &data_h, &data_c)
+            .expect("open");
+        let sealed = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), tcp.id, &pt, PAD)
+            .expect("seal");
+        write_one(&mut stream, &sealed.header, &sealed.ciphertext);
+        let mut one = [0u8; 1];
+        let _ = stream.read(&mut one);
+    });
+
+    // ...and a TUN holding one SYN with payload
+    let syn = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        42001,
+        443,
+        true,
+        false,
+        true,
+        8000,
+        0,
+        b"via-attach",
+    );
+    let tun = Arc::new(Mutex::new(FakeTun {
+        inbound: vec![syn].into(),
+        outbound: Vec::new(),
+    }));
+    // When: single-call attach (connect + pump) against the test server
+    let config = test_config(&format!("127.0.0.1:{port}"));
+    let mut handle = aetherlink_client::lifecycle::attach_pump(
+        Arc::clone(&tun),
+        &config,
+        Some(Arc::new(AcceptAll)),
+    )
+    .expect("attach");
+    // Then: echo returns into TUN as a TCP packet.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        {
+            let guard = tun.lock().expect("lock");
+            if !guard.outbound.is_empty() {
+                let parsed =
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&guard.outbound[0])
+                        .expect("valid ip");
+                assert_eq!(parsed.dst, CLIENT_IP);
+                assert_eq!(parsed.tcp().expect("tcp").payload, b"via-attach");
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "echo never reached TUN"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    handle.stop();
+    server.join().expect("server thread");
+}

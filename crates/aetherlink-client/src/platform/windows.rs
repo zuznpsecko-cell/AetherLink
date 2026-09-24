@@ -104,6 +104,34 @@ fn clean_ip(value: &str) -> &str {
     v
 }
 
+/// Strip a leading interface-type word left over from header parsing.
+///
+/// Russian headers put the type after the kind word ("Адаптер Ethernet X"),
+/// so cutting at "адаптер " leaves "Ethernet X". Known type words are
+/// dropped; anything else (including a genuine single-word name like
+/// "Ethernet") is kept as-is.
+fn strip_iface_type(raw: &str) -> String {
+    const TYPES: &[&str] = &[
+        "ethernet",
+        "wi-fi",
+        "wifi",
+        "wireless",
+        "bluetooth",
+        "tunnel",
+        "loopback",
+        "ppp",
+    ];
+    let trimmed = raw.trim();
+    match trimmed.split_once(char::is_whitespace) {
+        Some((first, rest))
+            if TYPES.contains(&first.to_lowercase().as_str()) && !rest.trim().is_empty() =>
+        {
+            rest.trim().to_string()
+        }
+        _ => trimmed.to_string(),
+    }
+}
+
 /// Parse `ipconfig /all` output into `(dns_servers, adapter_name → ipv4)`.
 ///
 /// Locale-independent: matches on technical tokens (`DNS`, `IPv4`, absence
@@ -126,13 +154,15 @@ pub fn parse_ipconfig(output: &str) -> (Vec<String>, HashMap<String, String>) {
             // Header lines carry no dots ("Ethernet adapter X:" in any language).
             if trimmed.ends_with(':') && !label.contains('.') {
                 // Adapter name follows the kind word ("adapter"/"адаптер");
-                // Russian prefixes the state ("Неизвестный адаптер X").
+                // Russian prefixes the state ("Неизвестный адаптер X") and
+                // puts the interface type after it ("Адаптер Ethernet X"),
+                // while English puts the type before ("Ethernet adapter X").
                 let lower = label.to_lowercase();
                 let cut = lower
                     .rfind("adapter ")
                     .map(|p| p + "adapter ".len())
                     .or_else(|| lower.rfind("адаптер ").map(|p| p + "адаптер ".len()));
-                let name = match cut {
+                let raw = match cut {
                     Some(pos) => label[pos..].trim().to_string(),
                     None => label
                         .split_whitespace()
@@ -140,6 +170,7 @@ pub fn parse_ipconfig(output: &str) -> (Vec<String>, HashMap<String, String>) {
                         .collect::<Vec<_>>()
                         .join(" "),
                 };
+                let name = strip_iface_type(&raw);
                 if !name.is_empty() {
                     adapter = Some(name);
                 }
@@ -214,6 +245,35 @@ pub fn route_add_args(dest_cidr: &str, gateway: &str) -> Result<Vec<String>> {
     ])
 }
 
+/// Low interface metric for the TUN device.
+///
+/// Windows derives route metrics from the interface metric; the wintun
+/// default (≈5 + surcharges) still loses to DHCP Ethernet (25). Pinning the
+/// interface to 1 makes auto and explicit route metrics win.
+pub const TUN_IFACE_METRIC: u32 = 1;
+
+/// Arg vector for `route add <dest> mask <mask> <gw> if <idx>`.
+///
+/// The `if` egress binding is mandatory for TUN-gatewayed routes: without
+/// it Windows pins the gateway to the physical NIC (seen live: /1 rows
+/// showing the Ethernet interface while the TUN was up) and traffic
+/// bypasses the tunnel.
+pub fn route_add_if_args(dest_cidr: &str, gateway: &str, ifindex: u32) -> Result<Vec<String>> {
+    let mut args = route_add_args(dest_cidr, gateway)?;
+    args.push("if".to_string());
+    args.push(ifindex.to_string());
+    Ok(args)
+}
+
+/// Arg vector for `route delete <dest> mask <mask> <gw> if <idx>` (mirrors
+/// the add shape so the exact rows are removed).
+pub fn route_delete_if_args(dest_cidr: &str, gateway: &str, ifindex: u32) -> Result<Vec<String>> {
+    let mut args = route_delete_args(dest_cidr, gateway)?;
+    args.push("if".to_string());
+    args.push(ifindex.to_string());
+    Ok(args)
+}
+
 /// Arg vector for `route delete <dest> mask <mask> <gw>`.
 pub fn route_delete_args(dest_cidr: &str, gateway: &str) -> Result<Vec<String>> {
     let (base, mask) = split_cidr(dest_cidr)?;
@@ -239,6 +299,21 @@ pub fn dns_set_args(iface: &str, dns: &str) -> Vec<String> {
         "static".to_string(),
         dns.to_string(),
     ]
+}
+
+/// Arg vector for `netsh interface ipv4 set interface` metric.
+pub fn iface_metric_args(name: &str, metric: u32) -> Result<Vec<String>> {
+    if name.is_empty() {
+        return Err(ClientError::RoutingError("tun name empty".to_string()));
+    }
+    Ok(vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "interface".to_string(),
+        format!("name=\"{name}\""),
+        format!("metric={metric}"),
+    ])
 }
 
 /// Arg vector for `netsh interface set interface` admin state.

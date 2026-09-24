@@ -12,6 +12,7 @@ pub mod windows;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use aetherlink_netstack::tun::{previous_gateway, RestoreOp};
 use aetherlink_netstack::tun::{rollback_plan, AppliedChange, Route, Snapshot};
@@ -123,6 +124,11 @@ pub trait Platform: Send {
         None
     }
 
+    /// Live TUN adapter Win32 ifIndex, if held (egress binding + persist).
+    fn tun_ifindex(&self) -> Option<u32> {
+        None
+    }
+
     /// Crash-recovery state file path.
     fn state_path(&self) -> PathBuf {
         default_state_path()
@@ -139,7 +145,8 @@ pub struct RealPlatform {
     default_iface: Option<String>,
     /// Live TUN session, held for the whole `up` (dropping it ends the
     /// wintun session and the device goes dark, so it must outlive `up`).
-    tun: Option<aetherlink_netstack::tun::TunInterface>,
+    /// Shared (`Arc<Mutex>`) so pump threads can borrow it after attach.
+    tun: Option<Arc<Mutex<aetherlink_netstack::tun::TunInterface>>>,
 }
 
 impl RealPlatform {
@@ -214,6 +221,37 @@ impl RealPlatform {
             .ok_or_else(|| ClientError::PlatformError("no default route".to_string()))?;
         iface_name_for(ip)
     }
+
+    /// Shared handle to the live TUN device, if up (for pump attach).
+    #[must_use]
+    pub fn tun_handle(&self) -> Option<Arc<Mutex<aetherlink_netstack::tun::TunInterface>>> {
+        self.tun.clone()
+    }
+
+    /// Drop the held TUN device, deleting the adapter when we are its last
+    /// owner (pump stopped beforehand in the normal path; a shared handle
+    /// just ends our ownership and reports it).
+    fn drop_tun(&mut self) -> Result<()> {
+        match self.tun.take() {
+            Some(tun) => match Arc::try_unwrap(tun) {
+                Ok(mutex) => {
+                    let iface = mutex
+                        .into_inner()
+                        .map_err(|_| ClientError::PlatformError("tun lock poisoned".to_string()))?;
+                    iface.delete().map_err(|e| {
+                        let e = ClientError::PlatformError(format!("tun down: {e}"));
+                        aetherlink_netstack::debug_log(&format!("{e}"));
+                        e
+                    })
+                }
+                Err(_) => {
+                    aetherlink_netstack::debug_log("tun_down: handle shared, ownership dropped");
+                    Ok(())
+                }
+            },
+            None => Ok(()),
+        }
+    }
 }
 
 impl Platform for RealPlatform {
@@ -255,8 +293,9 @@ impl Platform for RealPlatform {
         // is reused by the next open-or-create, so just report. The OS
         // registers newborn interfaces asynchronously: retry ~5s per step.
         let enable_args = windows::iface_admin_args(name, true)?;
+        let metric_args = windows::iface_metric_args(name, windows::TUN_IFACE_METRIC)?;
         let addr_args = windows::tun_addr_args(name, &addr.to_string(), 30)?;
-        for args in [&enable_args, &addr_args] {
+        for args in [&enable_args, &metric_args, &addr_args] {
             let mut last_err = ClientError::PlatformError("tun bring-up: no attempts".to_string());
             let mut done = false;
             for _ in 0..10 {
@@ -277,7 +316,7 @@ impl Platform for RealPlatform {
                 )));
             }
         }
-        self.tun = Some(iface);
+        self.tun = Some(Arc::new(Mutex::new(iface)));
         aetherlink_netstack::debug_log(&format!("tun_up: {name} session held"));
         Ok(())
     }
@@ -285,18 +324,18 @@ impl Platform for RealPlatform {
     fn tun_down(&mut self) -> Result<()> {
         // Same as replay TunDown: end session + delete our adapter.
         // Best-effort by contract (callers ignore the result), traced here.
-        match self.tun.take() {
-            Some(tun) => tun.delete().map_err(|e| {
-                let e = ClientError::PlatformError(format!("tun down: {e}"));
-                aetherlink_netstack::debug_log(&format!("{e}"));
-                e
-            }),
-            None => Ok(()),
-        }
+        self.drop_tun()
     }
 
     fn captured_iface(&self) -> Option<String> {
         self.default_iface.clone()
+    }
+
+    fn tun_ifindex(&self) -> Option<u32> {
+        self.tun
+            .as_ref()
+            .and_then(|t| t.lock().ok())
+            .and_then(|g| g.adapter_index().ok())
     }
 
     fn pin_route(&mut self, dest: IpAddr, via: Ipv4Addr) -> Result<()> {
@@ -335,11 +374,18 @@ impl Platform for RealPlatform {
     }
 
     fn default_via_tun(&mut self) -> Result<()> {
+        // OpenVPN-style def1: two /1 routes beat the default without touching
+        // it and without metric wars. Bound to the TUN ifIndex: without `if`
+        // Windows pins the gateway to the physical NIC (seen live).
         let gw = crate::lifecycle::VIRTUAL_DNS_IP;
-        let args = windows::route_add_args("0.0.0.0/0", &gw.to_string())?;
-        tolerate_exists(run("route", &args), "default-via-tun")?;
-        self.added_routes
-            .push(("0.0.0.0/0".to_string(), gw.to_string()));
+        let ifindex = self.tun_ifindex().ok_or_else(|| {
+            ClientError::PlatformError("no live TUN for default route".to_string())
+        })?;
+        for dest in ["0.0.0.0/1", "128.0.0.0/1"] {
+            let args = windows::route_add_if_args(dest, &gw.to_string(), ifindex)?;
+            tolerate_exists(run("route", &args), &format!("default-via-tun {dest}"))?;
+            self.added_routes.push((dest.to_string(), gw.to_string()));
+        }
         Ok(())
     }
 
@@ -379,11 +425,38 @@ impl Platform for RealPlatform {
         for op in rollback_plan(&state.applied) {
             let r = match &op {
                 RestoreOp::RemoveDefaultViaTun => {
+                    // Current shape (two /1s, if-bound) plus the legacy 0.0.0.0/0 shape
+                    // (pre-/1 clients and manual runs): delete best-effort.
+                    // The ifIndex rides from the state file (crash path has no
+                    // live handle) with a live-handle fallback.
                     let gw = crate::lifecycle::VIRTUAL_DNS_IP.to_string();
-                    match windows::route_delete_args("0.0.0.0/0", &gw) {
-                        Ok(args) => run("route", &args).map(|_| ()),
-                        Err(e) => Err(e),
+                    let ifindex = state.tun_ifindex.or_else(|| self.tun_ifindex());
+                    let mut last = Ok(());
+                    for dest in ["0.0.0.0/1", "128.0.0.0/1", "0.0.0.0/0"] {
+                        let built = match ifindex {
+                            Some(idx) => windows::route_delete_if_args(dest, &gw, idx),
+                            None => windows::route_delete_args(dest, &gw),
+                        };
+                        match built {
+                            Ok(args) => match run("route", &args) {
+                                Ok(_) => {
+                                    aetherlink_netstack::debug_log(&format!(
+                                        "replay: del default {dest} ok"
+                                    ));
+                                }
+                                Err(e) => {
+                                    aetherlink_netstack::debug_log(&format!(
+                                        "replay: del default {dest}: {e}"
+                                    ));
+                                    last = Err(e);
+                                }
+                            },
+                            Err(e) => {
+                                last = Err(e);
+                            }
+                        }
                     }
+                    last.map(|_| ())
                 }
                 RestoreOp::RemovePinnedRoute(dest) => {
                     // `dest` is `ip` (pin) or `base/prefix` (direct rule);
@@ -410,21 +483,10 @@ impl Platform for RealPlatform {
                     }
                 }
                 RestoreOp::TunDown(_name) => {
-                    // End the session AND delete the adapter we opened:
-                    // TunDown via a live handle leaves no NIC behind.
-                    // (Crash recovery holds no handle — the adapter stays
-                    // for the next open-or-create to reuse.)
-                    match self.tun.take() {
-                        Some(tun) => tun
-                            .delete()
-                            .map_err(|e| ClientError::PlatformError(format!("tun down: {e}"))),
-                        None => {
-                            aetherlink_netstack::debug_log(
-                                "TunDown: no live handle, adapter left in place",
-                            );
-                            Ok(())
-                        }
-                    }
+                    // End the session AND delete the adapter we opened.
+                    // (Crash recovery holds no handle — drop_tun reports
+                    // shared/missing and the adapter stays for reuse.)
+                    self.drop_tun()
                 }
                 RestoreOp::RestoreDns(servers) => {
                     // Target the persisted up-time interface; only legacy
@@ -523,6 +585,13 @@ impl FakePlatform {
             fail_at: None,
             state_path,
         }
+    }
+
+    /// Backend with preset DNS servers (stale-state simulations).
+    #[must_use]
+    pub fn with_dns(mut self, dns: Vec<String>) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// Backend failing exactly at `step`.

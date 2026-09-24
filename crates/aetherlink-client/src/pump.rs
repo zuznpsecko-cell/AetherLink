@@ -29,6 +29,18 @@ struct FlowInfo {
     is_udp: bool,
 }
 
+/// Link-local discovery has no business crossing a VPN (TTL 1 by design):
+/// multicast/broadcast destinations, mDNS 5353, LLMNR 5355, NetBIOS 137/138,
+/// SSDP 1900. Forwarding them only burns server relay timeouts serially and
+/// starves real flows past client timeouts (seen live: nslookup drowning in
+/// LLMNR/NetBIOS chatter). DNS (53) and everything else pass through.
+fn is_discovery_noise(dst: Ipv4Addr, port: u16) -> bool {
+    dst.is_multicast()
+        || dst.is_broadcast()
+        || dst.is_unspecified()
+        || matches!(port, 137 | 138 | 5353 | 5355 | 1900)
+}
+
 /// 5-tuple key for the TUN->mux direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
@@ -105,10 +117,23 @@ impl DataPump {
     fn pump_one(&mut self, raw: &[u8]) -> Result<Option<Vec<SealedFrame>>> {
         let parsed = match parse_ipv4_packet(raw) {
             Ok(p) => p,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                aetherlink_netstack::debug_log(&format!("pump: drop truncated packet: {e}"));
+                return Ok(None);
+            }
         };
         match parsed.payload {
             ParsedPayload::Tcp(seg) => {
+                if parsed.dst.is_multicast()
+                    || parsed.dst.is_broadcast()
+                    || parsed.dst.is_unspecified()
+                {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: drop tcp to non-unicast {}",
+                        parsed.dst
+                    ));
+                    return Ok(None);
+                }
                 let fk = FlowKey {
                     src: parsed.src,
                     src_port: seg.src_port,
@@ -124,6 +149,13 @@ impl DataPump {
                     Ok(Some(vec![sealed]))
                 } else {
                     let id = self.mux.open_tcp(&parsed.dst.to_string(), seg.dst_port)?;
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: new tcp {src}:{sport} -> {dst}:{dport} id={id}",
+                        src = parsed.src,
+                        sport = seg.src_port,
+                        dst = parsed.dst,
+                        dport = seg.dst_port,
+                    ));
                     self.by_tuple.insert(fk, id);
                     self.by_id.insert(
                         id,
@@ -141,6 +173,13 @@ impl DataPump {
                 }
             }
             ParsedPayload::Udp(dgram) => {
+                if is_discovery_noise(parsed.dst, dgram.dst_port) {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: drop discovery udp to {}:{}",
+                        parsed.dst, dgram.dst_port
+                    ));
+                    return Ok(None);
+                }
                 let fk = FlowKey {
                     src: parsed.src,
                     src_port: dgram.src_port,
@@ -155,6 +194,13 @@ impl DataPump {
                     Ok(Some(vec![sealed]))
                 } else {
                     let id = self.mux.open_udp(&parsed.dst.to_string(), dgram.dst_port)?;
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: new udp {src}:{sport} -> {dst}:{dport} id={id}",
+                        src = parsed.src,
+                        sport = dgram.src_port,
+                        dst = parsed.dst,
+                        dport = dgram.dst_port,
+                    ));
                     self.by_tuple.insert(fk, id);
                     self.by_id.insert(
                         id,

@@ -222,3 +222,46 @@ fn truncated_ip_packet_is_dropped() {
     let frames = pump.poll_once(&mut tun).expect("poll");
     assert!(frames.is_empty());
 }
+
+#[test]
+fn link_local_discovery_never_enters_tunnel() {
+    // Given: LLMNR + mDNS + NetBIOS + SSDP packets from TUN
+    let llmnr = build_udp_packet(
+        CLIENT_IP,
+        Ipv4Addr::new(224, 0, 0, 252),
+        55000,
+        5355,
+        b"llmnr?",
+    );
+    let mdns = build_udp_packet(
+        CLIENT_IP,
+        Ipv4Addr::new(224, 0, 0, 251),
+        5353,
+        5353,
+        b"mdns?",
+    );
+    let netbios = build_udp_packet(CLIENT_IP, Ipv4Addr::new(10, 255, 0, 3), 137, 137, b"nbns?");
+    let ssdp = build_udp_packet(
+        CLIENT_IP,
+        Ipv4Addr::new(239, 255, 255, 250),
+        1900,
+        1900,
+        b"ssdp?",
+    );
+    let mut tun = FakeTun::with_packets(vec![llmnr, mdns, netbios, ssdp]);
+    let mut pump = DataPump::new(KEY, PAD);
+    // When: polling -> Then: nothing sealed (link-local by design, TTL 1).
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert!(frames.is_empty());
+}
+
+#[test]
+fn unicast_dns_still_flows() {
+    // Given: ordinary DNS query to the virtual resolver
+    let query = build_udp_packet(CLIENT_IP, Ipv4Addr::new(10, 255, 0, 1), 54000, 53, b"q?");
+    let mut tun = FakeTun::with_packets(vec![query]);
+    let mut pump = DataPump::new(KEY, PAD);
+    // When: polling -> Then: OPEN + DATAGRAM as before.
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
+}

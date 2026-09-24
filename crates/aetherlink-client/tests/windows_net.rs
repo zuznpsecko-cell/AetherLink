@@ -5,8 +5,9 @@
 //! proves parsing against the real machine without privileges.
 
 use aetherlink_client::platform::windows::{
-    dns_set_args, iface_admin_args, parse_ipconfig, parse_route_print, prefix_to_mask,
-    route_add_args, route_delete_args, tun_addr_args,
+    dns_set_args, iface_admin_args, iface_metric_args, parse_ipconfig, parse_route_print,
+    prefix_to_mask, route_add_args, route_add_if_args, route_delete_args, route_delete_if_args,
+    tun_addr_args, TUN_IFACE_METRIC,
 };
 
 const ROUTE_PRINT: &str = "\
@@ -72,8 +73,8 @@ Windows IP Configuration\r\n\
 \r\n\
 Адаптер Ethernet Ethernet0:\r\n\
 \r\n\
-   IPv4-адрес. . . . . . . . . . . : 192.168.31.95(Preferred)\r\n\
-   DNS-серверы . . . . . . . . . . : 192.168.31.1\r\n";
+    IPv4-адрес. . . . . . . . . . . : 192.168.31.95(Preferred)\r\n\
+    DNS-серверы . . . . . . . . . . : 192.168.31.1\r\n";
 
 #[test]
 fn parse_localized_ipconfig_by_technical_tokens() {
@@ -81,14 +82,28 @@ fn parse_localized_ipconfig_by_technical_tokens() {
     let (dns, ifaces) = parse_ipconfig(IPCONFIG_RU);
     // Then: DNS + adapter mapping still extracted.
     assert_eq!(dns, vec!["192.168.31.1".to_string()]);
+    // The type word ("Ethernet" after "Адаптер") is header chrome, not name.
     assert_eq!(
-        ifaces.get("Ethernet Ethernet0").map(String::as_str),
+        ifaces.get("Ethernet0").map(String::as_str),
         Some("192.168.31.95")
     );
 }
 
 #[test]
+fn parse_russian_unknown_adapter_header() {
+    // Given: "Неизвестный адаптер <name>:" (wintun-style, no type word)
+    let text = "Неизвестный адаптер singbox_tun:\r\n   IPv4-адрес. . . : 172.18.0.1\r\n";
+    // Then: bare name extracted.
+    let (_, ifaces) = parse_ipconfig(text);
+    assert_eq!(
+        ifaces.get("singbox_tun").map(String::as_str),
+        Some("172.18.0.1")
+    );
+}
+
+#[test]
 fn prefix_to_mask_table() {
+    assert_eq!(prefix_to_mask(1).expect("1"), "128.0.0.0");
     assert_eq!(prefix_to_mask(8).expect("8"), "255.0.0.0");
     assert_eq!(prefix_to_mask(24).expect("24"), "255.255.255.0");
     assert_eq!(prefix_to_mask(32).expect("32"), "255.255.255.255");
@@ -187,6 +202,48 @@ fn iface_admin_arg_builder() {
         "admin=disabled".to_string(),
     );
     assert!(iface_admin_args("", true).is_err());
+}
+
+#[test]
+fn tun_iface_metric_arg_builder() {
+    // Given: newborn wintun adapter → Then: interface metric pinned low so
+    // derived route metrics beat DHCP Ethernet.
+    assert!(TUN_IFACE_METRIC < 25, "must beat observed physical 25");
+    assert_eq!(
+        iface_metric_args("aether0", TUN_IFACE_METRIC).expect("args"),
+        vec![
+            "interface".to_string(),
+            "ipv4".to_string(),
+            "set".to_string(),
+            "interface".to_string(),
+            "name=\"aether0\"".to_string(),
+            format!("metric={}", TUN_IFACE_METRIC),
+        ],
+    );
+    assert!(iface_metric_args("", 1).is_err());
+}
+
+#[test]
+fn tun_routes_bind_egress_ifindex() {
+    // Given: TUN gateway + adapter index → Then: add/delete mirror the
+    // `if` binding (unbound rows get pinned to the physical NIC live).
+    assert_eq!(
+        route_add_if_args("0.0.0.0/1", "10.255.0.1", 7).expect("args"),
+        vec![
+            "add".to_string(),
+            "0.0.0.0".to_string(),
+            "mask".to_string(),
+            "128.0.0.0".to_string(),
+            "10.255.0.1".to_string(),
+            "if".to_string(),
+            "7".to_string(),
+        ],
+    );
+    assert_eq!(
+        route_delete_if_args("128.0.0.0/1", "10.255.0.1", 7).expect("args")[5..],
+        vec!["if".to_string(), "7".to_string()],
+    );
+    assert!(route_add_if_args("999.0.0.0/1", "10.255.0.1", 7).is_err());
 }
 
 #[test]

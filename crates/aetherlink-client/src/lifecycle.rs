@@ -57,16 +57,30 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
     aetherlink_netstack::debug_log(&format!("up: server {host} -> {server_ip}"));
     // 2. Snapshot before touching anything.
     let snap = platform.snapshot()?;
+    // Stale tunnel DNS means a previous teardown never finished: refuse to
+    // stack on it (snapshot would canonize the tunnel address as "previous").
+    if snap
+        .dns_servers
+        .iter()
+        .any(|s| s == &VIRTUAL_DNS_IP.to_string())
+    {
+        return Err(ClientError::PlatformError(
+            "stale tunnel DNS in snapshot: run down/cleanup first".to_string(),
+        ));
+    }
     aetherlink_netstack::debug_log("up: snapshot ok");
     // Applied-change log, persisted after every mutation so a crash mid-up
-    // still leaves a replayable state file (DNS target = up-time iface).
+    // still leaves a replayable state file (DNS target = up-time iface,
+    // ifIndex = up-time adapter for egress-bound deletes).
     let mut applied: Vec<AppliedChange> = Vec::new();
     let dns_iface = platform.captured_iface().unwrap_or_default();
-    let persist = |applied: &[AppliedChange]| -> Result<()> {
+    let mut tun_ifindex: Option<u32> = None;
+    let persist = |applied: &[AppliedChange], tun_ifindex: Option<u32>| -> Result<()> {
         UpState {
             snapshot: snap.clone(),
             applied: applied.to_vec(),
             dns_iface: dns_iface.clone(),
+            tun_ifindex,
         }
         .save(&state_path)
         .map_err(ClientError::from)
@@ -76,6 +90,7 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
             snapshot: snap.clone(),
             applied: applied.to_vec(),
             dns_iface: platform.captured_iface().unwrap_or_default(),
+            tun_ifindex: platform.tun_ifindex(),
         };
         let _ = platform.restore_applied(&state);
         let _ = std::fs::remove_file(&state_path);
@@ -86,7 +101,8 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         return Err(e);
     }
     applied.push(AppliedChange::TunUp("aether0".to_string()));
-    if let Err(e) = persist(&applied) {
+    tun_ifindex = platform.tun_ifindex();
+    if let Err(e) = persist(&applied, tun_ifindex) {
         failed(platform, &applied);
         return Err(e);
     }
@@ -98,7 +114,7 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
             return Err(e);
         }
         applied.push(AppliedChange::PinnedRoute(server_ip.to_string()));
-        if let Err(e) = persist(&applied) {
+        if let Err(e) = persist(&applied, tun_ifindex) {
             failed(platform, &applied);
             return Err(e);
         }
@@ -117,7 +133,7 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
                 return Err(e);
             }
             applied.push(AppliedChange::DirectRoute(dest));
-            if let Err(e) = persist(&applied) {
+            if let Err(e) = persist(&applied, tun_ifindex) {
                 failed(platform, &applied);
                 return Err(e);
             }
@@ -129,7 +145,7 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         return Err(e);
     }
     applied.push(AppliedChange::DefaultViaTun);
-    if let Err(e) = persist(&applied) {
+    if let Err(e) = persist(&applied, tun_ifindex) {
         failed(platform, &applied);
         return Err(e);
     }
@@ -140,7 +156,7 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         return Err(e);
     }
     applied.push(AppliedChange::DnsOverride(snap.dns_servers.clone()));
-    if let Err(e) = persist(&applied) {
+    if let Err(e) = persist(&applied, tun_ifindex) {
         failed(platform, &applied);
         return Err(e);
     }
@@ -197,14 +213,36 @@ pub fn connect(
         .map_err(|_| ClientError::ConfigError("server_addr port invalid".to_string()))?;
     let sock = TcpStream::connect((host, port))
         .map_err(|e| ClientError::PlatformError(format!("tcp connect: {e}")))?;
+    aetherlink_netstack::debug_log(&format!("connect: tcp {host}:{port} ok"));
     let name = tls::server_name(&config.outer_sni).map_err(ClientError::Core)?;
     let tls_cfg = Arc::new(match verifier {
         Some(verifier) => tls::client_config(verifier).map_err(ClientError::Core)?,
         None => tls::system_client_config().map_err(ClientError::Core)?,
     });
     let mut stream = tls::connect_tls(sock, name, &tls_cfg).map_err(ClientError::Core)?;
+    aetherlink_netstack::debug_log("connect: tls ok");
     let nonce = aetherlink_crypto::auth::generate_nonce();
     let sess = session::handshake_client(&mut stream, config.psk.as_bytes(), &nonce)
         .map_err(ClientError::Core)?;
+    aetherlink_netstack::debug_log("connect: auth ok");
     Ok(ConnectedTunnel { stream, sess })
+}
+
+/// Attach the pump: connect the transport, then bridge TUN<->TLS session.
+///
+/// Single call for tests and `Client::up_full`: `tun` is shared with the
+/// caller (usually the platform's held handle). Fails closed before any
+/// byte moves when the handshake or spawn fails.
+pub fn attach_pump<T>(
+    tun: Arc<Mutex<T>>,
+    config: &ClientConfig,
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
+) -> Result<crate::threads::PumpHandle>
+where
+    T: aetherlink_netstack::tun::TunPackets + Send + 'static,
+{
+    let tunnel = connect(config, verifier)?;
+    let pad = config.pad_multiple;
+    crate::threads::spawn_pump_tls(tun, tunnel, pad)
+        .map_err(|e| ClientError::PlatformError(format!("pump spawn: {e}")))
 }

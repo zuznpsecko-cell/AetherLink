@@ -229,7 +229,7 @@ pub extern "C" fn aether_client_up(handle: AetherHandle) -> c_int {
         }
     };
 
-    match client.up() {
+    match client.up_full(None) {
         Ok(_) => AetherError::Success as c_int,
         Err(e) => {
             set_last_error(&format!("Client up failed: {}", e));

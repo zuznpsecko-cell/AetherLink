@@ -74,11 +74,23 @@ pub fn client_config_tls12(verifier: Arc<dyn ServerCertVerifier>) -> Result<Clie
 
 /// TLS1.3-only client config against the platform system roots.
 ///
-/// Production default: the server must present a publicly trusted chain
-/// (e.g. Let's Encrypt via `provision_cert_ubuntu.sh`). Tests inject a
-/// custom verifier instead.
+/// Platform (Windows/macOS/Linux) trust stores are honored first, with the
+/// Mozilla bundle as fallback — private/test CAs installed by the operator
+/// (e.g. a smoke-test CA in LocalMachine\Root) verify correctly, and public
+/// chains keep working with no platform store involved.
 pub fn system_client_config() -> Result<ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
+    let bundle = rustls_native_certs::load_native_certs();
+    if bundle.certs.is_empty() && !bundle.errors.is_empty() {
+        return Err(CoreError::TlsError(format!(
+            "native roots: {:?}",
+            bundle.errors.first()
+        )));
+    }
+    for cert in bundle.certs {
+        // Duplicates across stores are harmless: keep the first.
+        let _ = roots.add(cert);
+    }
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut cfg = ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .with_root_certificates(roots)

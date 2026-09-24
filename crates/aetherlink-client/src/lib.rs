@@ -140,6 +140,41 @@ impl Client {
         }
     }
 
+    /// Attach the live transport: connect (TLS+AUTH) and pump TUN<->session.
+    ///
+    /// Requires a prior `up()` holding the TUN handle. Fails closed (no
+    /// bytes move) when the server is unreachable or AUTH rejects us.
+    pub fn attach_transport(
+        &mut self,
+        verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    ) -> Result<()> {
+        let tun = self
+            .platform
+            .tun_handle()
+            .ok_or_else(|| ClientError::PlatformError("no live TUN (up first)".to_string()))?;
+        let tunnel = lifecycle::connect(&self.config, verifier)?;
+        self.start_pump_tls(tun, tunnel)
+    }
+
+    /// Full bring-up: platform `up` + transport attach; rolls the platform
+    /// back down when the transport fails so no half-tunnel survives.
+    pub fn up_full(
+        &mut self,
+        verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    ) -> Result<()> {
+        if self.up {
+            return Ok(());
+        }
+        lifecycle::up(&mut self.platform, &self.config)?;
+        if let Err(e) = self.attach_transport(verifier) {
+            let _ = lifecycle::down(&mut self.platform);
+            self.up = false;
+            return Err(e);
+        }
+        self.up = true;
+        Ok(())
+    }
+
     /// Attach the pump inside an established TLS session (production path).
     ///
     /// Takes a `lifecycle::connect` tunnel: session mux/keys move into the

@@ -77,10 +77,12 @@ pub struct PumpHandle {
 impl PumpHandle {
     /// Signal stop and join all threads; safe to call twice.
     pub fn stop(&mut self) {
+        aetherlink_netstack::debug_log("pump: stop requested");
         self.stop.store(true, Ordering::SeqCst);
         while let Some(h) = self.threads.pop() {
             let _ = h.join();
         }
+        aetherlink_netstack::debug_log("pump: stopped");
     }
 }
 
@@ -110,6 +112,7 @@ where
     let mut write_side = stream;
     let stop = Arc::new(AtomicBool::new(false));
     let pump = Arc::new(Mutex::new(DataPump::new_split(tx, rx, pad)));
+    aetherlink_netstack::debug_log(&format!("pump: spawned (pad {pad})"));
 
     // TUN -> wire: drain TUN, seal, write.
     let (stop_tun, pump_tun, tun_tun) = (Arc::clone(&stop), Arc::clone(&pump), Arc::clone(&tun));
@@ -122,9 +125,18 @@ where
             })();
             match frames {
                 Some(fs) => {
+                    if !fs.is_empty() {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tun->wire {} frame(s)",
+                            fs.len()
+                        ));
+                    }
                     let mut ok = true;
                     for f in &fs {
                         if write_sealed(&mut write_side, &f.header, &f.ciphertext).is_err() {
+                            aetherlink_netstack::debug_log(
+                                "pump: wire write failed, tun thread ends",
+                            );
                             ok = false;
                             break;
                         }
@@ -136,9 +148,13 @@ where
                         std::thread::sleep(TUN_IDLE);
                     }
                 }
-                None => break,
+                None => {
+                    aetherlink_netstack::debug_log("pump: lock failed, tun thread ends");
+                    break;
+                }
             }
         }
+        aetherlink_netstack::debug_log("pump: tun thread joined");
     });
 
     // Wire -> TUN: read, open, inject; timeouts just re-poll the stop flag.
@@ -151,14 +167,25 @@ where
             }
             match read_sealed(&mut reader) {
                 Ok((header, ct)) => {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: wire {:?} id={} len={}",
+                        header.frame_type, header.stream_id, header.length
+                    ));
                     let injected = (|| {
                         let mut tun_guard = tun_wire.lock().ok()?;
                         let mut pump_guard = pump_wire.lock().ok()?;
                         Some(pump_guard.receive_mux(&header, &ct, &mut *tun_guard))
                     })();
                     match injected {
-                        Some(Ok(())) | Some(Err(_)) => {} // tamper dropped, loop lives
-                        None => break,                    // lock poisoned: fail closed
+                        Some(Ok(())) => aetherlink_netstack::debug_log("pump: wire->tun injected"),
+                        // Tamper/unknown id dropped, loop lives.
+                        Some(Err(e)) => aetherlink_netstack::debug_log(&format!(
+                            "pump: wire frame dropped: {e}"
+                        )),
+                        None => {
+                            aetherlink_netstack::debug_log("pump: lock failed, wire thread ends");
+                            break; // lock poisoned: fail closed
+                        }
                     }
                 }
                 Err(e)
@@ -167,9 +194,13 @@ where
                 {
                     continue;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    aetherlink_netstack::debug_log(&format!("pump: wire read failed ({e}), ends"));
+                    break;
+                }
             }
         }
+        aetherlink_netstack::debug_log("pump: wire thread joined");
     });
 
     Ok(PumpHandle {
@@ -196,6 +227,7 @@ where
     stream.get_mut().set_read_timeout(Some(READ_TIMEOUT))?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_loop = Arc::clone(&stop);
+    aetherlink_netstack::debug_log("pump: tls thread spawned");
     let thread = std::thread::spawn(move || {
         let mut pump = DataPump::with_mux(sess.mux, *sess.keys.tx_key(), *sess.keys.rx_key(), pad);
         loop {
@@ -206,9 +238,18 @@ where
             match tun.lock() {
                 Ok(mut guard) => match pump.poll_once(&mut *guard) {
                     Ok(frames) => {
+                        if !frames.is_empty() {
+                            aetherlink_netstack::debug_log(&format!(
+                                "pump: tls tun->wire {} frame(s)",
+                                frames.len()
+                            ));
+                        }
                         let mut ok = true;
                         for f in &frames {
                             if write_sealed(&mut stream, &f.header, &f.ciphertext).is_err() {
+                                aetherlink_netstack::debug_log(
+                                    "pump: tls write failed, thread ends",
+                                );
                                 ok = false;
                                 break;
                             }
@@ -217,27 +258,46 @@ where
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!("pump: tls tun drain: {e}"));
+                        break;
+                    }
                 },
-                Err(_) => break,
+                Err(_) => {
+                    aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
+                    break;
+                }
             }
             // Wire -> TUN: one frame per turn; timeout re-polls stop.
             match read_sealed(&mut stream) {
-                Ok((header, ct)) => match tun.lock() {
-                    Ok(mut guard) => {
-                        let _ = pump.receive_mux(&header, &ct, &mut *guard);
+                Ok((header, ct)) => {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tls wire {:?} id={} len={}",
+                        header.frame_type, header.stream_id, header.length
+                    ));
+                    match tun.lock() {
+                        Ok(mut guard) => match pump.receive_mux(&header, &ct, &mut *guard) {
+                            Ok(()) => aetherlink_netstack::debug_log("pump: tls injected to tun"),
+                            Err(e) => aetherlink_netstack::debug_log(&format!(
+                                "pump: tls frame dropped: {e}"
+                            )),
+                        },
+                        Err(_) => break,
                     }
-                    Err(_) => break,
-                },
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::TimedOut
                         || e.kind() == std::io::ErrorKind::WouldBlock =>
                 {
                     continue;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    aetherlink_netstack::debug_log(&format!("pump: tls read failed ({e}), ends"));
+                    break;
+                }
             }
         }
+        aetherlink_netstack::debug_log("pump: tls thread joined");
     });
     Ok(PumpHandle {
         stop,
