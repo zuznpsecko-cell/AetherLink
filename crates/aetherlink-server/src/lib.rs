@@ -6,6 +6,7 @@
 pub mod accept;
 pub mod auth;
 pub mod config;
+pub mod debug;
 pub mod dns;
 pub mod fallback;
 pub mod relay;
@@ -98,6 +99,12 @@ impl Server {
                 psk: self.config.psk.as_bytes().to_vec(),
                 cache: NonceCache::new(),
                 static_body,
+                dns_upstream: self
+                    .config
+                    .dns_upstream
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| crate::dns::upstream().to_string()),
             },
         })
     }

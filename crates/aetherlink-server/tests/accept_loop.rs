@@ -35,6 +35,7 @@ fn ctx() -> ServerCtx {
         psk: PSK.to_vec(),
         cache: NonceCache::new(),
         static_body: STATIC_BODY.to_vec(),
+        dns_upstream: "1.1.1.1:53".to_string(),
     }
 }
 

@@ -105,3 +105,19 @@ fn config_rejects_missing_psk() {
     // Then: rejected, never default to empty secret
     assert!(config::parse(raw).is_err());
 }
+
+#[test]
+fn relay_dial_refused_fails_fast() {
+    // Given: localhost порт, который точно закрыт (bind -> drop даёт
+    // минимальную гонку, ок; DPI сюда не вмешивается)
+    // When: dialing a refused port -> Then: Err быстро, без подвисаний.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+    let started = std::time::Instant::now();
+    assert!(relay::dial_tcp("127.0.0.1", port).is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "dial errors must stay bounded"
+    );
+}

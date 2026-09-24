@@ -7,6 +7,10 @@ use std::time::Duration;
 
 use crate::{Result, ServerError};
 
+/// Bound for outbound TCP dials: a silent target must fail fast instead of
+/// inheriting the ~21s OS connect stall and serially blocking the mux.
+const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Dial `(addr, port)` for a relayed stream.
 pub fn dial_tcp(addr: &str, port: u16) -> Result<TcpStream> {
     let target = format!("{addr}:{port}");
@@ -15,7 +19,7 @@ pub fn dial_tcp(addr: &str, port: u16) -> Result<TcpStream> {
         .to_socket_addrs()
         .map_err(|e| ServerError::RelayError(e.to_string()))?
     {
-        match TcpStream::connect(sock_addr) {
+        match TcpStream::connect_timeout(&sock_addr, TCP_DIAL_TIMEOUT) {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = e.to_string(),
         }
