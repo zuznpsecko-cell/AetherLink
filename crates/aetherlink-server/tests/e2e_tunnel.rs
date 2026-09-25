@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use aetherlink_crypto::auth::NonceCache;
 
+use aetherlink_protocol::FrameType;
+
 use aetherlink_server::accept::{serve_connection, Path, ServerCtx};
 
 mod wire_help;
@@ -88,20 +90,25 @@ fn tcp_echo() -> u16 {
             Ok(s) => s,
             Err(_) => break,
         };
-        let mut buf = [0u8; 64];
-        let mut n = match sock.read(&mut buf) {
-            Ok(0) | Err(_) => continue,
-            Ok(n) => n,
-        };
-        while n > 0 {
-            if sock.write_all(&buf[..n]).is_err() {
-                break;
-            }
-            n = match sock.read(&mut buf) {
+        // Per-connection thread: relays hold sockets open for the whole
+        // session, so a single-threaded echo would serialize (and stall)
+        // every flow behind the first.
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let mut n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => return,
                 Ok(n) => n,
-                Err(_) => break,
             };
-        }
+            while n > 0 {
+                if sock.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                n = match sock.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+            }
+        });
     });
     port
 }
@@ -472,6 +479,127 @@ fn empty_data_dials_without_read_stall() {
         "empty DATA must not cost a read timeout"
     );
 
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn burst_and_edge_traffic_keeps_server_alive() {
+    // Given: echo targets serving continuously + server learning from OPEN
+    let echo = tcp_echo();
+    let udp = UdpSocket::bind("127.0.0.1:0").expect("udp echo bind");
+    let udp_port = udp.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 9000];
+        loop {
+            match udp.recv_from(&mut buf) {
+                Ok((0, _)) | Err(_) => continue,
+                Ok((n, from)) => {
+                    if udp.send_to(&buf[..n], from).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    // When: handshake + burst (120 TCP + 60 UDP flows, mixed sizes, empty
+    // DATAs, duplicate OPENs, one tampered frame), then read every echo.
+    // A server crash (e.g. stack overflow) aborts this process loudly.
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .expect("timeout");
+    let nonce = [0xE7u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let mut expect_tcp = 0u32;
+    let mut expect_udp = 0u32;
+    for i in 0..120u16 {
+        let id = sess.mux.open_tcp("127.0.0.1", echo).expect("open");
+        let sealed_open = sess
+            .mux
+            .seal_open_tcp(sess.keys.tx_key(), id, 128)
+            .expect("seal open");
+        wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+        // Duplicate OPEN on every 10th flow (retransmit-style).
+        if i % 10 == 0 {
+            wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+        }
+        // Empty DATA (bare SYN) then sized payload.
+        let size = match i % 4 {
+            0 => 0,
+            1 => 1,
+            2 => 1400,
+            _ => 8000,
+        };
+        let payload = vec![(i & 0xFF) as u8; size];
+        let sealed = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), id, &payload, 128)
+            .expect("seal data");
+        wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+        if size > 0 {
+            expect_tcp += 1;
+        }
+        // One tampered frame mid-burst (must not kill the loop).
+        if i == 60 {
+            let mut bad = sealed.ciphertext.clone();
+            bad[0] ^= 0xFF;
+            wire_help::write_frame(&mut stream, &sealed.header, &bad);
+        }
+    }
+    for i in 0..60u16 {
+        let id = sess.mux.open_udp("127.0.0.1", udp_port).expect("open");
+        let sealed_open = sess
+            .mux
+            .seal_open_udp(sess.keys.tx_key(), id, 128)
+            .expect("seal open");
+        wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+        let size = if i % 3 == 0 { 0 } else { 500 };
+        let payload = vec![(i & 0xFF) as u8; size];
+        let sealed = sess
+            .mux
+            .seal_datagram(sess.keys.tx_key(), id, &payload, 128)
+            .expect("seal dgram");
+        wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+        if size > 0 {
+            expect_udp += 1;
+        }
+    }
+    // Then: every non-empty payload echoes back (order preserved).
+    let mut got_tcp = 0u32;
+    let mut got_udp = 0u32;
+    for _ in 0..(expect_tcp + expect_udp) {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        assert!(h.length as usize == c.len());
+        match h.frame_type {
+            FrameType::Data => {
+                sess.mux
+                    .open_data(sess.keys.rx_key(), &h, &c)
+                    .expect("echo opens");
+                got_tcp += 1;
+            }
+            FrameType::UdpDatagram => {
+                sess.mux
+                    .open_datagram(sess.keys.rx_key(), &h, &c)
+                    .expect("echo opens");
+                got_udp += 1;
+            }
+            other => panic!("unexpected echo frame {other:?}"),
+        }
+    }
+    assert_eq!(got_tcp, expect_tcp, "every TCP payload echoes");
+    assert_eq!(got_udp, expect_udp, "every UDP payload echoes");
     drop(stream);
     server.join().expect("server thread");
 }
