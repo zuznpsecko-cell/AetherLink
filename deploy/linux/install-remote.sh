@@ -103,6 +103,9 @@ cp -f target/release/libaetherlink_ffi.so dist/ubuntu-server/libaetherlink_core.
 
 echo "==> [6/8] Install to $PREFIX..."
 install -d "$PREFIX/server" "$STATE_DIR"
+# Stop the running server first: overwriting a live binary fails ETXTBSY.
+# (enable --now below restarts it after install.)
+systemctl stop aetherlink-server 2>/dev/null || true
 # Full publish dir (see install.sh): the apphost exe alone won't run.
 cp -a dist/ubuntu-server/. "$PREFIX/server/"
 chmod 0755 "$PREFIX/server/AetherLink.Server"
