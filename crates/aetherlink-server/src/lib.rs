@@ -99,12 +99,13 @@ impl Server {
                 psk: self.config.psk.as_bytes().to_vec(),
                 cache: NonceCache::new(),
                 static_body,
-                dns_upstream: self
-                    .config
-                    .dns_upstream
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| crate::dns::upstream().to_string()),
+                dns_upstream: {
+                    let mut list = self.config.dns_upstream.clone();
+                    if list.is_empty() {
+                        list.push(crate::dns::upstream().to_string());
+                    }
+                    list
+                },
             },
         })
     }

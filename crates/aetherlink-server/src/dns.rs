@@ -20,6 +20,22 @@ pub fn upstreams() -> &'static [&'static str] {
     aetherlink_mux::dns::upstreams()
 }
 
+/// Resolve one DNS query through the first answering upstream.
+///
+/// Tries each `"ip:port"` in order with `timeout` per attempt and returns
+/// the first answer. A single silent upstream (DPI blackhole, dead resolver)
+/// must not kill DNS for the whole tunnel.
+pub fn resolve_any(query: &[u8], upstreams: &[String], timeout: Duration) -> Result<Vec<u8>> {
+    let mut last_err = ServerError::DnsError("no upstreams configured".to_string());
+    for upstream in upstreams {
+        match resolve(query, upstream, timeout) {
+            Ok(answer) => return Ok(answer),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 /// Resolve one DNS query through `upstream` (`"ip:port"`), relaying the
 /// answer back verbatim. Bounded by `timeout`.
 pub fn resolve(query: &[u8], upstream: &str, timeout: Duration) -> Result<Vec<u8>> {

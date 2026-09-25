@@ -30,7 +30,7 @@ fn ctx() -> ServerCtx {
         psk: PSK.to_vec(),
         cache: NonceCache::new(),
         static_body: STATIC_BODY.to_vec(),
-        dns_upstream: "1.1.1.1:53".to_string(),
+        dns_upstream: vec!["1.1.1.1:53".to_string()],
     }
 }
 
@@ -209,7 +209,7 @@ fn virtual_dns_open_resolves_via_upstream() {
     });
 
     let mut base = ctx();
-    base.dns_upstream = format!("127.0.0.1:{dns_port}");
+    base.dns_upstream = vec![format!("127.0.0.1:{dns_port}")];
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let server = std::thread::spawn(move || {
@@ -360,6 +360,116 @@ fn multicast_datagram_skipped_loop_lives() {
     assert!(
         started.elapsed() < std::time::Duration::from_secs(4),
         "multicast must not stall the loop"
+    );
+
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn virtual_dns_falls_back_to_secondary_upstream() {
+    // Given: primary upstream is a closed port (fast fail), secondary answers
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let dead_port = dead.local_addr().expect("addr").port();
+    drop(dead);
+    let dns_sock = UdpSocket::bind("127.0.0.1:0").expect("dns bind");
+    let dns_port = dns_sock.local_addr().expect("addr").port();
+    let dns_answer = b"\xab\xcd\x81\x80\x00\x01\x00\x02".to_vec();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let (_, from) = dns_sock.recv_from(&mut buf).expect("dns recv");
+        dns_sock.send_to(&dns_answer, from).expect("dns send");
+    });
+
+    let mut base = ctx();
+    base.dns_upstream = vec![
+        format!("127.0.0.1:{dead_port}"),
+        format!("127.0.0.1:{dns_port}"),
+    ];
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &base, &mut routes), Path::Tunnel);
+    });
+
+    // When: query to the virtual resolver
+    let mut stream = client_tls(port);
+    let nonce = [0xE5u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let id = sess
+        .mux
+        .open_udp("10.255.0.1", 53)
+        .expect("open virtual dns");
+    let open = sess
+        .mux
+        .seal_open_udp(sess.keys.tx_key(), id, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+    let query = sess
+        .mux
+        .seal_datagram(sess.keys.tx_key(), id, b"\xab\xcd\x01\x00", 128)
+        .expect("seal query");
+    wire_help::write_frame(&mut stream, &query.header, &query.ciphertext);
+    // Then: secondary answer arrives despite the dead primary.
+    let (h, c) = wire_help::read_frame(&mut stream);
+    let answer = sess
+        .mux
+        .open_datagram(sess.keys.rx_key(), &h, &c)
+        .expect("open answer");
+    assert_eq!(answer, b"\xab\xcd\x81\x80\x00\x01\x00\x02");
+
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn empty_data_dials_without_read_stall() {
+    // Given: TCP echo target, routes learned from OPEN (production path)
+    let echo = tcp_echo();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    // When: OPEN + empty DATA (bare SYN) + payload DATA back-to-back
+    let mut stream = client_tls(port);
+    let nonce = [0xE6u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let id = sess.mux.open_tcp("127.0.0.1", echo).expect("open");
+    let sealed_open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), id, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+    let sealed_empty = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), id, b"", 128)
+        .expect("seal empty");
+    wire_help::write_frame(&mut stream, &sealed_empty.header, &sealed_empty.ciphertext);
+    let sealed_data = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), id, b"hi", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed_data.header, &sealed_data.ciphertext);
+    // Then: echo arrives without the 5s empty-read stall in the way.
+    let started = std::time::Instant::now();
+    let (h, c) = wire_help::read_frame(&mut stream);
+    let back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open answer");
+    assert_eq!(back, b"hi");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "empty DATA must not cost a read timeout"
     );
 
     drop(stream);

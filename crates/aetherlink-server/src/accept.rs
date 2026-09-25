@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aetherlink_core::{session, tls};
 use aetherlink_crypto::auth::NonceCache;
@@ -47,8 +47,9 @@ pub struct ServerCtx {
     pub cache: NonceCache,
     /// Static response body (must carry no tunnel banner).
     pub static_body: Vec<u8>,
-    /// DNS upstream `"ip:port"` for the virtual resolver intercept.
-    pub dns_upstream: String,
+    /// DNS upstreams `"ip:port"` (primary first) for the virtual
+    /// resolver intercept; tried in order per datagram.
+    pub dns_upstream: Vec<String>,
 }
 
 /// Relay read timeout: a silent target must not stall the loop forever.
@@ -140,6 +141,9 @@ fn tunnel_loop(
     routes: &mut HashMap<u16, SocketAddr>,
 ) {
     let mut relays: HashMap<u16, TcpStream> = HashMap::new();
+    // Targets whose dial recently failed: fail fast for the cooldown
+    // instead of serially stalling every flow behind another dial timeout.
+    let mut dead: HashMap<(String, u16), Instant> = HashMap::new();
     loop {
         let mut hb = [0u8; FRAME_HEADER_SIZE];
         if stream.read_exact(&mut hb).is_err() {
@@ -205,8 +209,44 @@ fn tunnel_loop(
                         continue;
                     }
                 };
+                // Bare SYN/ACK (empty DATA): dial to warm the cached socket
+                // without reading for a reply that cannot exist yet.
+                if pt.is_empty() {
+                    match relays.get_mut(&header.stream_id) {
+                        Some(_) => {}
+                        None => match relay::dial_tcp(&target.ip().to_string(), target.port()) {
+                            Ok(mut sock) => {
+                                if sock.set_read_timeout(Some(RELAY_TIMEOUT)).is_err() {
+                                    debug_log(&format!(
+                                        "tunnel: data id={} dial timeout set failed, skipping flow",
+                                        header.stream_id
+                                    ));
+                                    continue;
+                                }
+                                relays.insert(header.stream_id, sock);
+                            }
+                            Err(_) => {
+                                debug_log(&format!(
+                                    "tunnel: data id={} dial failed, skipping flow",
+                                    header.stream_id
+                                ));
+                                continue;
+                            }
+                        },
+                    }
+                    continue;
+                }
+                let target_key = (target.ip().to_string(), target.port());
+                if relay::is_fresh_dead(&dead, &target_key.0, target_key.1, Instant::now()) {
+                    debug_log(&format!(
+                        "tunnel: data id={} target {target} in dead cooldown, skipping flow",
+                        header.stream_id
+                    ));
+                    continue;
+                }
                 let reply = match relay_exchange(&mut relays, header.stream_id, *target, &pt) {
                     Ok(reply) => {
+                        dead.remove(&target_key);
                         debug_log(&format!(
                             "tunnel: data id={} relay {}B",
                             header.stream_id,
@@ -216,9 +256,10 @@ fn tunnel_loop(
                     }
                     Err(_) => {
                         debug_log(&format!(
-                            "tunnel: data id={} relay failed, skipping flow",
+                            "tunnel: data id={} relay failed, cooling down {target}",
                             header.stream_id
                         ));
+                        relay::mark_dead(&mut dead, &target_key.0, target_key.1, Instant::now());
                         continue;
                     }
                 };
@@ -281,12 +322,26 @@ fn tunnel_loop(
                     ));
                     continue;
                 }
-                let reply = match relay::relay_udp(
-                    &target.ip().to_string(),
-                    target.port(),
-                    &pt,
-                    UDP_RELAY_TIMEOUT,
-                ) {
+                // Virtual-DNS flows resolve across the whole upstream
+                // list (one silent upstream must not kill DNS); ordinary
+                // flows relay to their learned target exactly once.
+                let is_virtual = ctx.dns_upstream.iter().any(|u| {
+                    u.rsplit_once(':').is_some_and(|(host, port)| {
+                        host == target.ip().to_string()
+                            && port.parse::<u16>().ok() == Some(target.port())
+                    })
+                });
+                let relayed = if is_virtual {
+                    dns::resolve_any(&pt, &ctx.dns_upstream, UDP_RELAY_TIMEOUT)
+                } else {
+                    relay::relay_udp(
+                        &target.ip().to_string(),
+                        target.port(),
+                        &pt,
+                        UDP_RELAY_TIMEOUT,
+                    )
+                };
+                let reply = match relayed {
                     Ok(reply) => {
                         debug_log(&format!(
                             "tunnel: datagram id={} relay {}B",
@@ -380,11 +435,12 @@ fn tunnel_loop(
                 // 10.255.0.1:53; the server terminates it at its upstream
                 // (dialing .1 would time out and kill the loop instead).
                 let (addr, port) = if flow.addr == VIRTUAL_DNS_IP && flow.port == VIRTUAL_DNS_PORT {
+                    let primary = ctx.dns_upstream.first().cloned().unwrap_or_default();
                     debug_log(&format!(
                         "tunnel: open_udp id={} virtual dns -> upstream {}",
-                        flow.id, ctx.dns_upstream
+                        flow.id, primary
                     ));
-                    match ctx.dns_upstream.rsplit_once(':') {
+                    match primary.rsplit_once(':') {
                         Some((host, port)) => match port.parse::<u16>() {
                             Ok(port) => (host.to_string(), port),
                             Err(_) => break,

@@ -2,8 +2,9 @@
 //!
 //! The mux layer owns framing/crypto; relay owns the plain sockets.
 
+use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{Result, ServerError};
 
@@ -50,7 +51,60 @@ pub fn relay_udp(addr: &str, port: u16, payload: &[u8], timeout: Duration) -> Re
     Ok(buf)
 }
 
+/// Cooldown for targets whose dial just failed: retry storms (an app
+/// re-SYNing a blackholed host every few seconds) must fail fast instead of
+/// serially stalling the whole mux loop behind another full dial timeout.
+pub const DEAD_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether `addr:port` failed recently enough to skip re-dialing outright.
+#[must_use]
+pub fn is_fresh_dead(
+    dead: &HashMap<(String, u16), Instant>,
+    addr: &str,
+    port: u16,
+    now: Instant,
+) -> bool {
+    dead.get(&(addr.to_string(), port))
+        .is_some_and(|t| now.duration_since(*t) < DEAD_COOLDOWN)
+}
+
+/// Record a dial failure for cooldown.
+pub fn mark_dead(dead: &mut HashMap<(String, u16), Instant>, addr: &str, port: u16, now: Instant) {
+    dead.insert((addr.to_string(), port), now);
+}
+
 /// Legacy id-based relay hook (kept for the FFI surface; dials via mux target).
 pub fn relay(_id: u16) -> Result<()> {
     Err(ServerError::RelayError("use dial_tcp".to_string()))
+}
+
+#[cfg(test)]
+mod dead_cache_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_dead_target_is_skipped_until_cooldown() {
+        // Given: a target marked dead just now
+        let mut dead = HashMap::new();
+        let now = Instant::now();
+        mark_dead(&mut dead, "10.9.9.9", 443, now);
+        // Then: skipped within cooldown, allowed after it.
+        assert!(is_fresh_dead(&dead, "10.9.9.9", 443, now));
+        assert!(is_fresh_dead(
+            &dead,
+            "10.9.9.9",
+            443,
+            now + DEAD_COOLDOWN - Duration::from_secs(1)
+        ));
+        assert!(!is_fresh_dead(&dead, "10.9.9.9", 443, now + DEAD_COOLDOWN));
+        // And: other ports/hosts unaffected.
+        assert!(!is_fresh_dead(&dead, "10.9.9.9", 80, now));
+        assert!(!is_fresh_dead(&dead, "10.9.9.8", 443, now));
+    }
+
+    #[test]
+    fn unknown_target_never_skipped() {
+        let dead: HashMap<(String, u16), Instant> = HashMap::new();
+        assert!(!is_fresh_dead(&dead, "10.9.9.9", 443, Instant::now()));
+    }
 }
