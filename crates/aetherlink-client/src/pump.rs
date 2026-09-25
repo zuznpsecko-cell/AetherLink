@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use aetherlink_frame::codec::FrameHeader;
 use aetherlink_mux::manager::{MuxManager, SealedFrame};
 use aetherlink_netstack::smoltcp_wrapper::{
-    build_tcp_packet, build_udp_packet, parse_ipv4_packet, ParsedPayload,
+    build_tcp_packet_full, build_udp_packet, parse_ipv4_packet, ParsedPayload,
 };
 use aetherlink_netstack::tun::TunPackets;
 use aetherlink_protocol::FrameType;
@@ -51,7 +51,38 @@ struct FlowKey {
     is_udp: bool,
 }
 
-/// Stateless bridge between TUN packets and sealed mux frames.
+/// Client-side TCP termination state per 5-tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpState {
+    /// SYN seen, SYN-ACK emitted, waiting for the completing ACK.
+    SynReceived,
+    /// Handshake complete; payload flows to/from mux.
+    Established,
+}
+
+/// One terminated TCP flow: the app completes TCP against us, only payload
+/// crosses the mux (OPEN once, then DATA per segment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpFlow {
+    key: FlowKey,
+    /// Mux stream id, allocated on first payload (None until then).
+    id: Option<u16>,
+    client_ip: Ipv4Addr,
+    client_port: u16,
+    server_ip: Ipv4Addr,
+    server_port: u16,
+    /// Client initial sequence (from SYN).
+    client_isn: u32,
+    /// Our initial sequence (SYN-ACK).
+    server_iss: u32,
+    /// Next sequence number we will send.
+    server_next: u32,
+    /// Payload bytes accepted from the client so far (for ACK numbers).
+    client_bytes: u32,
+    state: TcpState,
+}
+
+/// Terminating bridge between TUN packets and sealed mux frames.
 pub struct DataPump {
     mux: MuxManager,
     /// Seal key (client->server).
@@ -61,6 +92,9 @@ pub struct DataPump {
     pad: usize,
     by_tuple: HashMap<FlowKey, u16>,
     by_id: HashMap<u16, FlowInfo>,
+    tcp: HashMap<FlowKey, TcpFlow>,
+    tcp_by_id: HashMap<u16, FlowKey>,
+    iss_next: u32,
 }
 
 impl DataPump {
@@ -80,6 +114,9 @@ impl DataPump {
             pad: pad_multiple,
             by_tuple: HashMap::new(),
             by_id: HashMap::new(),
+            tcp: HashMap::new(),
+            tcp_by_id: HashMap::new(),
+            iss_next: 1_000_000,
         }
     }
 
@@ -96,6 +133,48 @@ impl DataPump {
             pad: pad_multiple,
             by_tuple: HashMap::new(),
             by_id: HashMap::new(),
+            tcp: HashMap::new(),
+            tcp_by_id: HashMap::new(),
+            iss_next: 1_000_000,
+        }
+    }
+
+    /// Allocate our next server sequence number (deterministic counter).
+    fn next_iss(&mut self) -> u32 {
+        let iss = self.iss_next;
+        self.iss_next = self.iss_next.wrapping_add(1);
+        iss
+    }
+
+    /// Emit a SYN-ACK for a terminated flow toward TUN.
+    fn send_synack(&self, flow: &TcpFlow, tun: &mut dyn TunPackets) -> Result<()> {
+        let synack = build_tcp_packet_full(
+            flow.server_ip,
+            flow.client_ip,
+            flow.server_port,
+            flow.client_port,
+            true,
+            true,
+            false,
+            false,
+            false,
+            flow.server_iss,
+            flow.client_isn.wrapping_add(1),
+            &[],
+        );
+        tun.send_packet(&synack)?;
+        Ok(())
+    }
+
+    /// Forget a TCP flow everywhere (RST/FIN path, always silent upstream:
+    /// the server treats Rst frames as loop-fatal, so none are ever sent).
+    fn forget_tcp(&mut self, fk: &FlowKey) {
+        if let Some(flow) = self.tcp.remove(fk) {
+            if let Some(id) = flow.id {
+                self.tcp_by_id.remove(&id);
+                self.by_id.remove(&id);
+                self.by_tuple.remove(fk);
+            }
         }
     }
 
@@ -107,14 +186,18 @@ impl DataPump {
     pub fn poll_once(&mut self, tun: &mut dyn TunPackets) -> Result<Vec<SealedFrame>> {
         let mut out = Vec::new();
         while let Some(raw) = tun.try_recv()? {
-            if let Some(frames) = self.pump_one(&raw)? {
+            if let Some(frames) = self.pump_one(&raw, tun)? {
                 out.extend(frames);
             }
         }
         Ok(out)
     }
 
-    fn pump_one(&mut self, raw: &[u8]) -> Result<Option<Vec<SealedFrame>>> {
+    fn pump_one(
+        &mut self,
+        raw: &[u8],
+        tun: &mut dyn TunPackets,
+    ) -> Result<Option<Vec<SealedFrame>>> {
         let parsed = match parse_ipv4_packet(raw) {
             Ok(p) => p,
             Err(e) => {
@@ -141,36 +224,141 @@ impl DataPump {
                     dst_port: seg.dst_port,
                     is_udp: false,
                 };
-                if let Some(&id) = self.by_tuple.get(&fk) {
-                    if seg.payload.is_empty() {
+                // RST always forgets the flow, silently (never RST upstream).
+                if seg.rst {
+                    self.forget_tcp(&fk);
+                    return Ok(None);
+                }
+                // Bare SYN on an unknown flow opens termination.
+                if !self.tcp.contains_key(&fk) {
+                    if seg.syn && !seg.ack {
+                        let iss = self.next_iss();
+                        let mut flow = TcpFlow {
+                            key: fk,
+                            id: None,
+                            client_ip: parsed.src,
+                            client_port: seg.src_port,
+                            server_ip: parsed.dst,
+                            server_port: seg.dst_port,
+                            client_isn: seg.seq,
+                            server_iss: iss,
+                            server_next: iss.wrapping_add(1),
+                            client_bytes: 0,
+                            state: TcpState::SynReceived,
+                        };
+                        self.send_synack(&flow, tun)?;
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tcp synack {src}:{sport} -> {dst}:{dport}",
+                            src = parsed.src,
+                            sport = seg.src_port,
+                            dst = parsed.dst,
+                            dport = seg.dst_port,
+                        ));
+                        self.tcp.insert(fk, flow);
+                        // SYN carrying payload (fast-open style): forward it
+                        // now instead of waiting for the completing ACK.
+                        if !seg.payload.is_empty() {
+                            let mut flow = self.tcp.remove(&fk).expect("just inserted");
+                            let id = self
+                                .mux
+                                .open_tcp(&flow.server_ip.to_string(), flow.server_port)?;
+                            self.by_tuple.insert(fk, id);
+                            self.by_id.insert(
+                                id,
+                                FlowInfo {
+                                    client_ip: flow.client_ip,
+                                    client_port: flow.client_port,
+                                    server_ip: flow.server_ip,
+                                    server_port: flow.server_port,
+                                    is_udp: false,
+                                },
+                            );
+                            self.tcp_by_id.insert(id, fk);
+                            flow.id = Some(id);
+                            flow.client_bytes =
+                                flow.client_bytes.wrapping_add(seg.payload.len() as u32);
+                            let open = self.mux.seal_open_tcp(&self.tx, id, self.pad)?;
+                            let data = self.mux.seal_data(&self.tx, id, &seg.payload, self.pad)?;
+                            self.tcp.insert(fk, flow);
+                            return Ok(Some(vec![open, data]));
+                        }
+                    }
+                    return Ok(None);
+                }
+                let mut flow = self.tcp.remove(&fk).expect("checked above");
+                // Duplicate SYN (lost SYN-ACK): resend it, keep state.
+                if seg.syn && !seg.ack && seg.seq == flow.client_isn {
+                    self.send_synack(&flow, tun)?;
+                    self.tcp.insert(fk, flow);
+                    return Ok(None);
+                }
+                // Completing ACK moves SynReceived -> Established.
+                if flow.state == TcpState::SynReceived {
+                    if seg.ack && !seg.syn && seg.ack_num == flow.server_iss.wrapping_add(1) {
+                        flow.state = TcpState::Established;
+                    } else {
+                        self.tcp.insert(fk, flow);
                         return Ok(None);
                     }
-                    let sealed = self.mux.seal_data(&self.tx, id, &seg.payload, self.pad)?;
-                    Ok(Some(vec![sealed]))
-                } else {
-                    let id = self.mux.open_tcp(&parsed.dst.to_string(), seg.dst_port)?;
+                }
+                // FIN closes: FIN-ACK out, forget the flow.
+                if seg.fin {
+                    let finack = build_tcp_packet_full(
+                        flow.server_ip,
+                        flow.client_ip,
+                        flow.server_port,
+                        flow.client_port,
+                        false,
+                        true,
+                        false,
+                        true,
+                        false,
+                        flow.server_next,
+                        seg.seq
+                            .wrapping_add(seg.payload.len() as u32)
+                            .wrapping_add(1),
+                        &[],
+                    );
+                    tun.send_packet(&finack)?;
+                    self.forget_tcp(&fk);
+                    return Ok(None);
+                }
+                // Pure ACKs/keepalives: silence.
+                if seg.payload.is_empty() {
+                    self.tcp.insert(fk, flow);
+                    return Ok(None);
+                }
+                // Payload: OPEN the mux stream once, then DATA per segment.
+                let mut frames = Vec::new();
+                if flow.id.is_none() {
+                    let id = self
+                        .mux
+                        .open_tcp(&flow.server_ip.to_string(), flow.server_port)?;
                     aetherlink_netstack::debug_log(&format!(
-                        "pump: new tcp {src}:{sport} -> {dst}:{dport} id={id}",
-                        src = parsed.src,
-                        sport = seg.src_port,
-                        dst = parsed.dst,
-                        dport = seg.dst_port,
+                        "pump: tcp open id={id} -> {dst}:{dport}",
+                        dst = flow.server_ip,
+                        dport = flow.server_port,
                     ));
                     self.by_tuple.insert(fk, id);
                     self.by_id.insert(
                         id,
                         FlowInfo {
-                            client_ip: parsed.src,
-                            client_port: seg.src_port,
-                            server_ip: parsed.dst,
-                            server_port: seg.dst_port,
+                            client_ip: flow.client_ip,
+                            client_port: flow.client_port,
+                            server_ip: flow.server_ip,
+                            server_port: flow.server_port,
                             is_udp: false,
                         },
                     );
-                    let open = self.mux.seal_open_tcp(&self.tx, id, self.pad)?;
-                    let data = self.mux.seal_data(&self.tx, id, &seg.payload, self.pad)?;
-                    Ok(Some(vec![open, data]))
+                    self.tcp_by_id.insert(id, fk);
+                    flow.id = Some(id);
+                    frames.push(self.mux.seal_open_tcp(&self.tx, id, self.pad)?);
                 }
+                let id = flow.id.expect("just opened");
+                flow.client_bytes = flow.client_bytes.wrapping_add(seg.payload.len() as u32);
+                frames.push(self.mux.seal_data(&self.tx, id, &seg.payload, self.pad)?);
+                self.tcp.insert(fk, flow);
+                Ok(Some(frames))
             }
             ParsedPayload::Udp(dgram) => {
                 if is_discovery_noise(parsed.dst, dgram.dst_port) {
@@ -235,17 +423,14 @@ impl DataPump {
     ) -> Result<()> {
         match header.frame_type {
             FrameType::Data => {
-                let flow = self.by_id.get(&header.stream_id).ok_or_else(|| {
-                    ClientError::RoutingError(format!("unknown stream {}", header.stream_id))
-                })?;
-                if flow.is_udp {
-                    return Err(ClientError::RoutingError(format!(
-                        "stream {} is udp, got DATA",
-                        header.stream_id
-                    )));
-                }
+                let id = header.stream_id;
+                let key = *self
+                    .tcp_by_id
+                    .get(&id)
+                    .ok_or_else(|| ClientError::RoutingError(format!("unknown stream {id}")))?;
                 let payload = self.mux.open_data(&self.rx, header, ciphertext)?;
-                let pkt = build_tcp_packet(
+                let mut flow = self.tcp.remove(&key).expect("tcp_by_id consistent");
+                let pkt = build_tcp_packet_full(
                     flow.server_ip,
                     flow.client_ip,
                     flow.server_port,
@@ -253,11 +438,17 @@ impl DataPump {
                     false,
                     true,
                     true,
-                    0,
-                    0,
+                    false,
+                    false,
+                    flow.server_next,
+                    flow.client_isn
+                        .wrapping_add(1)
+                        .wrapping_add(flow.client_bytes),
                     &payload,
                 );
+                flow.server_next = flow.server_next.wrapping_add(payload.len() as u32);
                 tun.send_packet(&pkt)?;
+                self.tcp.insert(key, flow);
                 Ok(())
             }
             FrameType::UdpDatagram => {

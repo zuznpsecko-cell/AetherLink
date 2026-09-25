@@ -67,8 +67,21 @@ impl ClientConfig {
     /// Accepts both the §8 nested shape (`{client: {...}}`) and a flat
     /// table (FFI callers passing pre-extracted sections).
     pub fn parse(root: &serde_json::Value) -> Result<Self> {
-        let doc = root.get("client").unwrap_or(root);
-        Self::parse_flat(doc)
+        let inner = root.get("client").unwrap_or(root);
+        // Section inheritance: file-level `full_tunnel`/`routing` apply when
+        // the `client:` section does not define them (the shipped example
+        // layout). Without this, root sections are silently dropped.
+        let mut doc = inner.clone();
+        if let Some(map) = doc.as_object_mut() {
+            for key in ["full_tunnel", "routing"] {
+                if !map.contains_key(key) {
+                    if let Some(section) = root.get(key) {
+                        map.insert(key.to_string(), section.clone());
+                    }
+                }
+            }
+        }
+        Self::parse_flat(&doc)
     }
 
     /// Parse + validate a flat client config table.

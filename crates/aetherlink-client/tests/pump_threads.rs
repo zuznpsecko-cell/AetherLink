@@ -13,7 +13,7 @@ use std::time::Duration;
 use aetherlink_client::threads::{read_sealed, spawn_pump};
 use aetherlink_frame::codec::FrameHeader;
 use aetherlink_mux::manager::MuxManager;
-use aetherlink_netstack::smoltcp_wrapper::{build_tcp_packet, build_udp_packet};
+use aetherlink_netstack::smoltcp_wrapper::{build_tcp_packet, build_udp_packet, parse_ipv4_packet};
 use aetherlink_netstack::tun::TunPackets;
 
 const KEY: [u8; 32] = [9u8; 32];
@@ -58,14 +58,66 @@ fn loopback_pair() -> (TcpStream, TcpStream) {
     (client, server)
 }
 
+/// Wait for the pump thread's SYN-ACK in TUN, return its sequence number.
+fn poll_synack(tun: &Arc<Mutex<FakeTun>>) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let mut guard = tun.lock().expect("lock");
+            if let Some(raw) = guard.outbound.pop() {
+                let parsed = parse_ipv4_packet(&raw).expect("valid ip");
+                let seg = parsed.tcp().expect("tcp");
+                assert!(seg.syn && seg.ack, "pump answers SYN with SYN-ACK");
+                return seg.seq;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no SYN-ACK from pump thread"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn tun_packets_reach_the_wire() {
     // Given: SYN queued in TUN + pump on a loopback stream
     let syn = build_tcp_packet(CLIENT_IP, DST, 41000, 443, true, false, false, 5000, 0, &[]);
     let tun = tun_with(vec![syn]);
     let (client_side, server_side) = loopback_pair();
-    let _handle = spawn_pump(tun, client_side, KEY, KEY, PAD).expect("spawn");
-    // When: reading two frames server-side
+    let _handle = spawn_pump(Arc::clone(&tun), client_side, KEY, KEY, PAD).expect("spawn");
+    // When: handshake completes against the pump, then payload flows
+    let iss = poll_synack(&tun);
+    let ack = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        41000,
+        443,
+        false,
+        true,
+        false,
+        5001,
+        iss.wrapping_add(1),
+        &[],
+    );
+    let data = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        41000,
+        443,
+        false,
+        true,
+        true,
+        5001,
+        iss.wrapping_add(1),
+        b"hello",
+    );
+    {
+        let mut guard = tun.lock().expect("lock");
+        guard.inbound.push_back(ack);
+        guard.inbound.push_back(data);
+    }
+    // Then: OPEN_TCP + DATA arrive server-side
     let (h1, c1) = read_sealed(&mut &server_side).expect("frame 1");
     let (h2, c2) = read_sealed(&mut &server_side).expect("frame 2");
     // Then: OPEN_TCP + DATA, both open server-side with the session key

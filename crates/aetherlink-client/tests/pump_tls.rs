@@ -112,17 +112,23 @@ fn tls_pump_moves_bytes_both_ways() {
     )
     .expect("connect");
     let mut handle = spawn_pump_tls(Arc::clone(&tun), tunnel, PAD).expect("spawn");
-    // Then: echo payload lands back in TUN as a TCP packet
+    // Then: echo payload lands back in TUN as a TCP packet (outbound[0]
+    // is the pump's own SYN-ACK; the echo arrives behind it).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         {
             let guard = tun.lock().expect("lock");
-            if !guard.outbound.is_empty() {
+            let mut found = false;
+            for raw in guard.outbound.iter() {
                 let parsed =
-                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&guard.outbound[0])
-                        .expect("valid ip");
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw).expect("valid ip");
                 assert_eq!(parsed.dst, CLIENT_IP);
-                assert_eq!(parsed.tcp().expect("tcp").payload, b"hello");
+                if parsed.tcp().expect("tcp").payload == b"hello" {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
                 break;
             }
         }
@@ -261,17 +267,22 @@ fn attach_pump_wires_tun_through_tls_session() {
         Some(Arc::new(AcceptAll)),
     )
     .expect("attach");
-    // Then: echo returns into TUN as a TCP packet.
+    // Then: echo returns into TUN as a TCP packet (behind our SYN-ACK).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         {
             let guard = tun.lock().expect("lock");
-            if !guard.outbound.is_empty() {
+            let mut found = false;
+            for raw in guard.outbound.iter() {
                 let parsed =
-                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&guard.outbound[0])
-                        .expect("valid ip");
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw).expect("valid ip");
                 assert_eq!(parsed.dst, CLIENT_IP);
-                assert_eq!(parsed.tcp().expect("tcp").payload, b"via-attach");
+                if parsed.tcp().expect("tcp").payload == b"via-attach" {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
                 break;
             }
         }

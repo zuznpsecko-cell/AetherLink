@@ -176,6 +176,31 @@ pub fn build_tcp_packet(
     ack_num: u32,
     payload: &[u8],
 ) -> Vec<u8> {
+    build_tcp_packet_full(
+        src, dst, src_port, dst_port, syn, ack, psh, false, false, seq, ack_num, payload,
+    )
+}
+
+/// Build one IPv4/TCP packet with full flag control (close path needs FIN).
+///
+/// `build_tcp_packet` covers the common case so its 25 existing call sites
+/// stay untouched; this variant is for SYN-ACK/FIN/RST construction.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_tcp_packet_full(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    syn: bool,
+    ack: bool,
+    psh: bool,
+    fin: bool,
+    rst: bool,
+    seq: u32,
+    ack_num: u32,
+    payload: &[u8],
+) -> Vec<u8> {
     const IPV4_HEADER: usize = 20;
     const TCP_HEADER: usize = 20;
     let total = IPV4_HEADER + TCP_HEADER + payload.len();
@@ -196,6 +221,8 @@ pub fn build_tcp_packet(
         tcp.set_syn(syn);
         tcp.set_ack(ack);
         tcp.set_psh(psh);
+        tcp.set_fin(fin);
+        tcp.set_rst(rst);
         tcp.payload_mut()[..payload.len()].copy_from_slice(payload);
         tcp.fill_checksum(&ip_addr(src), &ip_addr(dst));
     }

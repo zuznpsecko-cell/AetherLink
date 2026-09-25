@@ -49,8 +49,9 @@ impl TunPackets for FakeTun {
 }
 
 #[test]
-fn tcp_syn_becomes_open_plus_data() {
-    // Given: TCP SYN from TUN toward an external target
+fn tcp_handshake_then_data_opens_mux() {
+    // Given: TCP SYN from TUN toward an external target (terminated TCP:
+    // handshake completes against the pump, nothing goes upstream yet)
     let syn = build_tcp_packet(
         CLIENT_IP,
         SERVER_DST,
@@ -65,10 +66,47 @@ fn tcp_syn_becomes_open_plus_data() {
     );
     let mut tun = FakeTun::with_packets(vec![syn]);
     let mut pump = DataPump::new(KEY, PAD);
-    // When: polling once
+    // When: polling -> Then: SYN-ACK to TUN, zero frames upstream
     let frames = pump.poll_once(&mut tun).expect("poll");
-    // Then: OPEN_TCP (seq 0) + DATA frames, both parseable server-side
-    assert_eq!(frames.len(), 2, "SYN must yield OPEN + DATA");
+    assert!(frames.is_empty());
+    assert_eq!(tun.outbound.len(), 1);
+    let iss = aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&tun.outbound[0])
+        .expect("valid synack")
+        .tcp()
+        .expect("tcp")
+        .seq;
+    tun.outbound.clear();
+    // When: ACK completes, then PSH with payload
+    let ack = build_tcp_packet(
+        CLIENT_IP,
+        SERVER_DST,
+        40000,
+        443,
+        false,
+        true,
+        false,
+        1001,
+        iss.wrapping_add(1),
+        &[],
+    );
+    tun.inbound.push_back(ack);
+    assert!(pump.poll_once(&mut tun).expect("poll").is_empty());
+    let data = build_tcp_packet(
+        CLIENT_IP,
+        SERVER_DST,
+        40000,
+        443,
+        false,
+        true,
+        true,
+        1001,
+        iss.wrapping_add(1),
+        b"GET",
+    );
+    tun.inbound.push_back(data);
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    // Then: OPEN_TCP + DATA, both parseable server-side
+    assert_eq!(frames.len(), 2, "established payload yields OPEN + DATA");
     let mut server = MuxManager::new();
     let tcp = MuxManager::parse_open_tcp(&KEY, &frames[0].header, &frames[0].ciphertext)
         .expect("open parses");
@@ -84,9 +122,10 @@ fn tcp_syn_becomes_open_plus_data() {
         stream_id: tcp.id,
         sequence: frames[1].header.sequence,
     };
-    assert!(server
+    let pt = server
         .open_data(&KEY, &data_hdr, &frames[1].ciphertext)
-        .is_ok());
+        .expect("data opens");
+    assert_eq!(pt, b"GET");
 }
 
 #[test]
@@ -123,7 +162,7 @@ fn udp_dns_becomes_open_plus_datagram() {
 
 #[test]
 fn mux_data_becomes_tcp_packet_in_tun() {
-    // Given: established TCP flow via a prior SYN poll
+    // Given: terminated flow (SYN, SYN-ACK, ACK) + one payload upstream
     let syn = build_tcp_packet(
         CLIENT_IP,
         SERVER_DST,
@@ -138,7 +177,42 @@ fn mux_data_becomes_tcp_packet_in_tun() {
     );
     let mut tun = FakeTun::with_packets(vec![syn]);
     let mut pump = DataPump::new(KEY, PAD);
+    assert!(pump.poll_once(&mut tun).expect("poll").is_empty());
+    let iss = aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&tun.outbound[0])
+        .expect("valid synack")
+        .tcp()
+        .expect("tcp")
+        .seq;
+    tun.outbound.clear();
+    let ack = build_tcp_packet(
+        CLIENT_IP,
+        SERVER_DST,
+        40001,
+        80,
+        false,
+        true,
+        false,
+        2001,
+        iss.wrapping_add(1),
+        &[],
+    );
+    tun.inbound.push_back(ack);
+    assert!(pump.poll_once(&mut tun).expect("poll").is_empty());
+    let data = build_tcp_packet(
+        CLIENT_IP,
+        SERVER_DST,
+        40001,
+        80,
+        false,
+        true,
+        true,
+        2001,
+        iss.wrapping_add(1),
+        b"hello",
+    );
+    tun.inbound.push_back(data);
     let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
     let id = frames[0].header.stream_id;
     // When: server reply bytes arrive via mux (sealed by a peer mux)
     let mut peer = MuxManager::new();
@@ -150,13 +224,15 @@ fn mux_data_becomes_tcp_packet_in_tun() {
     pump.receive_mux(&sealed.header, &sealed.ciphertext, &mut tun)
         .expect("inject");
     // Then: one TCP packet toward TUN carries the payload
-    assert_eq!(tun.outbound.len(), 1);
-    let parsed = aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&tun.outbound[0])
-        .expect("valid ip");
+    let out: Vec<_> = tun.outbound.drain(..).collect();
+    assert_eq!(out.len(), 1);
+    let parsed =
+        aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&out[0]).expect("valid ip");
     assert_eq!(parsed.dst, CLIENT_IP);
     let seg = parsed.tcp().expect("tcp");
     assert_eq!(seg.dst_port, 40001);
     assert_eq!(seg.payload, reply);
+    assert!(seg.ack && seg.psh);
 }
 
 #[test]
@@ -188,7 +264,7 @@ fn mux_datagram_becomes_udp_packet_in_tun() {
 
 #[test]
 fn tampered_frame_fails_closed_without_tun_write() {
-    // Given: established flow + a tampered mux frame
+    // Given: terminated flow with one payload upstream (real sealed DATA)
     let syn = build_tcp_packet(
         CLIENT_IP,
         SERVER_DST,
@@ -203,7 +279,43 @@ fn tampered_frame_fails_closed_without_tun_write() {
     );
     let mut tun = FakeTun::with_packets(vec![syn]);
     let mut pump = DataPump::new(KEY, PAD);
+    assert!(pump.poll_once(&mut tun).expect("poll").is_empty());
+    let iss = aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&tun.outbound[0])
+        .expect("valid synack")
+        .tcp()
+        .expect("tcp")
+        .seq;
+    tun.outbound.clear();
+    let ack = build_tcp_packet(
+        CLIENT_IP,
+        SERVER_DST,
+        40002,
+        443,
+        false,
+        true,
+        false,
+        3001,
+        iss.wrapping_add(1),
+        &[],
+    );
+    tun.inbound.push_back(ack);
+    assert!(pump.poll_once(&mut tun).expect("poll").is_empty());
+    let data = build_tcp_packet(
+        CLIENT_IP,
+        SERVER_DST,
+        40002,
+        443,
+        false,
+        true,
+        true,
+        3001,
+        iss.wrapping_add(1),
+        b"ping",
+    );
+    tun.inbound.push_back(data);
     let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
+    tun.outbound.clear();
     let mut bad = frames[1].clone();
     bad.ciphertext[0] ^= 0xFF;
     // When: injecting the tampered frame -> Then: Err, nothing written to TUN
