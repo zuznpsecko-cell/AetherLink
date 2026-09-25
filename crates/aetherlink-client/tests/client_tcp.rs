@@ -288,3 +288,94 @@ fn app_rst_forgets_flow_silently() {
     assert!(frames.is_empty());
     assert!(tun.take_outbound().is_empty());
 }
+
+/// TunPackets wrapper failing the next send_packet on demand (wintun ring
+/// full under flood). A failed send must never desync the flow tables.
+struct FlakyTun {
+    inner: FakeTun,
+    fail_send: bool,
+}
+
+impl TunPackets for FlakyTun {
+    fn try_recv(&mut self) -> aetherlink_netstack::Result<Option<Vec<u8>>> {
+        self.inner.try_recv()
+    }
+
+    fn send_packet(&mut self, pkt: &[u8]) -> aetherlink_netstack::Result<()> {
+        if self.fail_send {
+            self.fail_send = false;
+            return Err(aetherlink_netstack::NetstackError::InvalidPacket(
+                "injected send failure".to_string(),
+            ));
+        }
+        self.inner.send_packet(pkt)
+    }
+}
+
+#[test]
+fn failed_sends_keep_tables_consistent() {
+    // Given: established flow with mux id allocated (one payload upstream)
+    let mut tun = FlakyTun {
+        inner: FakeTun::with_packets(vec![syn(7000)]),
+        fail_send: false,
+    };
+    let mut pump = DataPump::new(KEY, PAD);
+    assert!(pump.poll_once(&mut tun).expect("poll").is_empty());
+    let out = tun.inner.take_outbound();
+    assert_eq!(out.len(), 1);
+    let iss = out[0].tcp().expect("tcp").seq;
+    let ack = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        false,
+        7001,
+        iss.wrapping_add(1),
+        &[],
+    );
+    tun.inner.inbound.push_back(ack);
+    assert!(pump.poll_once(&mut tun).expect("poll").is_empty());
+    let data = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        true,
+        7001,
+        iss.wrapping_add(1),
+        b"hi",
+    );
+    tun.inner.inbound.push_back(data);
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
+    let id = frames[0].header.stream_id;
+    // When: duplicate SYN while the TUN send fails (ring full)
+    tun.fail_send = true;
+    tun.inner.inbound.push_back(syn(7000));
+    // Then: clean Err, no panic — and the flow still works after.
+    assert!(pump.poll_once(&mut tun).is_err());
+    let mut peer = MuxManager::new();
+    peer.register_inbound(id, &DST.to_string(), 80, false)
+        .expect("register");
+    let one = peer.seal_data(&KEY, id, b"one", PAD).expect("seal");
+    pump.receive_mux(&one.header, &one.ciphertext, &mut tun)
+        .expect("flow survived failed resend");
+    assert_eq!(tun.inner.take_outbound().len(), 1);
+    // When: a mux reply fails its TUN send -> Then: Err, flow survives again.
+    tun.fail_send = true;
+    let two = peer.seal_data(&KEY, id, b"two", PAD).expect("seal");
+    assert!(pump
+        .receive_mux(&two.header, &two.ciphertext, &mut tun)
+        .is_err());
+    let three = peer.seal_data(&KEY, id, b"three", PAD).expect("seal");
+    pump.receive_mux(&three.header, &three.ciphertext, &mut tun)
+        .expect("flow survived failed inject");
+    let out = tun.inner.take_outbound();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].tcp().expect("tcp").payload, b"three");
+}

@@ -259,9 +259,34 @@ impl DataPump {
                         // now instead of waiting for the completing ACK.
                         if !seg.payload.is_empty() {
                             let mut flow = self.tcp.remove(&fk).expect("just inserted");
-                            let id = self
+                            // Any failure below restores the flow first: maps
+                            // commit only after all fallible ops succeed, so
+                            // the tables can never desync (live panic class).
+                            let id = match self
                                 .mux
-                                .open_tcp(&flow.server_ip.to_string(), flow.server_port)?;
+                                .open_tcp(&flow.server_ip.to_string(), flow.server_port)
+                            {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    self.tcp.insert(fk, flow);
+                                    return Err(e.into());
+                                }
+                            };
+                            let open = match self.mux.seal_open_tcp(&self.tx, id, self.pad) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    self.tcp.insert(fk, flow);
+                                    return Err(e.into());
+                                }
+                            };
+                            let data =
+                                match self.mux.seal_data(&self.tx, id, &seg.payload, self.pad) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        self.tcp.insert(fk, flow);
+                                        return Err(e.into());
+                                    }
+                                };
                             self.by_tuple.insert(fk, id);
                             self.by_id.insert(
                                 id,
@@ -277,21 +302,25 @@ impl DataPump {
                             flow.id = Some(id);
                             flow.client_bytes =
                                 flow.client_bytes.wrapping_add(seg.payload.len() as u32);
-                            let open = self.mux.seal_open_tcp(&self.tx, id, self.pad)?;
-                            let data = self.mux.seal_data(&self.tx, id, &seg.payload, self.pad)?;
                             self.tcp.insert(fk, flow);
                             return Ok(Some(vec![open, data]));
                         }
                     }
                     return Ok(None);
                 }
-                let mut flow = self.tcp.remove(&fk).expect("checked above");
-                // Duplicate SYN (lost SYN-ACK): resend it, keep state.
-                if seg.syn && !seg.ack && seg.seq == flow.client_isn {
-                    self.send_synack(&flow, tun)?;
-                    self.tcp.insert(fk, flow);
+                // Duplicate SYN (lost SYN-ACK): resend it borrowing only,
+                // so a failed send cannot desync the tables.
+                if seg.syn && !seg.ack {
+                    if let Some(flow) = self.tcp.get(&fk) {
+                        if seg.seq == flow.client_isn {
+                            let flow = *flow;
+                            self.send_synack(&flow, tun)?;
+                            return Ok(None);
+                        }
+                    }
                     return Ok(None);
                 }
+                let mut flow = self.tcp.remove(&fk).expect("checked above");
                 // Completing ACK moves SynReceived -> Established.
                 if flow.state == TcpState::SynReceived {
                     if seg.ack && !seg.syn && seg.ack_num == flow.server_iss.wrapping_add(1) {
@@ -331,14 +360,28 @@ impl DataPump {
                 // Payload: OPEN the mux stream once, then DATA per segment.
                 let mut frames = Vec::new();
                 if flow.id.is_none() {
-                    let id = self
+                    let id = match self
                         .mux
-                        .open_tcp(&flow.server_ip.to_string(), flow.server_port)?;
+                        .open_tcp(&flow.server_ip.to_string(), flow.server_port)
+                    {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.tcp.insert(fk, flow);
+                            return Err(e.into());
+                        }
+                    };
                     aetherlink_netstack::debug_log(&format!(
                         "pump: tcp open id={id} -> {dst}:{dport}",
                         dst = flow.server_ip,
                         dport = flow.server_port,
                     ));
+                    let open = match self.mux.seal_open_tcp(&self.tx, id, self.pad) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            self.tcp.insert(fk, flow);
+                            return Err(e.into());
+                        }
+                    };
                     self.by_tuple.insert(fk, id);
                     self.by_id.insert(
                         id,
@@ -352,11 +395,18 @@ impl DataPump {
                     );
                     self.tcp_by_id.insert(id, fk);
                     flow.id = Some(id);
-                    frames.push(self.mux.seal_open_tcp(&self.tx, id, self.pad)?);
+                    frames.push(open);
                 }
                 let id = flow.id.expect("just opened");
+                let data = match self.mux.seal_data(&self.tx, id, &seg.payload, self.pad) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.tcp.insert(fk, flow);
+                        return Err(e.into());
+                    }
+                };
                 flow.client_bytes = flow.client_bytes.wrapping_add(seg.payload.len() as u32);
-                frames.push(self.mux.seal_data(&self.tx, id, &seg.payload, self.pad)?);
+                frames.push(data);
                 self.tcp.insert(fk, flow);
                 Ok(Some(frames))
             }
@@ -428,8 +478,26 @@ impl DataPump {
                     .tcp_by_id
                     .get(&id)
                     .ok_or_else(|| ClientError::RoutingError(format!("unknown stream {id}")))?;
-                let payload = self.mux.open_data(&self.rx, header, ciphertext)?;
-                let mut flow = self.tcp.remove(&key).expect("tcp_by_id consistent");
+                let payload = match self.mux.open_data(&self.rx, header, ciphertext) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: data id={id} open failed: {e}, flow kept"
+                        ));
+                        return Err(e.into());
+                    }
+                };
+                let mut flow = match self.tcp.remove(&key) {
+                    Some(flow) => flow,
+                    None => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: data id={id} without terminated flow, dropped"
+                        ));
+                        return Err(ClientError::RoutingError(format!(
+                            "stream {id} has no terminated flow"
+                        )));
+                    }
+                };
                 let pkt = build_tcp_packet_full(
                     flow.server_ip,
                     flow.client_ip,
@@ -447,7 +515,14 @@ impl DataPump {
                     &payload,
                 );
                 flow.server_next = flow.server_next.wrapping_add(payload.len() as u32);
-                tun.send_packet(&pkt)?;
+                if let Err(e) = tun.send_packet(&pkt) {
+                    // Ring full etc: keep the flow (un-advanced? no — the
+                    // sequence advanced, but the app never saw the bytes, so
+                    // roll the number back to stay consistent).
+                    flow.server_next = flow.server_next.wrapping_sub(payload.len() as u32);
+                    self.tcp.insert(key, flow);
+                    return Err(e.into());
+                }
                 self.tcp.insert(key, flow);
                 Ok(())
             }
