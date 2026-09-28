@@ -19,6 +19,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 export DEBIAN_FRONTEND=noninteractive
 
+# Toolchains are often user-local (rustup) while we run under sudo:
+# probe the usual spots before failing with "command not found".
+for d in "$HOME/.cargo/bin" /root/.cargo/bin /usr/local/cargo/bin /opt/cargo/bin; do
+  [ -x "$d/cargo" ] && export PATH="$d:$PATH" && break
+done
+for d in "$HOME/.dotnet" /usr/share/dotnet /usr/lib/dotnet; do
+  [ -x "$d/dotnet" ] && export PATH="$d:$PATH" && break
+done
+command -v cargo >/dev/null || { echo "cargo not found (tried ~/.cargo/bin, /root/.cargo/bin, /usr/local/cargo/bin). Install rustup first." >&2; exit 3; }
+command -v dotnet >/dev/null || { echo "dotnet not found. Install .NET SDK 8+ first." >&2; exit 3; }
+
 echo "==> [1/4] Fetch latest main..."
 rm -rf "$WORK"
 git clone --quiet --depth 1 "$REPO" "$WORK"
