@@ -357,6 +357,24 @@ impl DataPump {
                     self.tcp.insert(fk, flow);
                     return Ok(None);
                 }
+                // In-order only: duplicates (app RTO retransmits) and gaps
+                // are dropped, never resealed. Resealing duplicates inflates
+                // client_bytes, the ACK number then runs past the app send
+                // window, and the local stack answers RST (seen live).
+                // Gaps resolve via app retransmit of the missing bytes.
+                let expected = flow
+                    .client_isn
+                    .wrapping_add(1)
+                    .wrapping_add(flow.client_bytes);
+                if seg.seq != expected {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tcp id={} out-of-order/drop (seq {} vs expected {expected}), dropped",
+                        flow.id.unwrap_or(u16::MAX),
+                        seg.seq
+                    ));
+                    self.tcp.insert(fk, flow);
+                    return Ok(None);
+                }
                 // Payload: OPEN the mux stream once, then DATA per segment.
                 let mut frames = Vec::new();
                 if flow.id.is_none() {

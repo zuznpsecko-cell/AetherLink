@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-09-22 (TDD 194/194 green, fmt clean, clippy warnings-only; Windows up/down live cycle green)_
+_Last Updated: 2026-09-25 (TDD 211/211 green, fmt clean, clippy 0 errors; Windows up/down live cycle green; live traffic proof in progress — see docs/LIVE_ISSUES.md)_
 
 ## Overview
 
@@ -70,6 +70,8 @@ _Last Updated: 2026-09-22 (TDD 194/194 green, fmt clean, clippy warnings-only; W
 
 ## Known Issues / Blockers
 
+> Рабочий журнал живых прогонов: [docs/LIVE_ISSUES.md](LIVE_ISSUES.md) — открытые и закрытые проблемы с доказательствами.
+
 1. **Live TUN tests** — need Linux root/CAP_NET_ADMIN or Windows admin
    (run manually per PLAN_FINAL_TDD.md D5/G3)
 2. **On-device Android test** — APK assembles; needs phone/TV for VpnService run
@@ -78,7 +80,7 @@ _Last Updated: 2026-09-22 (TDD 194/194 green, fmt clean, clippy warnings-only; W
 
 ## Next Steps
 
-1. Phase W3: `DataPump` (TUN↔mux bridge) — `TunPackets` + `TunInterface` I/O
-   + `client/src/pump.rs`, RED-тесты с `FakeTun` (в работе)
-2. Phase W4: памп-потоки в `up()`/`down()` + живой чек-лист под админом
-3. Phase I6: live E2E под правами (curl через туннель)
+1. Live traffic proof: сквозной HTTP через туннель против VPS (DNS уже ходит в обе стороны; текущий фронт — задержки серийного event-loop сервера).
+2. Streaming relay (полный дуплекс TCP вместо запрос-ответ) — после пруфа.
+3. Phase T: TLS-fidelity hardening (DEC-012) — после рабочего трафика.
+4. Phase I6: полный live E2E чек-лист (kill -9, DNS no-leak, domain-direct).

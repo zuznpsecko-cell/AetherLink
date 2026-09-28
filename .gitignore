@@ -60,6 +60,22 @@ state.json
 .vscode/
 *.log
 
+# --- Live-run logs and batch outputs (never in git) ---
+*-debug.txt
+up-*.txt
+b-*.txt
+b2-*.txt
+c-*.txt
+d2-*.txt
+e2-*.txt
+f2-*.txt
+routes-*.txt
+ifaces-*.txt
+sync-check.txt
+*.srl
+*.csr
+*.ext
+
 # --- Agent recovery prompt: stored separately by owner, never in git ---
 AGENT_PROMPT.md
 
@@ -70,3 +86,7 @@ desktop.ini
 *~
 *.orig
 *.rej
+
+# --- Live-run logs (per-batch outputs, never in git) ---
+/logs/
+

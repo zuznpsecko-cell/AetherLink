@@ -379,3 +379,58 @@ fn failed_sends_keep_tables_consistent() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].tcp().expect("tcp").payload, b"three");
 }
+
+#[test]
+fn retransmitted_data_is_dropped_without_recount() {
+    // Given: established flow, one payload ("hi") already upstream
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 8000);
+    let data = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        true,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"hi",
+    );
+    tun.inbound.push_back(data);
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
+    let id = frames[0].header.stream_id;
+    // When: the same segment retransmitted (app RTO, no answer yet)
+    let dup = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        true,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"hi",
+    );
+    tun.inbound.push_back(dup);
+    // Then: dropped silently — no second upstream copy, no recount.
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert!(frames.is_empty());
+    assert!(tun.take_outbound().is_empty());
+    // And: the next server reply still acks exactly isn+1+2.
+    let mut peer = MuxManager::new();
+    peer.register_inbound(id, &DST.to_string(), 80, false)
+        .expect("register");
+    let sealed = peer.seal_data(&KEY, id, b"ok", PAD).expect("seal");
+    pump.receive_mux(&sealed.header, &sealed.ciphertext, &mut tun)
+        .expect("inject");
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].tcp().expect("tcp").ack_num,
+        isn.wrapping_add(1).wrapping_add(2)
+    );
+}
