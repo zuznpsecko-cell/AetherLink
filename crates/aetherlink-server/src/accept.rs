@@ -75,6 +75,16 @@ const READ_TIMEOUT: Duration = Duration::from_millis(200);
 /// At cap the loop sheds (fail fast, app retransmits) instead of queueing.
 const POOL_WORKERS: usize = 32;
 
+/// Queue depth past the workers: legit bursts (120+ flows in one go,
+/// seen in tests and on noisy machines) must not shed — shed TCP DATA
+/// stalls that stream past client dedup, so shed stays flood-only.
+const POOL_QUEUE: usize = 256;
+
+/// Idle drain after the first reply chunk: multi-chunk flights (TLS
+/// handshakes) arrive with small gaps; shorter stalls interactive
+/// traffic, longer delays every exchange by the tail.
+const STREAM_IDLE: Duration = Duration::from_millis(200);
+
 /// Completed relay work, back on the loop thread. Seal + write stay here:
 /// single writer, the mux never leaves this thread, and reply order per
 /// stream does not matter (the peer's replay window tolerates reorder).
@@ -327,7 +337,8 @@ fn tunnel_loop(
     let mut dead: HashMap<(String, u16), Instant> = HashMap::new();
     // Stream ids with relay jobs in flight (socket reuse only when idle).
     let mut in_flight: HashMap<u16, usize> = HashMap::new();
-    let pool: RelayPool<FlowKey, Result<RelayOut, ()>> = RelayPool::new(POOL_WORKERS);
+    let pool: RelayPool<FlowKey, Result<RelayOut, ()>> =
+        RelayPool::new(POOL_WORKERS, POOL_WORKERS + POOL_QUEUE);
     // Best-effort: without a timeout an idle peer wedges completion
     // draining; failure keeps the old blocking behaviour.
     let _ = stream.get_mut().set_read_timeout(Some(READ_TIMEOUT));
@@ -473,18 +484,11 @@ fn tunnel_loop(
                         Ok(s) => s,
                         Err(()) => return Err(()),
                     };
-                    if sock.write_all(&pt).is_err() {
-                        return Err(());
-                    }
-                    let mut buf = vec![0u8; 65535];
-                    match sock.read(&mut buf) {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Ok(RelayOut::Tcp {
-                                reply: buf,
-                                sock: Some(sock),
-                            })
-                        }
+                    match relay::exchange_stream(&mut sock, &pt, RELAY_TIMEOUT, STREAM_IDLE) {
+                        Ok(reply) => Ok(RelayOut::Tcp {
+                            reply,
+                            sock: Some(sock),
+                        }),
                         Err(_) => Err(()),
                     }
                 }) {

@@ -41,10 +41,16 @@ where
     K: Send + 'static,
     R: Send + 'static,
 {
-    /// Spawn `workers` threads; at most `workers` jobs run at once.
+    /// Spawn `workers` threads; at most `cap` jobs in flight (running +
+    /// queued). Past `cap` `dispatch` fails fast so a burst sheds instead
+    /// of queueing without bound (each queued job pins its payload).
+    /// Keep `cap` comfortably above the worst legit burst: shed TCP DATA
+    /// is never retried past the client dedup, so shed must stay a
+    /// flood-only event, not a burst event.
     #[must_use]
-    pub fn new(workers: usize) -> Self {
+    pub fn new(workers: usize, cap: usize) -> Self {
         assert!(workers > 0, "pool needs at least one worker");
+        assert!(cap >= workers, "cap must cover the workers");
         let (job_tx, job_rx) = mpsc::channel::<Job<K, R>>();
         let (done_tx, done_rx) = mpsc::channel::<Completion<K, R>>();
         let shared = Arc::new(Mutex::new(job_rx));
@@ -77,7 +83,7 @@ where
         Self {
             tx: job_tx,
             rx: done_rx,
-            cap: workers,
+            cap,
             active: AtomicUsize::new(0),
         }
     }

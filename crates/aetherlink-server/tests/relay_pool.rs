@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn fast_result_first_despite_slow_job() {
-    let pool: RelayPool<u16, &'static str> = RelayPool::new(2);
+    let pool: RelayPool<u16, &'static str> = RelayPool::new(2, 2);
     assert!(pool.dispatch(1, || {
         std::thread::sleep(Duration::from_millis(300));
         "slow"
@@ -25,7 +25,7 @@ fn fast_result_first_despite_slow_job() {
 
 #[test]
 fn cap_fail_fast() {
-    let pool: RelayPool<u16, &'static str> = RelayPool::new(1);
+    let pool: RelayPool<u16, &'static str> = RelayPool::new(1, 1);
     assert!(pool.dispatch(1, || {
         std::thread::sleep(Duration::from_millis(500));
         "blocked"
@@ -41,7 +41,7 @@ fn cap_fail_fast() {
 
 #[test]
 fn keys_and_results_round_trip() {
-    let pool: RelayPool<u16, Result<Vec<u8>, ()>> = RelayPool::new(8);
+    let pool: RelayPool<u16, Result<Vec<u8>, ()>> = RelayPool::new(8, 8);
     for i in 0..8u16 {
         assert!(pool.dispatch(i, move || Ok(vec![i as u8])));
     }

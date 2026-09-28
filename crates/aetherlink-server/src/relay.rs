@@ -51,6 +51,51 @@ pub fn relay_udp(addr: &str, port: u16, payload: &[u8], timeout: Duration) -> Re
     Ok(buf)
 }
 
+/// One payload in, full reply flight out: write, one blocking first read
+/// (socket's own timeout), then drain until `idle` with no new bytes.
+///
+/// A single read strands multi-chunk flights (TLS handshakes) in the
+/// socket buffer and the peer stalls forever (seen live:
+/// ERR_SSL_PROTOCOL_ERROR in the browser). Idle-bounded, not
+/// close-bounded: keep-alive targets that answer but hold the connection
+/// open still release. Capped at 1MB per exchange (bulk streaming beyond
+/// that needs full-duplex relay, a follow-up).
+pub fn exchange_stream(
+    sock: &mut TcpStream,
+    payload: &[u8],
+    first: Duration,
+    idle: Duration,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    const CAP: usize = 1 << 20;
+    sock.write_all(payload)
+        .map_err(|e| ServerError::RelayError(format!("stream write: {e}")))?;
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 65535];
+    sock.set_read_timeout(Some(first))
+        .map_err(|e| ServerError::RelayError(format!("stream timeout: {e}")))?;
+    let n = sock
+        .read(&mut buf)
+        .map_err(|e| ServerError::RelayError(format!("stream read: {e}")))?;
+    out.extend_from_slice(&buf[..n]);
+    sock.set_read_timeout(Some(idle))
+        .map_err(|e| ServerError::RelayError(format!("stream timeout: {e}")))?;
+    while out.len() < CAP {
+        match sock.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                break
+            }
+            Err(e) => return Err(ServerError::RelayError(format!("stream drain: {e}"))),
+        }
+    }
+    Ok(out)
+}
+
 /// Cooldown for targets whose dial just failed: retry storms (an app
 /// re-SYNing a blackholed host every few seconds) must fail fast instead of
 /// serially stalling the whole mux loop behind another full dial timeout.
