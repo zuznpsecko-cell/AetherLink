@@ -34,6 +34,15 @@ Start-Sleep -Seconds 1
 # NOTE: via cmd — PS 5.1 cannot silence native stderr (not even *>$null).
 cmd /c "`"$CLIENT`" `"$CFG`" down >nul 2>&1"
 cmd /c "`"$CLIENT`" `"$CFG`" cleanup >nul 2>&1"
+# Self-heal stale tunnel DNS: a killed run leaves 10.255.0.1 live with no
+# state file to restore from — up would refuse ("stale tunnel DNS").
+# Reset those interfaces to DHCP before proceeding.
+$stale = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { $_.ServerAddresses -contains '10.255.0.1' }
+foreach ($s in $stale) {
+  Write-Host "Resetting stale tunnel DNS on $($s.InterfaceAlias)" -ForegroundColor Yellow
+  Set-DnsClientServerAddress -InterfaceIndex $s.InterfaceIndex -ResetServerAddresses
+}
 Start-Sleep -Seconds 1
 
 try {
