@@ -168,21 +168,23 @@ fn e2e_two_streams_one_flow_plus_dns() {
         .expect("seal dgram");
     wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
 
-    // Then: all three replies arrive (server answers in frame order).
-    let (h1, c1) = wire_help::read_frame(&mut stream);
-    let (h2, c2) = wire_help::read_frame(&mut stream);
-    let (h3, c3) = wire_help::read_frame(&mut stream);
-    let mut got = vec![
-        sess.mux
-            .open_data(sess.keys.rx_key(), &h1, &c1)
-            .expect("open r1"),
-        sess.mux
-            .open_data(sess.keys.rx_key(), &h2, &c2)
-            .expect("open r2"),
-        sess.mux
-            .open_datagram(sess.keys.rx_key(), &h3, &c3)
-            .expect("open r3"),
-    ];
+    // Then: all three replies arrive. Completion order is NOT guaranteed
+    // (relay runs on a worker pool), so open each reply by its frame type.
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        got.push(match h.frame_type {
+            aetherlink_protocol::FrameType::Data => sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("open data"),
+            aetherlink_protocol::FrameType::UdpDatagram => sess
+                .mux
+                .open_datagram(sess.keys.rx_key(), &h, &c)
+                .expect("open dgram"),
+            other => panic!("unexpected reply type: {other:?}"),
+        });
+    }
     got.sort();
     assert_eq!(
         got,

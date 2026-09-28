@@ -9,6 +9,7 @@ pub mod config;
 pub mod debug;
 pub mod dns;
 pub mod fallback;
+pub mod pool;
 pub mod relay;
 
 use std::collections::HashMap;

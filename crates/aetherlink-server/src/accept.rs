@@ -24,7 +24,12 @@ use aetherlink_mux::manager::MuxManager;
 use aetherlink_protocol::{FrameType, VIRTUAL_DNS_IP, VIRTUAL_DNS_PORT};
 use bytes::BytesMut;
 
-use crate::{debug::debug_log, dns, relay};
+use crate::{
+    debug::debug_log,
+    dns,
+    pool::{Completion, RelayPool},
+    relay,
+};
 
 /// How one accepted connection was served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,17 +57,193 @@ pub struct ServerCtx {
     pub dns_upstream: Vec<String>,
 }
 
-/// Relay read timeout: a silent target must not stall the loop forever.
+/// Relay read timeout: a silent target burns one worker for this long;
+/// the loop itself never stalls (concurrent pool + dead-target cooldown).
 const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// UDP relay timeout: DNS answers in well under this; multicast/NetBIOS
-/// noise must fail fast instead of serially stalling the loop (each stall
-/// delays every flow behind it past client timeouts).
+/// noise must fail fast instead of burning a worker per datagram.
 const UDP_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Wire-read timeout: the loop must keep draining pool completions even
+/// when the peer sends nothing (a blocking read would wedge replies
+/// behind an idle connection).
+const READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Pool workers: blocking dials/relays run here so one slow target never
+/// serially stalls the loop (seen live: 11s backlog, client gone by reply).
+/// At cap the loop sheds (fail fast, app retransmits) instead of queueing.
+const POOL_WORKERS: usize = 32;
+
+/// Completed relay work, back on the loop thread. Seal + write stay here:
+/// single writer, the mux never leaves this thread, and reply order per
+/// stream does not matter (the peer's replay window tolerates reorder).
+enum RelayOut {
+    /// TCP reply plus the socket to return to the cache.
+    Tcp {
+        reply: Vec<u8>,
+        sock: Option<TcpStream>,
+    },
+    /// Dial-warm (empty DATA): socket to cache, nothing to seal.
+    Warmed(Option<TcpStream>),
+    /// UDP reply bytes.
+    Udp(Vec<u8>),
+}
+
+/// Pool key: carried through for logging, cooldown and cache decisions.
+struct FlowKey {
+    id: u16,
+    target: (String, u16),
+    is_udp: bool,
+    warm: bool,
+}
 
 /// Unanswerable destinations: multicast, broadcast, unspecified.
 /// Relaying them only burns a full timeout per datagram (LLMNR/mDNS/SSDP
 /// chatter does exactly that, constantly) — skip without a relay attempt.
+/// Reuse a cached relay socket only when no job for this stream is in
+/// flight (two workers must never share one socket); otherwise the worker
+/// dials fresh and its socket is dropped on return.
+fn take_idle_socket(
+    relays: &mut HashMap<u16, TcpStream>,
+    in_flight: &HashMap<u16, usize>,
+    id: u16,
+) -> Option<TcpStream> {
+    if in_flight.get(&id).copied().unwrap_or(0) == 0 {
+        relays.remove(&id)
+    } else {
+        None
+    }
+}
+
+/// Reused socket or fresh dial (with read timeout); Err drops the attempt.
+fn prep_socket(sock: Option<TcpStream>, ip: &str, port: u16) -> Result<TcpStream, ()> {
+    match sock {
+        Some(s) => Ok(s),
+        None => {
+            let s = relay::dial_tcp(ip, port).map_err(|_| ())?;
+            s.set_read_timeout(Some(RELAY_TIMEOUT)).map_err(|_| ())?;
+            Ok(s)
+        }
+    }
+}
+
+/// Release one in-flight slot for a stream.
+fn release_slot(in_flight: &mut HashMap<u16, usize>, id: u16) {
+    match in_flight.get_mut(&id) {
+        Some(n) => {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                in_flight.remove(&id);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Seal + write one completion; false ends the session (write failed).
+#[allow(clippy::too_many_arguments)]
+fn handle_completion(
+    c: Completion<FlowKey, Result<RelayOut, ()>>,
+    sess: &mut session::ServerSession,
+    stream: &mut tls::ServerTlsStream,
+    relays: &mut HashMap<u16, TcpStream>,
+    in_flight: &mut HashMap<u16, usize>,
+    dead: &mut HashMap<(String, u16), Instant>,
+) -> bool {
+    let FlowKey {
+        id,
+        target,
+        is_udp,
+        warm,
+    } = c.key;
+    release_slot(in_flight, id);
+    match c.result {
+        Ok(RelayOut::Tcp { reply, sock }) => {
+            debug_log(&format!("tunnel: data id={id} relay {}B", reply.len()));
+            dead.remove(&target);
+            if let Some(s) = sock {
+                if !in_flight.contains_key(&id) {
+                    relays.insert(id, s);
+                }
+            }
+            match send_data(sess, stream, id, &reply) {
+                Ok(()) => true,
+                Err(e) => {
+                    debug_log(&format!(
+                        "tunnel: data id={id} reply write failed ({e}), closing"
+                    ));
+                    false
+                }
+            }
+        }
+        Ok(RelayOut::Warmed(sock)) => {
+            if let Some(s) = sock {
+                if !in_flight.contains_key(&id) {
+                    relays.insert(id, s);
+                }
+            }
+            true
+        }
+        Ok(RelayOut::Udp(reply)) => {
+            debug_log(&format!("tunnel: datagram id={id} relay {}B", reply.len()));
+            let sealed = match sess.mux.seal_datagram(sess.keys.tx_key(), id, &reply, 128) {
+                Ok(sealed) => sealed,
+                Err(e) => {
+                    debug_log(&format!(
+                        "tunnel: datagram id={id} seal failed: {e}, skipping flow"
+                    ));
+                    return true;
+                }
+            };
+            if write_sealed(stream, &sealed.header, &sealed.ciphertext).is_err() {
+                debug_log(&format!(
+                    "tunnel: datagram id={id} reply write failed, closing"
+                ));
+                return false;
+            }
+            true
+        }
+        Err(()) => {
+            if warm {
+                debug_log(&format!(
+                    "tunnel: data id={id} warm dial failed, skipping flow"
+                ));
+            } else if is_udp {
+                debug_log(&format!(
+                    "tunnel: datagram id={id} relay to {}:{} failed, skipping flow",
+                    target.0, target.1
+                ));
+            } else {
+                debug_log(&format!(
+                    "tunnel: data id={id} relay failed, cooling down {}:{}",
+                    target.0, target.1
+                ));
+                relay::mark_dead(dead, &target.0, target.1, Instant::now());
+            }
+            true
+        }
+    }
+}
+
+/// Seal + write every arrived completion; false ends the session.
+#[allow(clippy::too_many_arguments)]
+fn drain_completions(
+    pool: &RelayPool<FlowKey, Result<RelayOut, ()>>,
+    sess: &mut session::ServerSession,
+    stream: &mut tls::ServerTlsStream,
+    relays: &mut HashMap<u16, TcpStream>,
+    in_flight: &mut HashMap<u16, usize>,
+    dead: &mut HashMap<(String, u16), Instant>,
+) -> bool {
+    while let Some(c) = pool.try_recv() {
+        if !handle_completion(c, sess, stream, relays, in_flight, dead) {
+            return false;
+        }
+    }
+    true
+}
+
 fn is_unroutable_target(target: &SocketAddr) -> bool {
     match target.ip() {
         std::net::IpAddr::V4(v4) => v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified(),
@@ -142,13 +323,38 @@ fn tunnel_loop(
 ) {
     let mut relays: HashMap<u16, TcpStream> = HashMap::new();
     // Targets whose dial recently failed: fail fast for the cooldown
-    // instead of serially stalling every flow behind another dial timeout.
+    // instead of burning a worker behind another dial timeout.
     let mut dead: HashMap<(String, u16), Instant> = HashMap::new();
+    // Stream ids with relay jobs in flight (socket reuse only when idle).
+    let mut in_flight: HashMap<u16, usize> = HashMap::new();
+    let pool: RelayPool<FlowKey, Result<RelayOut, ()>> = RelayPool::new(POOL_WORKERS);
+    // Best-effort: without a timeout an idle peer wedges completion
+    // draining; failure keeps the old blocking behaviour.
+    let _ = stream.get_mut().set_read_timeout(Some(READ_TIMEOUT));
     loop {
         let mut hb = [0u8; FRAME_HEADER_SIZE];
-        if stream.read_exact(&mut hb).is_err() {
-            debug_log("tunnel: header eof, closing");
-            break; // EOF or transport error: fail closed.
+        match stream.read_exact(&mut hb) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if !drain_completions(
+                    &pool,
+                    &mut sess,
+                    stream,
+                    &mut relays,
+                    &mut in_flight,
+                    &mut dead,
+                ) {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => {
+                debug_log("tunnel: header eof, closing");
+                break; // EOF or transport error: fail closed.
+            }
         }
         let mut hbuf = BytesMut::from(&hb[..]);
         let header = match FrameHeader::decode(&mut hbuf) {
@@ -209,30 +415,38 @@ fn tunnel_loop(
                         continue;
                     }
                 };
-                // Bare SYN/ACK (empty DATA): dial to warm the cached socket
-                // without reading for a reply that cannot exist yet.
+                // Bare SYN/ACK (empty DATA): warm the cached socket on a
+                // worker; the reply that cannot exist yet needs no read.
                 if pt.is_empty() {
-                    match relays.get_mut(&header.stream_id) {
-                        Some(_) => {}
-                        None => match relay::dial_tcp(&target.ip().to_string(), target.port()) {
-                            Ok(mut sock) => {
-                                if sock.set_read_timeout(Some(RELAY_TIMEOUT)).is_err() {
-                                    debug_log(&format!(
-                                        "tunnel: data id={} dial timeout set failed, skipping flow",
-                                        header.stream_id
-                                    ));
-                                    continue;
-                                }
-                                relays.insert(header.stream_id, sock);
-                            }
-                            Err(_) => {
-                                debug_log(&format!(
-                                    "tunnel: data id={} dial failed, skipping flow",
-                                    header.stream_id
-                                ));
-                                continue;
-                            }
-                        },
+                    let sock = take_idle_socket(&mut relays, &in_flight, header.stream_id);
+                    let warm_ip = target.ip().to_string();
+                    let warm_port = target.port();
+                    let key = FlowKey {
+                        id: header.stream_id,
+                        target: (warm_ip.clone(), warm_port),
+                        is_udp: false,
+                        warm: true,
+                    };
+                    if pool.dispatch(key, move || match prep_socket(sock, &warm_ip, warm_port) {
+                        Ok(s) => Ok(RelayOut::Warmed(Some(s))),
+                        Err(()) => Err(()),
+                    }) {
+                        *in_flight.entry(header.stream_id).or_insert(0) += 1;
+                    } else {
+                        debug_log(&format!(
+                            "tunnel: data id={} server busy, skipping flow",
+                            header.stream_id
+                        ));
+                    }
+                    if !drain_completions(
+                        &pool,
+                        &mut sess,
+                        stream,
+                        &mut relays,
+                        &mut in_flight,
+                        &mut dead,
+                    ) {
+                        break;
                     }
                     continue;
                 }
@@ -244,34 +458,52 @@ fn tunnel_loop(
                     ));
                     continue;
                 }
-                let reply = match relay_exchange(&mut relays, header.stream_id, *target, &pt) {
-                    Ok(reply) => {
-                        dead.remove(&target_key);
-                        debug_log(&format!(
-                            "tunnel: data id={} relay {}B",
-                            header.stream_id,
-                            reply.len()
-                        ));
-                        reply
-                    }
-                    Err(_) => {
-                        debug_log(&format!(
-                            "tunnel: data id={} relay failed, cooling down {target}",
-                            header.stream_id
-                        ));
-                        relay::mark_dead(&mut dead, &target_key.0, target_key.1, Instant::now());
-                        continue;
-                    }
+                // Payload: relay on a worker; seal + write on completion.
+                let sock = take_idle_socket(&mut relays, &in_flight, header.stream_id);
+                let job_ip = target.ip().to_string();
+                let job_port = target.port();
+                let key = FlowKey {
+                    id: header.stream_id,
+                    target: target_key,
+                    is_udp: false,
+                    warm: false,
                 };
-                match send_data(&mut sess, stream, header.stream_id, &reply) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        debug_log(&format!(
-                            "tunnel: data id={} reply write failed ({e}), closing",
-                            header.stream_id
-                        ));
-                        break;
+                if pool.dispatch(key, move || {
+                    let mut sock = match prep_socket(sock, &job_ip, job_port) {
+                        Ok(s) => s,
+                        Err(()) => return Err(()),
+                    };
+                    if sock.write_all(&pt).is_err() {
+                        return Err(());
                     }
+                    let mut buf = vec![0u8; 65535];
+                    match sock.read(&mut buf) {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Ok(RelayOut::Tcp {
+                                reply: buf,
+                                sock: Some(sock),
+                            })
+                        }
+                        Err(_) => Err(()),
+                    }
+                }) {
+                    *in_flight.entry(header.stream_id).or_insert(0) += 1;
+                } else {
+                    debug_log(&format!(
+                        "tunnel: data id={} server busy, skipping flow",
+                        header.stream_id
+                    ));
+                }
+                if !drain_completions(
+                    &pool,
+                    &mut sess,
+                    stream,
+                    &mut relays,
+                    &mut in_flight,
+                    &mut dead,
+                ) {
+                    break;
                 }
             }
             FrameType::UdpDatagram => {
@@ -331,52 +563,38 @@ fn tunnel_loop(
                             && port.parse::<u16>().ok() == Some(target.port())
                     })
                 });
-                let relayed = if is_virtual {
-                    dns::resolve_any(&pt, &ctx.dns_upstream, UDP_RELAY_TIMEOUT)
-                } else {
-                    relay::relay_udp(
-                        &target.ip().to_string(),
-                        target.port(),
-                        &pt,
-                        UDP_RELAY_TIMEOUT,
-                    )
+                let key = FlowKey {
+                    id: header.stream_id,
+                    target: (target.ip().to_string(), target.port()),
+                    is_udp: true,
+                    warm: false,
                 };
-                let reply = match relayed {
-                    Ok(reply) => {
-                        debug_log(&format!(
-                            "tunnel: datagram id={} relay {}B",
-                            header.stream_id,
-                            reply.len()
-                        ));
-                        reply
-                    }
-                    Err(e) => {
-                        debug_log(&format!(
-                            "tunnel: datagram id={} relay to {target} failed: {e}, skipping flow",
-                            header.stream_id
-                        ));
-                        continue;
-                    }
-                };
-                let sealed =
-                    match sess
-                        .mux
-                        .seal_datagram(sess.keys.tx_key(), header.stream_id, &reply, 128)
-                    {
-                        Ok(sealed) => sealed,
-                        Err(e) => {
-                            debug_log(&format!(
-                                "tunnel: datagram id={} seal failed: {e}, skipping flow",
-                                header.stream_id
-                            ));
-                            continue;
-                        }
+                let job_ip = target.ip().to_string();
+                let job_port = target.port();
+                let upstreams = ctx.dns_upstream.clone();
+                if pool.dispatch(key, move || {
+                    let out = if is_virtual {
+                        dns::resolve_any(&pt, &upstreams, UDP_RELAY_TIMEOUT)
+                    } else {
+                        relay::relay_udp(&job_ip, job_port, &pt, UDP_RELAY_TIMEOUT)
                     };
-                if let Err(e) = write_sealed(stream, &sealed.header, &sealed.ciphertext) {
+                    out.map(RelayOut::Udp).map_err(|_| ())
+                }) {
+                    *in_flight.entry(header.stream_id).or_insert(0) += 1;
+                } else {
                     debug_log(&format!(
-                        "tunnel: datagram id={} reply write failed ({e}), closing",
+                        "tunnel: datagram id={} server busy, skipping flow",
                         header.stream_id
                     ));
+                }
+                if !drain_completions(
+                    &pool,
+                    &mut sess,
+                    stream,
+                    &mut relays,
+                    &mut in_flight,
+                    &mut dead,
+                ) {
                     break;
                 }
             }
@@ -488,29 +706,6 @@ fn tunnel_loop(
 /// Resolve a dial target announced by the peer (server-side system DNS).
 fn dial_addr(addr: &str, port: u16) -> Option<SocketAddr> {
     format!("{addr}:{port}").to_socket_addrs().ok()?.next()
-}
-
-/// One request→reply exchange with a cached TCP relay connection.
-fn relay_exchange(
-    relays: &mut HashMap<u16, TcpStream>,
-    id: u16,
-    target: SocketAddr,
-    payload: &[u8],
-) -> Result<Vec<u8>, ()> {
-    let sock = match relays.get_mut(&id) {
-        Some(sock) => sock,
-        None => {
-            let sock = relay::dial_tcp(&target.ip().to_string(), target.port()).map_err(|_| ())?;
-            sock.set_read_timeout(Some(RELAY_TIMEOUT)).map_err(|_| ())?;
-            relays.insert(id, sock);
-            relays.get_mut(&id).ok_or(())?
-        }
-    };
-    sock.write_all(payload).map_err(|_| ())?;
-    let mut buf = vec![0u8; 65535];
-    let n = sock.read(&mut buf).map_err(|_| ())?;
-    buf.truncate(n);
-    Ok(buf)
 }
 
 /// Seal + write one DATA reply; Err carries seal or transport failure.

@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-09-25 (TDD 211/211 green, fmt clean, clippy 0 errors; Windows up/down live cycle green; live traffic proof in progress — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-09-25 (TDD 222/222 green, fmt clean, clippy 0 errors; Windows up/down live cycle green; concurrent server relay (RelayPool) in progress — see docs/LIVE_ISSUES.md)_
 
 ## Overview
 
