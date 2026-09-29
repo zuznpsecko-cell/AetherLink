@@ -260,8 +260,12 @@ fn bursty_stream_stays_on_one_connection_in_order() {
         std::thread::spawn(move || {
             for _ in 0..8 {
                 let (mut s, _) = listener.accept().expect("accept");
-                let slot = { conns.lock().expect("lock").push(Vec::new()); conns.lock().expect("lock").len() - 1 };
-                s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+                let slot = {
+                    conns.lock().expect("lock").push(Vec::new());
+                    conns.lock().expect("lock").len() - 1
+                };
+                s.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("timeout");
                 let mut buf = [0u8; 4096];
                 loop {
                     match s.read(&mut buf) {
@@ -293,20 +297,35 @@ fn bursty_stream_stays_on_one_connection_in_order() {
     let mut sess =
         aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
     let s1 = sess.mux.open_tcp("127.0.0.1", port).expect("open");
-    let sealed = sess.mux.seal_open_tcp(sess.keys.tx_key(), s1, 128).expect("seal open");
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), s1, 128)
+        .expect("seal open");
     wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
     for chunk in [b"aaa".as_slice(), b"bb".as_slice(), b"c".as_slice()] {
-        let sealed = sess.mux.seal_data(sess.keys.tx_key(), s1, chunk, 128).expect("seal");
+        let sealed = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), s1, chunk, 128)
+            .expect("seal");
         wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
     }
 
-    // Then: all three replies arrive and the target saw ONE connection
-    // with the bytes in order (no split across parallel dials)
+    // Then: all bytes arrive (batched into fewer replies) and the target
+    // saw ONE connection with the bytes in order (no split dials)
     let mut got = Vec::new();
-    for _ in 0..3 {
+    while got.len() < 6 {
         let (h, c) = wire_help::read_frame(&mut stream);
-        assert!(h.frame_type == FrameType::Data, "data, got {:?}", h.frame_type);
-        got.extend_from_slice(&sess.mux.open_data(sess.keys.rx_key(), &h, &c).expect("open"));
+        assert!(
+            h.frame_type == FrameType::Data,
+            "data, got {:?}",
+            h.frame_type
+        );
+        got.extend_from_slice(
+            &sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("open"),
+        );
     }
     assert_eq!(got, b"aaabbc");
     drop(stream);
