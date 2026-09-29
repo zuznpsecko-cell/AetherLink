@@ -71,6 +71,9 @@ const UDP_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
 /// deadlines (below) fire promptly.
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Bound for one frame body across stalls (fail closed eventually).
+const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Linger before the first dispatch of an uncached stream: bursty flights
 /// (a 2KB ClientHello in 4 TUN packets) must coalesce into ONE job, else
 /// the first fragment stalls 5s waiting for a reply that needs the rest.
@@ -551,8 +554,34 @@ fn tunnel_loop(
         if header.length as usize > 65535 + 1024 {
             break; // Absurd length: fail closed.
         }
+        // Body: tolerate stalls past the read quantum (a big body is many
+        // TCP segments; any gap tripping the 50ms timeout must resume, not
+        // abort the session — seen live: "body eof, closing" killed healthy
+        // sessions mid-frame). Position-tracked; bounded 30s (fail closed).
         let mut ct = vec![0u8; header.length as usize];
-        if stream.read_exact(&mut ct).is_err() {
+        let body_start = Instant::now();
+        let mut filled = 0;
+        let body_ok = loop {
+            match stream.read(&mut ct[filled..]) {
+                Ok(0) => break false,
+                Ok(n) => {
+                    filled += n;
+                    if filled >= ct.len() {
+                        break true;
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    if body_start.elapsed() > BODY_TOTAL_TIMEOUT {
+                        break false;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        if !body_ok {
             debug_log("tunnel: body eof, closing");
             break;
         }

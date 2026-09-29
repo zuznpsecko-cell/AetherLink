@@ -336,6 +336,66 @@ fn bursty_stream_stays_on_one_connection_in_order() {
     assert_eq!(conns.len(), 1, "single connection, got {}", conns.len());
 }
 
+#[test]
+fn dribbled_frame_body_still_processed() {
+    // Given: echo target + pre-registered route (production shape)
+    let echo = tcp_echo();
+    let mut routes = HashMap::new();
+    routes.insert(1u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let nonce = [0xEEu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let s1 = sess.mux.open_tcp("127.0.0.1", echo).expect("open");
+    assert_eq!(s1, 1);
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), s1, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    // When: DATA header now, body 300ms later (past the 50ms read quantum)
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s1, b"slow", 128)
+        .expect("seal");
+    {
+        use bytes::BufMut;
+        let mut hb = bytes::BytesMut::new();
+        sealed.header.encode(&mut hb);
+        stream.write_all(&hb).expect("header now");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stream.write_all(&sealed.ciphertext).expect("body later");
+
+    // Then: echo arrives (a timeout-killed loop would answer nothing)
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert!(
+        h.frame_type == FrameType::Data,
+        "data, got {:?}",
+        h.frame_type
+    );
+    let back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open echo");
+    assert_eq!(back, b"slow");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
 fn tcp_echo() -> u16 {
     let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
     let port = echo.local_addr().expect("addr").port();

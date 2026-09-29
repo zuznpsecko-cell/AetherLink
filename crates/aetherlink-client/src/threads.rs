@@ -25,6 +25,8 @@ use crate::pump::DataPump;
 
 /// Read timeout so the wire thread polls the stop flag instead of blocking.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// Bound for one frame body across stalls (fail closed eventually).
+const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle sleep in the TUN->wire loop (no busy spin on an empty TUN).
 const TUN_IDLE: Duration = Duration::from_millis(10);
 /// Absurd ciphertext length: fail closed instead of allocating.
@@ -63,8 +65,28 @@ pub fn read_sealed<R: Read>(r: &mut R) -> std::io::Result<(FrameHeader, Vec<u8>)
             format!("absurd frame length {}", header.length),
         ));
     }
+    // Body: tolerate stalls past the read quantum (a 64KB body is many
+    // TCP segments; any gap tripping the timeout must resume, not abort —
+    // seen live: "body eof, closing" killed healthy sessions). Position is
+    // tracked so resumed reads never lose bytes. Bounded: a peer dribbling
+    // forever still fails closed, just later.
     let mut ct = vec![0u8; header.length as usize];
-    r.read_exact(&mut ct)?;
+    let start = std::time::Instant::now();
+    let mut filled = 0;
+    while filled < ct.len() {
+        match r.read(&mut ct[filled..]) {
+            Ok(0) => {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "body eof"));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => {
+                if start.elapsed() > BODY_TOTAL_TIMEOUT {
+                    return Err(Error::new(ErrorKind::TimedOut, "body stall"));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
     Ok((header, ct))
 }
 
@@ -303,4 +325,62 @@ where
         stop,
         threads: vec![thread],
     })
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    /// Yields the header whole, then the body one byte per 300ms
+    /// (past the 200ms read quantum): the frame must still assemble.
+    struct Dribble {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                None => Err(Error::new(ErrorKind::TimedOut, "drip")),
+                Some(c) => {
+                    let n = c.len().min(buf.len());
+                    buf[..n].copy_from_slice(&c[..n]);
+                    if c.len() > n {
+                        self.chunks.push_front(c[n..].to_vec());
+                    }
+                    if n == 0 {
+                        // Stall without EOF: must not abort the frame.
+                        std::thread::sleep(Duration::from_millis(300));
+                        return Err(Error::new(ErrorKind::TimedOut, "drip"));
+                    }
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dribbled_body_assembles() {
+        use aetherlink_protocol::FrameType;
+        let header = FrameHeader {
+            length: 3,
+            frame_type: FrameType::Data,
+            flags: 0,
+            stream_id: 7,
+            sequence: 1,
+        };
+        let mut hb = BytesMut::new();
+        header.encode(&mut hb);
+        let mut chunks = std::collections::VecDeque::new();
+        chunks.push_back(hb.to_vec());
+        chunks.push_back(vec![]); // 300ms stall, then byte by byte
+        chunks.push_back(b"A".to_vec());
+        chunks.push_back(vec![]);
+        chunks.push_back(b"B".to_vec());
+        chunks.push_back(vec![]);
+        chunks.push_back(b"C".to_vec());
+        let mut r = Dribble { chunks };
+        let (h, ct) = read_sealed(&mut r).expect("frame assembles");
+        assert_eq!(h.stream_id, 7);
+        assert_eq!(ct, b"ABC");
+    }
 }
