@@ -197,22 +197,15 @@ fn handle_completion(
         }
         Ok(RelayOut::Udp(reply)) => {
             debug_log(&format!("tunnel: datagram id={id} relay {}B", reply.len()));
-            let sealed = match sess.mux.seal_datagram(sess.keys.tx_key(), id, &reply, 128) {
-                Ok(sealed) => sealed,
+            match send_chunked(sess, stream, id, &reply, true) {
+                Ok(()) => true,
                 Err(e) => {
                     debug_log(&format!(
-                        "tunnel: datagram id={id} seal failed: {e}, skipping flow"
+                        "tunnel: datagram id={id} reply failed ({e}), closing"
                     ));
-                    return true;
+                    false
                 }
-            };
-            if write_sealed(stream, &sealed.header, &sealed.ciphertext).is_err() {
-                debug_log(&format!(
-                    "tunnel: datagram id={id} reply write failed, closing"
-                ));
-                return false;
             }
-            true
         }
         Err(()) => {
             if warm {
@@ -712,6 +705,42 @@ fn dial_addr(addr: &str, port: u16) -> Option<SocketAddr> {
     format!("{addr}:{port}").to_socket_addrs().ok()?.next()
 }
 
+/// Max plaintext per reply frame. Sealed body must stay within the peer's
+/// wire cap (65535+1024 enforced on read); one oversized frame kills the
+/// peer pump outright (seen live: a 189KB reply -> "absurd frame length",
+/// pump dead, tunnel mute). Sealed 64KiB + tag stays far below the cap.
+const REPLY_CHUNK: usize = 65536;
+
+/// Seal + write one reply, chunked to the wire cap; Err carries the first
+/// seal or transport failure. Empty payload keeps the old single empty
+/// frame (some flows rely on the reply existing, not its size).
+fn send_chunked(
+    sess: &mut session::ServerSession,
+    stream: &mut tls::ServerTlsStream,
+    id: u16,
+    payload: &[u8],
+    udp: bool,
+) -> Result<(), String> {
+    let seal_one = |sess: &mut session::ServerSession, chunk: &[u8]| {
+        if udp {
+            sess.mux.seal_datagram(sess.keys.tx_key(), id, chunk, 128)
+        } else {
+            sess.mux.seal_data(sess.keys.tx_key(), id, chunk, 128)
+        }
+    };
+    if payload.is_empty() {
+        let sealed = seal_one(sess, payload).map_err(|e| format!("seal: {e}"))?;
+        return write_sealed(stream, &sealed.header, &sealed.ciphertext)
+            .map_err(|e| format!("transport: {e}"));
+    }
+    for chunk in payload.chunks(REPLY_CHUNK) {
+        let sealed = seal_one(sess, chunk).map_err(|e| format!("seal: {e}"))?;
+        write_sealed(stream, &sealed.header, &sealed.ciphertext)
+            .map_err(|e| format!("transport: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Seal + write one DATA reply; Err carries seal or transport failure.
 fn send_data(
     sess: &mut session::ServerSession,
@@ -719,13 +748,7 @@ fn send_data(
     id: u16,
     payload: &[u8],
 ) -> Result<(), String> {
-    let sealed = sess
-        .mux
-        .seal_data(sess.keys.tx_key(), id, payload, 128)
-        .map_err(|e| format!("seal: {e}"))?;
-    write_sealed(stream, &sealed.header, &sealed.ciphertext)
-        .map_err(|e| format!("transport: {e}"))?;
-    Ok(())
+    send_chunked(sess, stream, id, payload, false)
 }
 
 /// Write one sealed frame; Err on transport failure.

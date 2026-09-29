@@ -82,6 +82,94 @@ fn client_tls(port: u16) -> aetherlink_core::tls::ClientTlsStream {
     aetherlink_core::tls::connect_tls(sock, name, &cfg).expect("client tls")
 }
 
+#[test]
+fn oversized_reply_arrives_chunked_loop_survives() {
+    // Given: a target replying 200KB at once (past the 64KB+1K wire cap)
+    // plus a normal echo target, routes pre-registered like production
+    let big_listener = TcpListener::bind("127.0.0.1:0").expect("big bind");
+    let big_port = big_listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let (mut s, _) = big_listener.accept().expect("big accept");
+        let mut buf = [0u8; 64];
+        let _ = s.read(&mut buf);
+        s.write_all(&vec![0xABu8; 200_000]).expect("big reply");
+        std::thread::sleep(Duration::from_secs(20));
+    });
+    let echo = tcp_echo();
+    let mut routes = HashMap::new();
+    routes.insert(1u16, format!("127.0.0.1:{big_port}").parse().expect("sa"));
+    routes.insert(3u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        // No read timeout games: the loop must stay alive past the big reply.
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    // When: handshake, both streams open, small request to the big target
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    let nonce = [0xEBu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let s1 = sess.mux.open_tcp("127.0.0.1", big_port).expect("open big");
+    let s2 = sess.mux.open_tcp("127.0.0.1", echo).expect("open echo");
+    assert_eq!((s1, s2), (1, 3));
+    for (id, host, p) in [(s1, "127.0.0.1", big_port), (s2, "127.0.0.1", echo)] {
+        let sealed = sess
+            .mux
+            .seal_open_tcp(sess.keys.tx_key(), id, 128)
+            .expect("seal open");
+        let _ = (host, p);
+        wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    }
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s1, b"get", 128)
+        .expect("seal");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    // Then: the full 200KB arrives across frames, each within the wire cap
+    let mut got = Vec::new();
+    while got.len() < 200_000 {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        assert!(
+            h.frame_type == FrameType::Data,
+            "data frame, got {:?}",
+            h.frame_type
+        );
+        assert!((h.length as usize) <= 65535 + 1024, "frame within wire cap");
+        got.extend_from_slice(
+            &sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("open"),
+        );
+    }
+    assert_eq!(got.len(), 200_000);
+    assert!(got.iter().all(|&b| b == 0xAB));
+
+    // And: the loop is still alive for the healthy stream afterwards
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s2, b"hi", 128)
+        .expect("seal hi");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let (h, c) = wire_help::read_frame(&mut stream);
+    let echo_back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open echo");
+    assert_eq!(echo_back, b"hi");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
 fn tcp_echo() -> u16 {
     let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
     let port = echo.local_addr().expect("addr").port();
