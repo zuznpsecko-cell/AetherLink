@@ -93,7 +93,22 @@ const POOL_QUEUE: usize = 256;
 /// Idle drain after the first reply chunk: multi-chunk flights (TLS
 /// handshakes) arrive with small gaps; shorter stalls interactive
 /// traffic, longer delays every exchange by the tail.
-const STREAM_IDLE: Duration = Duration::from_millis(200);
+/// Idle tail after the first bytes of an exchange on a FRESH dial: it may
+/// carry a fragmented handshake flight, reassemble patiently.
+const STREAM_IDLE_FIRST: Duration = Duration::from_millis(200);
+/// Idle tail on a REUSED socket (mid-stream: segments arrive back-to-back).
+/// 200ms here on every request caused RTO storms (seen live: 2900
+/// retransmits in one page load) — keep it under a typical RTO.
+const STREAM_IDLE_NEXT: Duration = Duration::from_millis(25);
+
+/// Idle tail selector: patient once per dial, fast forever after.
+fn idle_for(fresh: bool) -> Duration {
+    if fresh {
+        STREAM_IDLE_FIRST
+    } else {
+        STREAM_IDLE_NEXT
+    }
+}
 
 /// Completed relay work, back on the loop thread. Seal + write stay here:
 /// single writer, the mux never leaves this thread, and reply order per
@@ -201,11 +216,12 @@ fn dispatch_tcp(
         let pt_send = pt.clone();
         let tip3 = tip.clone();
         pool.dispatch(key, move || {
+            let fresh = sock.is_none();
             let mut sock = match prep_socket(sock, &tip3, tport) {
                 Ok(s) => s,
                 Err(()) => return Err(()),
             };
-            match relay::exchange_stream(&mut sock, &pt_send, RELAY_TIMEOUT, STREAM_IDLE) {
+            match relay::exchange_stream(&mut sock, &pt_send, RELAY_TIMEOUT, idle_for(fresh)) {
                 Ok(reply) => Ok(RelayOut::Tcp {
                     reply,
                     sock: Some(sock),
@@ -975,4 +991,20 @@ fn write_sealed(
     stream.write_all(&buf)?;
     stream.write_all(ct)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_socket_reassembles_patiently_reused_goes_fast() {
+        // A fresh dial may carry a fragmented handshake flight (wait it
+        // out); a reused socket is mid-stream (segments back-to-back).
+        // 200ms on every request caused RTO storms (seen live: 2900
+        // retransmits in one page load).
+        assert!(idle_for(true) >= Duration::from_millis(150));
+        assert!(idle_for(false) <= Duration::from_millis(50));
+        assert!(idle_for(false) < idle_for(true));
+    }
 }
