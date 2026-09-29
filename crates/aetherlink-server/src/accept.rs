@@ -105,8 +105,9 @@ const WORKER_CAP: usize = 512;
 const WORKER_QUEUE: usize = 128;
 
 /// Poll quantum of a stream worker: socket reads stay responsive to newly
-/// arrived payloads and to session end.
-const WORKER_POLL: Duration = Duration::from_millis(50);
+/// arrived payloads and to session end. 10ms keeps added latency far under
+/// a typical RTO (50ms showed up in ping/RTT budgets, seen live).
+const WORKER_POLL: Duration = Duration::from_millis(10);
 
 /// Stack per stream worker: it only dials/reads/writes (no deep frames).
 const WORKER_STACK: usize = 256 * 1024;

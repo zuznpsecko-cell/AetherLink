@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-09-25 (TDD 222/222 green, fmt clean, clippy 0 errors; Windows up/down live cycle green; concurrent server relay (RelayPool) in progress — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_ISSUES.md)_
 
 ## Overview
 

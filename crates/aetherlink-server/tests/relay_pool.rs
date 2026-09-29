@@ -45,7 +45,7 @@ fn keys_and_results_round_trip() {
     for i in 0..8u16 {
         assert!(pool.dispatch(i, move || Ok(vec![i as u8])));
     }
-    let mut seen = vec![false; 8];
+    let mut seen = [false; 8];
     let deadline = Instant::now() + Duration::from_secs(5);
     for _ in 0..8 {
         let left = deadline.saturating_duration_since(Instant::now());

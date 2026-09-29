@@ -10,11 +10,16 @@ Run ELEVATED (admin), V2RayN OFF:
   .\scripts\live_tunnel.ps1 [-Config client.local.yaml]
 #>
 [CmdletBinding()]
-param([string]$Config = "client.local.yaml")
+param(
+  [string]$Config = "client.local.yaml",
+  [switch]$Debug
+)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'Stop'
 
-$env:AETHERLINK_DEBUG = '1'
+# Debug logging is per-packet synchronous I/O: it skews latency/throughput
+# badly under load (speedtests). Off by default; pass -Debug to capture logs.
+if ($Debug) { $env:AETHERLINK_DEBUG = '1' } else { $env:AETHERLINK_DEBUG = '0' }
 $ROOT   = $PSScriptRoot | Split-Path -Parent
 $CLIENT = "$ROOT\dist\win-client\AetherLink.Client.exe"
 $CFG    = Join-Path $ROOT $Config
