@@ -21,11 +21,20 @@ const PSK: &[u8] = b"phase-i2-test-psk-32-bytes-long!!!";
 
 /// Test server with real PEM files + static root in a temp dir.
 fn test_server(listen: &str, static_body: &[u8]) -> aetherlink_server::Server {
+    // Unique temp dir: wall-clock nanos collide between parallel tests
+    // (same tick -> same dir -> concurrently written cert files read back
+    // partial -> bind fails). pid + thread + counter makes it collision-free.
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("aether-i2-{nanos}"));
+    let n = CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "aether-i2-{}-{nanos}-{n}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     std::fs::create_dir_all(&dir).expect("static dir");
     std::fs::write(dir.join("index.html"), static_body).expect("static file");
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");

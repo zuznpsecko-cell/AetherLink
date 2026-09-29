@@ -143,7 +143,9 @@ fn oversized_reply_arrives_chunked_loop_survives() {
             "data frame, got {:?}",
             h.frame_type
         );
-        assert!((h.length as usize) <= 65535 + 1024, "frame within wire cap");
+        // IP-carriable: one frame must become one TCP segment well under 64KiB.
+        // (A 64KB frame once built a >65535B IP packet and panicked the peer.)
+        assert!((h.length as usize) <= 17000, "frame IP-carriable");
         got.extend_from_slice(
             &sess
                 .mux
@@ -161,6 +163,82 @@ fn oversized_reply_arrives_chunked_loop_survives() {
         .expect("seal hi");
     wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
     let (h, c) = wire_help::read_frame(&mut stream);
+    let echo_back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open echo");
+    assert_eq!(echo_back, b"hi");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn giant_udp_reply_dropped_loop_survives() {
+    // Given: a UDP target answering one 65500B datagram (legal UDP, but no
+    // single IP packet can carry it back: 65500+28 > 65535) plus echo
+    let big_udp = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    let big_port = big_udp.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 70000];
+        let (n, from) = big_udp.recv_from(&mut buf).expect("recv");
+        assert!(n > 0);
+        big_udp
+            .send_to(&vec![0xCDu8; 65500], from)
+            .expect("giant reply");
+    });
+    let echo = tcp_echo();
+    let mut routes = HashMap::new();
+    routes.insert(1u16, format!("127.0.0.1:{big_port}").parse().expect("sa"));
+    routes.insert(3u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("timeout");
+    let nonce = [0xECu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let f1 = sess.mux.open_udp("127.0.0.1", big_port).expect("open udp");
+    let s2 = sess.mux.open_tcp("127.0.0.1", echo).expect("open tcp");
+    assert_eq!((f1, s2), (1, 3));
+    let sealed = sess
+        .mux
+        .seal_open_udp(sess.keys.tx_key(), f1, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), s2, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    // When: small datagram (giant answer must be dropped, not delivered),
+    // then a normal TCP echo on the other stream
+    let sealed = sess
+        .mux
+        .seal_datagram(sess.keys.tx_key(), f1, b"q", 128)
+        .expect("seal");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s2, b"hi", 128)
+        .expect("seal hi");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    // Then: only the TCP echo arrives (no giant datagram), loop alive
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert!(
+        h.frame_type == FrameType::Data,
+        "tcp echo, got {:?}",
+        h.frame_type
+    );
     let echo_back = sess
         .mux
         .open_data(sess.keys.rx_key(), &h, &c)

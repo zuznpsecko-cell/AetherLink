@@ -705,11 +705,16 @@ fn dial_addr(addr: &str, port: u16) -> Option<SocketAddr> {
     format!("{addr}:{port}").to_socket_addrs().ok()?.next()
 }
 
-/// Max plaintext per reply frame. Sealed body must stay within the peer's
-/// wire cap (65535+1024 enforced on read); one oversized frame kills the
-/// peer pump outright (seen live: a 189KB reply -> "absurd frame length",
-/// pump dead, tunnel mute). Sealed 64KiB + tag stays far below the cap.
-const REPLY_CHUNK: usize = 65536;
+/// Max plaintext per TCP reply frame. One frame becomes one TCP segment on
+/// the peer, so it must stay IP-carriable (<= 65535 incl. headers): a bigger
+/// frame panics the peer packet builder and kills its pump outright (seen
+/// live: a 189KB reply -> pump dead, tunnel mute). Sealed 16KiB + tag.
+const REPLY_CHUNK: usize = 16384;
+
+/// Max UDP reply payload sent as one datagram. Datagrams have no reassembly:
+/// past IP-carriable size (65507 incl. headers) the reply is undeliverable,
+/// so it is dropped with a log and the loop lives on.
+const UDP_SINGLE_MAX: usize = 65000;
 
 /// Seal + write one reply, chunked to the wire cap; Err carries the first
 /// seal or transport failure. Empty payload keeps the old single empty
@@ -728,7 +733,16 @@ fn send_chunked(
             sess.mux.seal_data(sess.keys.tx_key(), id, chunk, 128)
         }
     };
-    if payload.is_empty() {
+    if udp {
+        if payload.len() > UDP_SINGLE_MAX {
+            debug_log(&format!(
+                "tunnel: datagram id={id} reply {}B exceeds one packet, skipping flow",
+                payload.len()
+            ));
+            return Ok(());
+        }
+    }
+    if payload.is_empty() || udp {
         let sealed = seal_one(sess, payload).map_err(|e| format!("seal: {e}"))?;
         return write_sealed(stream, &sealed.header, &sealed.ciphertext)
             .map_err(|e| format!("transport: {e}"));
