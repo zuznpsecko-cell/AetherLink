@@ -372,7 +372,6 @@ fn dribbled_frame_body_still_processed() {
         .seal_data(sess.keys.tx_key(), s1, b"slow", 128)
         .expect("seal");
     {
-        use bytes::BufMut;
         let mut hb = bytes::BytesMut::new();
         sealed.header.encode(&mut hb);
         stream.write_all(&hb).expect("header now");
@@ -392,6 +391,77 @@ fn dribbled_frame_body_still_processed() {
         .open_data(sess.keys.rx_key(), &h, &c)
         .expect("open echo");
     assert_eq!(back, b"slow");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn slow_stream_does_not_stall_fast_stream() {
+    // Given: a tar-pit target (accepts, reads, never answers) plus echo
+    let pit = TcpListener::bind("127.0.0.1:0").expect("pit bind");
+    let pit_port = pit.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let (mut s, _) = pit.accept().expect("pit accept");
+        let mut buf = [0u8; 1024];
+        let _ = s.read(&mut buf);
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let echo = tcp_echo();
+    let mut routes = HashMap::new();
+    routes.insert(1u16, format!("127.0.0.1:{pit_port}").parse().expect("sa"));
+    routes.insert(3u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    // When: slow stream first, then fast echo on another stream
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .expect("timeout");
+    let nonce = [0xEFu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let s1 = sess.mux.open_tcp("127.0.0.1", pit_port).expect("open pit");
+    let s2 = sess.mux.open_tcp("127.0.0.1", echo).expect("open echo");
+    assert_eq!((s1, s2), (1, 3));
+    for (id, open) in [(s1, true), (s2, true)] {
+        let _ = open;
+        let sealed = sess
+            .mux
+            .seal_open_tcp(sess.keys.tx_key(), id, 128)
+            .expect("seal open");
+        wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    }
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s1, b"into-pit", 128)
+        .expect("seal");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s2, b"hi", 128)
+        .expect("seal hi");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    // Then: fast echo arrives while the pit is still digesting (no HOL block)
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert!(
+        h.frame_type == FrameType::Data,
+        "data, got {:?}",
+        h.frame_type
+    );
+    assert_eq!(h.stream_id, s2, "fast stream answers first");
+    let back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open echo");
+    assert_eq!(back, b"hi");
     drop(stream);
     server.join().expect("server thread");
 }
@@ -838,8 +908,16 @@ fn burst_and_edge_traffic_keeps_server_alive() {
     let nonce = [0xE7u8; 32];
     let mut sess =
         aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
-    let mut expect_tcp = 0u32;
-    let mut expect_udp = 0u32;
+    // When: 120 TCP + 60 UDP flows, conversing with each in turn
+    // (mixed sizes, empty DATAs, duplicate OPENs, one tampered frame).
+    // Strictly sequential: a duplex server answers while requests still
+    // flow, but this single-threaded harness must bound outstanding bytes
+    // (write-then-read of the whole burst deadlocks once replies fill the
+    // socket buffers — as would any client that never reads; our pump
+    // always reads). All 180 streams stay open till the end (the soak),
+    // every edge preserved. Byte-exact asserts (framing may split).
+    let mut want_tcp: Vec<u8> = Vec::new();
+    let mut got_tcp: Vec<u8> = Vec::new();
     for i in 0..120u16 {
         let id = sess.mux.open_tcp("127.0.0.1", echo).expect("open");
         let sealed_open = sess
@@ -864,16 +942,37 @@ fn burst_and_edge_traffic_keeps_server_alive() {
             .seal_data(sess.keys.tx_key(), id, &payload, 128)
             .expect("seal data");
         wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
-        if size > 0 {
-            expect_tcp += 1;
-        }
         // One tampered frame mid-burst (must not kill the loop).
         if i == 60 {
             let mut bad = sealed.ciphertext.clone();
             bad[0] ^= 0xFF;
             wire_help::write_frame(&mut stream, &sealed.header, &bad);
         }
+        if size > 0 {
+            want_tcp.extend_from_slice(&payload);
+            let mut got = 0;
+            while got < size {
+                let (h, c) = wire_help::read_frame(&mut stream);
+                assert!(h.length as usize == c.len());
+                assert!(
+                    h.frame_type == FrameType::Data,
+                    "only this flow outstanding, got {:?}",
+                    h.frame_type
+                );
+                let b = sess
+                    .mux
+                    .open_data(sess.keys.rx_key(), &h, &c)
+                    .expect("echo opens");
+                if b.is_empty() {
+                    continue;
+                }
+                got += b.len();
+                got_tcp.extend_from_slice(&b);
+            }
+        }
     }
+    let mut want_udp: Vec<u8> = Vec::new();
+    let mut got_udp: Vec<u8> = Vec::new();
     for i in 0..60u16 {
         let id = sess.mux.open_udp("127.0.0.1", udp_port).expect("open");
         let sealed_open = sess
@@ -889,33 +988,32 @@ fn burst_and_edge_traffic_keeps_server_alive() {
             .expect("seal dgram");
         wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
         if size > 0 {
-            expect_udp += 1;
-        }
-    }
-    // Then: every non-empty payload echoes back (order preserved).
-    let mut got_tcp = 0u32;
-    let mut got_udp = 0u32;
-    for _ in 0..(expect_tcp + expect_udp) {
-        let (h, c) = wire_help::read_frame(&mut stream);
-        assert!(h.length as usize == c.len());
-        match h.frame_type {
-            FrameType::Data => {
-                sess.mux
-                    .open_data(sess.keys.rx_key(), &h, &c)
-                    .expect("echo opens");
-                got_tcp += 1;
-            }
-            FrameType::UdpDatagram => {
-                sess.mux
+            want_udp.extend_from_slice(&payload);
+            let mut got = 0;
+            while got < size {
+                let (h, c) = wire_help::read_frame(&mut stream);
+                assert!(h.length as usize == c.len());
+                assert!(
+                    h.frame_type == FrameType::UdpDatagram,
+                    "only this flow outstanding, got {:?}",
+                    h.frame_type
+                );
+                let b = sess
+                    .mux
                     .open_datagram(sess.keys.rx_key(), &h, &c)
                     .expect("echo opens");
-                got_udp += 1;
+                if b.is_empty() {
+                    continue;
+                }
+                got += b.len();
+                got_udp.extend_from_slice(&b);
             }
-            other => panic!("unexpected echo frame {other:?}"),
         }
     }
-    assert_eq!(got_tcp, expect_tcp, "every TCP payload echoes");
-    assert_eq!(got_udp, expect_udp, "every UDP payload echoes");
+    // Then: every non-empty payload echoed back, byte-exact.
+    assert_eq!(got_tcp, want_tcp, "every TCP payload echoes");
+    assert_eq!(got_udp, want_udp, "every UDP payload echoes");
+
     drop(stream);
     server.join().expect("server thread");
 }
