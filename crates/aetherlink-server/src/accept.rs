@@ -10,7 +10,7 @@
 //! (fits DNS and proxied request/response). Bidirectional streaming relay
 //! is a follow-up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -108,21 +108,65 @@ struct FlowKey {
     warm: bool,
 }
 
+/// One queued TCP job for a busy stream. `None` payload = warm dial only.
+struct PendingTcp {
+    target: (String, u16),
+    payload: Option<Vec<u8>>,
+}
+
 /// Unanswerable destinations: multicast, broadcast, unspecified.
 /// Relaying them only burns a full timeout per datagram (LLMNR/mDNS/SSDP
 /// chatter does exactly that, constantly) — skip without a relay attempt.
-/// Reuse a cached relay socket only when no job for this stream is in
-/// flight (two workers must never share one socket); otherwise the worker
-/// dials fresh and its socket is dropped on return.
-fn take_idle_socket(
+/// Dispatch one TCP job (warm dial or payload exchange) to the pool.
+/// At most one job per stream ever runs: the caller serializes via
+/// `busy`/`pending`, so the cached socket moves to the worker with no
+/// sharing and returns on completion (keep-alive preserved).
+fn dispatch_tcp(
+    pool: &RelayPool<FlowKey, Result<RelayOut, ()>>,
     relays: &mut HashMap<u16, TcpStream>,
-    in_flight: &HashMap<u16, usize>,
     id: u16,
-) -> Option<TcpStream> {
-    if in_flight.get(&id).copied().unwrap_or(0) == 0 {
-        relays.remove(&id)
+    job: PendingTcp,
+    warm: bool,
+) -> Result<(), PendingTcp> {
+    let sock = relays.remove(&id);
+    let key = FlowKey {
+        id,
+        target: job.target.clone(),
+        is_udp: false,
+        warm,
+    };
+    let (tip, tport) = job.target;
+    let pt = job.payload.unwrap_or_default();
+    let tip2 = tip.clone();
+    let accepted = if warm {
+        pool.dispatch(key, move || match prep_socket(sock, &tip2, tport) {
+            Ok(s) => Ok(RelayOut::Warmed(Some(s))),
+            Err(()) => Err(()),
+        })
     } else {
-        None
+        let pt_send = pt.clone();
+        let tip3 = tip.clone();
+        pool.dispatch(key, move || {
+            let mut sock = match prep_socket(sock, &tip3, tport) {
+                Ok(s) => s,
+                Err(()) => return Err(()),
+            };
+            match relay::exchange_stream(&mut sock, &pt_send, RELAY_TIMEOUT, STREAM_IDLE) {
+                Ok(reply) => Ok(RelayOut::Tcp {
+                    reply,
+                    sock: Some(sock),
+                }),
+                Err(_) => Err(()),
+            }
+        })
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(PendingTcp {
+            target: (tip, tport),
+            payload: if warm { None } else { Some(pt) },
+        })
     }
 }
 
@@ -139,26 +183,17 @@ fn prep_socket(sock: Option<TcpStream>, ip: &str, port: u16) -> Result<TcpStream
 }
 
 /// Release one in-flight slot for a stream.
-fn release_slot(in_flight: &mut HashMap<u16, usize>, id: u16) {
-    match in_flight.get_mut(&id) {
-        Some(n) => {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                in_flight.remove(&id);
-            }
-        }
-        None => {}
-    }
-}
-
-/// Seal + write one completion; false ends the session (write failed).
+/// Seal + write one completion, then pump this stream's queue so its bytes
+/// stay on one socket in order; false ends the session (write failed).
 #[allow(clippy::too_many_arguments)]
 fn handle_completion(
+    pool: &RelayPool<FlowKey, Result<RelayOut, ()>>,
     c: Completion<FlowKey, Result<RelayOut, ()>>,
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     relays: &mut HashMap<u16, TcpStream>,
-    in_flight: &mut HashMap<u16, usize>,
+    busy: &mut HashSet<u16>,
+    pending: &mut HashMap<u16, VecDeque<PendingTcp>>,
     dead: &mut HashMap<(String, u16), Instant>,
 ) -> bool {
     let FlowKey {
@@ -167,15 +202,12 @@ fn handle_completion(
         is_udp,
         warm,
     } = c.key;
-    release_slot(in_flight, id);
-    match c.result {
+    let ok = match c.result {
         Ok(RelayOut::Tcp { reply, sock }) => {
             debug_log(&format!("tunnel: data id={id} relay {}B", reply.len()));
             dead.remove(&target);
             if let Some(s) = sock {
-                if !in_flight.contains_key(&id) {
-                    relays.insert(id, s);
-                }
+                relays.insert(id, s);
             }
             match send_data(sess, stream, id, &reply) {
                 Ok(()) => true,
@@ -189,9 +221,7 @@ fn handle_completion(
         }
         Ok(RelayOut::Warmed(sock)) => {
             if let Some(s) = sock {
-                if !in_flight.contains_key(&id) {
-                    relays.insert(id, s);
-                }
+                relays.insert(id, s);
             }
             true
         }
@@ -226,6 +256,41 @@ fn handle_completion(
             }
             true
         }
+    };
+    if !ok {
+        return false;
+    }
+    if is_udp {
+        return true;
+    }
+    // Pump this stream's queue in order; at most one job runs, so the
+    // socket moves worker -> cache -> next worker with no sharing.
+    loop {
+        let Some(job) = pending.get_mut(&id).and_then(VecDeque::pop_front) else {
+            pending.remove(&id);
+            busy.remove(&id);
+            return true;
+        };
+        if pending.get(&id).is_some_and(VecDeque::is_empty) {
+            pending.remove(&id);
+        }
+        let is_data = job.payload.is_some();
+        if is_data && relay::is_fresh_dead(dead, &job.target.0, job.target.1, Instant::now()) {
+            debug_log(&format!(
+                "tunnel: data id={id} queued payload in dead cooldown, skipping flow"
+            ));
+            continue;
+        }
+        match dispatch_tcp(pool, relays, id, job, !is_data) {
+            Ok(()) => return true, // still busy
+            Err(job) => {
+                debug_log(&format!(
+                    "tunnel: data id={id} server busy, parking payload for retry"
+                ));
+                pending.entry(id).or_default().push_front(job);
+                return true;
+            }
+        }
     }
 }
 
@@ -236,11 +301,12 @@ fn drain_completions(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     relays: &mut HashMap<u16, TcpStream>,
-    in_flight: &mut HashMap<u16, usize>,
+    busy: &mut HashSet<u16>,
+    pending: &mut HashMap<u16, VecDeque<PendingTcp>>,
     dead: &mut HashMap<(String, u16), Instant>,
 ) -> bool {
     while let Some(c) = pool.try_recv() {
-        if !handle_completion(c, sess, stream, relays, in_flight, dead) {
+        if !handle_completion(pool, c, sess, stream, relays, busy, pending, dead) {
             return false;
         }
     }
@@ -328,8 +394,11 @@ fn tunnel_loop(
     // Targets whose dial recently failed: fail fast for the cooldown
     // instead of burning a worker behind another dial timeout.
     let mut dead: HashMap<(String, u16), Instant> = HashMap::new();
-    // Stream ids with relay jobs in flight (socket reuse only when idle).
-    let mut in_flight: HashMap<u16, usize> = HashMap::new();
+    // Streams with a relay job running; further payloads queue per stream
+    // (one socket per stream: a bursty ClientHello must never split across
+    // dials, seen live: 4 parallel dials, target answered none).
+    let mut busy: HashSet<u16> = HashSet::new();
+    let mut pending: HashMap<u16, VecDeque<PendingTcp>> = HashMap::new();
     let pool: RelayPool<FlowKey, Result<RelayOut, ()>> =
         RelayPool::new(POOL_WORKERS, POOL_WORKERS + POOL_QUEUE);
     // Best-effort: without a timeout an idle peer wedges completion
@@ -348,7 +417,8 @@ fn tunnel_loop(
                     &mut sess,
                     stream,
                     &mut relays,
-                    &mut in_flight,
+                    &mut busy,
+                    &mut pending,
                     &mut dead,
                 ) {
                     break;
@@ -422,20 +492,26 @@ fn tunnel_loop(
                 // Bare SYN/ACK (empty DATA): warm the cached socket on a
                 // worker; the reply that cannot exist yet needs no read.
                 if pt.is_empty() {
-                    let sock = take_idle_socket(&mut relays, &in_flight, header.stream_id);
-                    let warm_ip = target.ip().to_string();
-                    let warm_port = target.port();
-                    let key = FlowKey {
-                        id: header.stream_id,
-                        target: (warm_ip.clone(), warm_port),
-                        is_udp: false,
-                        warm: true,
-                    };
-                    if pool.dispatch(key, move || match prep_socket(sock, &warm_ip, warm_port) {
-                        Ok(s) => Ok(RelayOut::Warmed(Some(s))),
-                        Err(()) => Err(()),
-                    }) {
-                        *in_flight.entry(header.stream_id).or_insert(0) += 1;
+                    let id = header.stream_id;
+                    let wtarget = (target.ip().to_string(), target.port());
+                    if busy.contains(&id) {
+                        pending.entry(id).or_default().push_back(PendingTcp {
+                            target: wtarget,
+                            payload: None,
+                        });
+                    } else if dispatch_tcp(
+                        &pool,
+                        &mut relays,
+                        id,
+                        PendingTcp {
+                            target: wtarget,
+                            payload: None,
+                        },
+                        true,
+                    )
+                    .is_ok()
+                    {
+                        busy.insert(id);
                     } else {
                         debug_log(&format!(
                             "tunnel: data id={} server busy, skipping flow",
@@ -447,7 +523,8 @@ fn tunnel_loop(
                         &mut sess,
                         stream,
                         &mut relays,
-                        &mut in_flight,
+                        &mut busy,
+                        &mut pending,
                         &mut dead,
                     ) {
                         break;
@@ -462,30 +539,27 @@ fn tunnel_loop(
                     ));
                     continue;
                 }
-                // Payload: relay on a worker; seal + write on completion.
-                let sock = take_idle_socket(&mut relays, &in_flight, header.stream_id);
-                let job_ip = target.ip().to_string();
-                let job_port = target.port();
-                let key = FlowKey {
-                    id: header.stream_id,
-                    target: target_key,
-                    is_udp: false,
-                    warm: false,
-                };
-                if pool.dispatch(key, move || {
-                    let mut sock = match prep_socket(sock, &job_ip, job_port) {
-                        Ok(s) => s,
-                        Err(()) => return Err(()),
-                    };
-                    match relay::exchange_stream(&mut sock, &pt, RELAY_TIMEOUT, STREAM_IDLE) {
-                        Ok(reply) => Ok(RelayOut::Tcp {
-                            reply,
-                            sock: Some(sock),
-                        }),
-                        Err(_) => Err(()),
-                    }
-                }) {
-                    *in_flight.entry(header.stream_id).or_insert(0) += 1;
+                // Payload: queued per stream when one is already running
+                // (one socket per stream: bytes must never split dials).
+                let id = header.stream_id;
+                if busy.contains(&id) {
+                    pending.entry(id).or_default().push_back(PendingTcp {
+                        target: target_key,
+                        payload: Some(pt),
+                    });
+                } else if dispatch_tcp(
+                    &pool,
+                    &mut relays,
+                    id,
+                    PendingTcp {
+                        target: target_key,
+                        payload: Some(pt),
+                    },
+                    false,
+                )
+                .is_ok()
+                {
+                    busy.insert(id);
                 } else {
                     debug_log(&format!(
                         "tunnel: data id={} server busy, skipping flow",
@@ -497,7 +571,8 @@ fn tunnel_loop(
                     &mut sess,
                     stream,
                     &mut relays,
-                    &mut in_flight,
+                    &mut busy,
+                    &mut pending,
                     &mut dead,
                 ) {
                     break;
@@ -577,7 +652,6 @@ fn tunnel_loop(
                     };
                     out.map(RelayOut::Udp).map_err(|_| ())
                 }) {
-                    *in_flight.entry(header.stream_id).or_insert(0) += 1;
                 } else {
                     debug_log(&format!(
                         "tunnel: datagram id={} server busy, skipping flow",
@@ -589,7 +663,8 @@ fn tunnel_loop(
                     &mut sess,
                     stream,
                     &mut relays,
-                    &mut in_flight,
+                    &mut busy,
+                    &mut pending,
                     &mut dead,
                 ) {
                     break;

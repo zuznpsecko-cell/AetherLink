@@ -248,6 +248,75 @@ fn giant_udp_reply_dropped_loop_survives() {
     server.join().expect("server thread");
 }
 
+#[test]
+fn bursty_stream_stays_on_one_connection_in_order() {
+    // Given: a target counting connections and capturing bytes per conn
+    use std::sync::{Arc, Mutex};
+    let conns: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    {
+        let conns = Arc::clone(&conns);
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let (mut s, _) = listener.accept().expect("accept");
+                let slot = { conns.lock().expect("lock").push(Vec::new()); conns.lock().expect("lock").len() - 1 };
+                s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+                let mut buf = [0u8; 4096];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            s.write_all(&buf[..n]).expect("echo");
+                            conns.lock().expect("lock")[slot].extend_from_slice(&buf[..n]);
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let mut routes = HashMap::new();
+    let srv_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_port = srv_listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = srv_listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    // When: handshake + OPEN + three payloads back-to-back on one stream
+    let mut stream = client_tls(srv_port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("timeout");
+    let nonce = [0xEDu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let s1 = sess.mux.open_tcp("127.0.0.1", port).expect("open");
+    let sealed = sess.mux.seal_open_tcp(sess.keys.tx_key(), s1, 128).expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    for chunk in [b"aaa".as_slice(), b"bb".as_slice(), b"c".as_slice()] {
+        let sealed = sess.mux.seal_data(sess.keys.tx_key(), s1, chunk, 128).expect("seal");
+        wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    }
+
+    // Then: all three replies arrive and the target saw ONE connection
+    // with the bytes in order (no split across parallel dials)
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        assert!(h.frame_type == FrameType::Data, "data, got {:?}", h.frame_type);
+        got.extend_from_slice(&sess.mux.open_data(sess.keys.rx_key(), &h, &c).expect("open"));
+    }
+    assert_eq!(got, b"aaabbc");
+    drop(stream);
+    server.join().expect("server thread");
+    let conns = conns.lock().expect("lock");
+    let total: Vec<u8> = conns.iter().flat_map(|v| v.iter().copied()).collect();
+    assert_eq!(total, b"aaabbc", "bytes in order across conns: {conns:?}");
+    assert_eq!(conns.len(), 1, "single connection, got {}", conns.len());
+}
+
 fn tcp_echo() -> u16 {
     let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
     let port = echo.local_addr().expect("addr").port();
