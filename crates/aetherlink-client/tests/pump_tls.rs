@@ -295,3 +295,98 @@ fn attach_pump_wires_tun_through_tls_session() {
     handle.stop();
     server.join().expect("server thread");
 }
+
+#[test]
+fn bulk_send_does_not_wait_for_replies() {
+    // Given: TLS server that sinks (reads OPEN + 30 DATA, never answers)
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        key.cert.der().to_vec(),
+    )];
+    let key_der = key.key_pair.serialize_der();
+    let server_cfg =
+        Arc::new(aetherlink_core::tls::server_config(chain, &key_der).expect("server cfg"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let cache = NonceCache::new();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut stream = aetherlink_core::tls::accept_tls(sock, &server_cfg).expect("server tls");
+        let _sess = aetherlink_core::session::handshake_server(&mut stream, PSK, &cache)
+            .expect("server hs");
+        let _open = read_one(&mut stream);
+        // Then: 30 dripped payloads all land (old loop burned 200ms per
+        // turn waiting for replies that never come: ~6s+ of pure wait).
+        let t0 = std::time::Instant::now();
+        for _ in 0..30 {
+            let _data = read_one(&mut stream);
+        }
+        let dt = t0.elapsed();
+        assert!(
+            dt < Duration::from_secs(7),
+            "30 dripped payloads took {dt:?}, loop waits on wire reads"
+        );
+        let _ = done_tx.send(());
+        let mut one = [0u8; 1];
+        let _ = stream.read(&mut one);
+    });
+
+    // When: SYN, handshake, then 30 payloads back-to-back
+    let syn = build_tcp_packet(CLIENT_IP, DST, 42001, 443, true, false, true, 8000, 0, &[]);
+    let tun = Arc::new(Mutex::new(FakeTun {
+        inbound: vec![syn].into(),
+        outbound: Vec::new(),
+    }));
+    let tunnel = aetherlink_client::lifecycle::connect(
+        &test_config(&format!("127.0.0.1:{port}")),
+        Some(Arc::new(AcceptAll)),
+    )
+    .expect("connect");
+    let mut handle = spawn_pump_tls(Arc::clone(&tun), tunnel, PAD).expect("spawn");
+    // Complete the handshake from TUN side (parse iss from SYN-ACK).
+    let iss = loop {
+        {
+            let guard = tun.lock().expect("lock");
+            if let Some(raw) = guard.outbound.first() {
+                let parsed =
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw).expect("valid ip");
+                if parsed.tcp().expect("tcp").syn {
+                    break parsed.tcp().expect("tcp").seq;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    {
+        let mut guard = tun.lock().expect("lock");
+        guard.outbound.clear();
+        let ack = build_tcp_packet(
+            CLIENT_IP, DST, 42001, 443, false, true, false, 8001, iss.wrapping_add(1), &[],
+        );
+        guard.inbound.push_back(ack);
+        // Drip one payload per 150ms (app-limited sender): the loop must
+        // not add its 200ms wire-wait per packet on top.
+        drop(guard);
+        for i in 0..30u32 {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut guard = tun.lock().expect("lock");
+            let data = build_tcp_packet(
+                CLIENT_IP,
+                DST,
+                42001,
+                443,
+                false,
+                true,
+                true,
+                8001u32.wrapping_add(i.wrapping_mul(16)),
+                iss.wrapping_add(1),
+                &vec![i as u8; 16],
+            );
+            guard.inbound.push_back(data);
+        }
+    }
+    done_rx.recv().expect("server got all frames");
+    handle.stop();
+    server.join().expect("server thread");
+}
