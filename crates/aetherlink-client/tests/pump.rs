@@ -214,7 +214,8 @@ fn mux_data_becomes_tcp_packet_in_tun() {
     let frames = pump.poll_once(&mut tun).expect("poll");
     assert_eq!(frames.len(), 2);
     let id = frames[0].header.stream_id;
-    tun.outbound.clear(); // prompt self-ack (not part of reply)
+    // Drain the prompt self-ack (not part of the reply chain).
+    tun.outbound.clear();
     // When: server reply bytes arrive via mux (sealed by a peer mux)
     let mut peer = MuxManager::new();
     peer.register_inbound(id, &SERVER_DST.to_string(), 80, false)
