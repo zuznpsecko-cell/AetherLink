@@ -425,6 +425,31 @@ impl DataPump {
                 };
                 flow.client_bytes = flow.client_bytes.wrapping_add(seg.payload.len() as u32);
                 frames.push(data);
+                // Split-TCP self-ack: confirm receipt hop-by-hop right away
+                // instead of waiting for the target's reply to piggyback on.
+                // Without it bulk upload stalls past cwnd (target ACKs never
+                // cross the relay as frames) and the app measures ~zero
+                // (seen live: 3KB/s then stall). Best-effort: a lost ack is
+                // recovered by the next reply/ack carrying newer numbers.
+                let ackpkt = build_tcp_packet_full(
+                    flow.server_ip,
+                    flow.client_ip,
+                    flow.server_port,
+                    flow.client_port,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    flow.server_next,
+                    flow.client_isn
+                        .wrapping_add(1)
+                        .wrapping_add(flow.client_bytes),
+                    &[],
+                );
+                if let Err(e) = tun.send_packet(&ackpkt) {
+                    aetherlink_netstack::debug_log(&format!("pump: tcp self-ack send failed: {e}"));
+                }
                 self.tcp.insert(fk, flow);
                 Ok(Some(frames))
             }

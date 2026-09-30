@@ -188,7 +188,8 @@ fn server_reply_returns_with_sequence_chain() {
     tun.inbound.push_back(data);
     let frames = pump.poll_once(&mut tun).expect("poll");
     let id = frames[0].header.stream_id;
-    // When: two mux DATA replies arrive -> Then: two TCP segments, seq chain.
+    let _ = tun.take_outbound(); // prompt self-ack (not part of reply chain)
+                                 // When: two mux DATA replies arrive -> Then: two TCP segments, seq chain.
     let mut peer = MuxManager::new();
     peer.register_inbound(id, &DST.to_string(), 80, false)
         .expect("register");
@@ -354,7 +355,8 @@ fn failed_sends_keep_tables_consistent() {
     let frames = pump.poll_once(&mut tun).expect("poll");
     assert_eq!(frames.len(), 2);
     let id = frames[0].header.stream_id;
-    // When: duplicate SYN while the TUN send fails (ring full)
+    let _ = tun.inner.take_outbound(); // prompt self-ack
+                                       // When: duplicate SYN while the TUN send fails (ring full)
     tun.fail_send = true;
     tun.inner.inbound.push_back(syn(7000));
     // Then: clean Err, no panic — and the flow still works after.
@@ -402,7 +404,8 @@ fn retransmitted_data_is_dropped_without_recount() {
     let frames = pump.poll_once(&mut tun).expect("poll");
     assert_eq!(frames.len(), 2);
     let id = frames[0].header.stream_id;
-    // When: the same segment retransmitted (app RTO, no answer yet)
+    let _ = tun.take_outbound(); // prompt self-ack (dup must add nothing)
+                                 // When: the same segment retransmitted (app RTO, no answer yet)
     let dup = build_tcp_packet(
         CLIENT_IP,
         DST,
@@ -433,4 +436,37 @@ fn retransmitted_data_is_dropped_without_recount() {
         out[0].tcp().expect("tcp").ack_num,
         isn.wrapping_add(1).wrapping_add(2)
     );
+}
+
+#[test]
+fn forwarded_data_emits_prompt_ack() {
+    // Given: established flow (split-TCP must ack hop-by-hop: the app
+    // stalls past cwnd if ACKs only piggyback on target replies, seen
+    // live as 3KB/s bulk upload then stall)
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, _iss) = handshake(&mut pump, &mut tun, 9000);
+    let data = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        true,
+        isn.wrapping_add(1),
+        70000,
+        b"hi",
+    );
+    tun.inbound.push_back(data);
+    // When: payload forwarded upstream
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
+    // Then: a pure ACK is injected immediately (no SYN/FIN, no payload).
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1);
+    let seg = out[0].tcp().expect("tcp");
+    assert!(seg.ack && !seg.syn && !seg.fin && !seg.rst);
+    assert_eq!(seg.ack_num, isn.wrapping_add(1).wrapping_add(2));
+    assert!(seg.payload.is_empty());
 }
