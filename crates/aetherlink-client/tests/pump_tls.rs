@@ -362,7 +362,16 @@ fn bulk_send_does_not_wait_for_replies() {
         let mut guard = tun.lock().expect("lock");
         guard.outbound.clear();
         let ack = build_tcp_packet(
-            CLIENT_IP, DST, 42001, 443, false, true, false, 8001, iss.wrapping_add(1), &[],
+            CLIENT_IP,
+            DST,
+            42001,
+            443,
+            false,
+            true,
+            false,
+            8001,
+            iss.wrapping_add(1),
+            &[],
         );
         guard.inbound.push_back(ack);
         // Drip one payload per 150ms (app-limited sender): the loop must

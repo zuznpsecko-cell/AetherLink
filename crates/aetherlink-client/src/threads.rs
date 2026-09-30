@@ -24,7 +24,10 @@ use crate::lifecycle::ConnectedTunnel;
 use crate::pump::DataPump;
 
 /// Read timeout so the wire thread polls the stop flag instead of blocking.
-const READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// Wire-read quantum: bounds per-turn wait on a silent peer (bulk senders
+/// must not pay 200ms per turn) and stop latency. Replies still arrive
+/// instantly when present; 10ms only prices true idleness.
+const READ_TIMEOUT: Duration = Duration::from_millis(10);
 /// Bound for one frame body across stalls (fail closed eventually).
 const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle sleep in the TUN->wire loop (no busy spin on an empty TUN).
@@ -290,6 +293,24 @@ where
                     break;
                 }
             }
+            // Inject one received frame; false ends the thread.
+            let mut inject = |header: &FrameHeader, ct: &[u8]| -> bool {
+                match tun.lock() {
+                    Ok(mut guard) => match pump.receive_mux(header, ct, &mut *guard) {
+                        Ok(()) => {
+                            aetherlink_netstack::debug_log("pump: tls injected to tun");
+                            true
+                        }
+                        Err(e) => {
+                            aetherlink_netstack::debug_log(&format!(
+                                "pump: tls frame dropped: {e}"
+                            ));
+                            true
+                        }
+                    },
+                    Err(_) => false,
+                }
+            };
             // Wire -> TUN: one frame per turn; timeout re-polls stop.
             match read_sealed(&mut stream) {
                 Ok((header, ct)) => {
@@ -297,14 +318,8 @@ where
                         "pump: tls wire {:?} id={} len={}",
                         header.frame_type, header.stream_id, header.length
                     ));
-                    match tun.lock() {
-                        Ok(mut guard) => match pump.receive_mux(&header, &ct, &mut *guard) {
-                            Ok(()) => aetherlink_netstack::debug_log("pump: tls injected to tun"),
-                            Err(e) => aetherlink_netstack::debug_log(&format!(
-                                "pump: tls frame dropped: {e}"
-                            )),
-                        },
-                        Err(_) => break,
+                    if !inject(&header, &ct) {
+                        break;
                     }
                 }
                 Err(e)
