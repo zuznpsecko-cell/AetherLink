@@ -12,14 +12,14 @@ Run ELEVATED (admin), V2RayN OFF:
 [CmdletBinding()]
 param(
   [string]$Config = "client.local.yaml",
-  [switch]$Debug
+  [switch]$DebugLog
 )
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'Stop'
 
 # Debug logging is per-packet synchronous I/O: it skews latency/throughput
-# badly under load (speedtests). Off by default; pass -Debug to capture logs.
-if ($Debug) { $env:AETHERLINK_DEBUG = '1' } else { $env:AETHERLINK_DEBUG = '0' }
+# badly under load (speedtests). Off by default; pass -DebugLog to capture logs.
+if ($DebugLog) { $env:AETHERLINK_DEBUG = '1' } else { $env:AETHERLINK_DEBUG = '0' }
 $ROOT   = $PSScriptRoot | Split-Path -Parent
 $CLIENT = "$ROOT\dist\win-client\AetherLink.Client.exe"
 $CFG    = Join-Path $ROOT $Config
