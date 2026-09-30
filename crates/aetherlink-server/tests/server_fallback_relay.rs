@@ -121,3 +121,17 @@ fn relay_dial_refused_fails_fast() {
         "dial errors must stay bounded"
     );
 }
+
+#[test]
+fn dial_tcp_disables_nagle() {
+    // Given: a listening socket (Nagle would stall our small per-frame
+    // writes behind delayed ACKs: seen live as a hard ~40pps cap)
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let _ = listener.accept();
+    });
+    // When: dialing for relay -> Then: NODELAY set
+    let sock = relay::dial_tcp("127.0.0.1", port).expect("dial");
+    assert!(sock.nodelay().expect("nodelay readable"));
+}

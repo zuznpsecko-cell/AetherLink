@@ -21,7 +21,14 @@ pub fn dial_tcp(addr: &str, port: u16) -> Result<TcpStream> {
         .map_err(|e| ServerError::RelayError(e.to_string()))?
     {
         match TcpStream::connect_timeout(&sock_addr, TCP_DIAL_TIMEOUT) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                // Nagle would stall our small per-frame writes behind
+                // delayed ACKs (seen live as a hard ~40pps cap).
+                stream
+                    .set_nodelay(true)
+                    .map_err(|e| ServerError::RelayError(format!("nodelay: {e}")))?;
+                return Ok(stream);
+            }
             Err(e) => last_err = e.to_string(),
         }
     }

@@ -213,6 +213,9 @@ pub fn connect(
         .map_err(|_| ClientError::ConfigError("server_addr port invalid".to_string()))?;
     let sock = TcpStream::connect((host, port))
         .map_err(|e| ClientError::PlatformError(format!("tcp connect: {e}")))?;
+    // Nagle would stall our small per-frame writes behind delayed ACKs.
+    sock.set_nodelay(true)
+        .map_err(|e| ClientError::PlatformError(format!("tcp nodelay: {e}")))?;
     aetherlink_netstack::debug_log(&format!("connect: tcp {host}:{port} ok"));
     let name = tls::server_name(&config.outer_sni).map_err(ClientError::Core)?;
     let tls_cfg = Arc::new(match verifier {

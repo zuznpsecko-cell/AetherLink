@@ -388,6 +388,8 @@ pub fn serve_connection(
     ctx: &ServerCtx,
     routes: &mut HashMap<u16, SocketAddr>,
 ) -> Path {
+    // Nagle would stall our small per-frame writes behind delayed ACKs.
+    let _ = sock.set_nodelay(true);
     let mut stream = match tls::accept_tls(sock, &ctx.tls) {
         Ok(s) => {
             debug_log("accept: tls ok");
