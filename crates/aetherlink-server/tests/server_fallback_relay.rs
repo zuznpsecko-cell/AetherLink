@@ -135,3 +135,19 @@ fn dial_tcp_disables_nagle() {
     let sock = relay::dial_tcp("127.0.0.1", port).expect("dial");
     assert!(sock.nodelay().expect("nodelay readable"));
 }
+
+#[test]
+fn dial_failure_classification() {
+    // Refused = definitive (cool it down); anything else = transient.
+    let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "nope");
+    assert_eq!(relay::classify_dial_err(&refused), relay::DialFail::Refused);
+    for kind in [
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::HostUnreachable,
+        std::io::ErrorKind::Other,
+    ] {
+        let e = std::io::Error::new(kind, "maybe");
+        assert_eq!(relay::classify_dial_err(&e), relay::DialFail::Transient);
+    }
+}

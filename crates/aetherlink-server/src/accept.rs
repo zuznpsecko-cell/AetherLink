@@ -113,17 +113,23 @@ const WORKER_POLL: Duration = Duration::from_millis(10);
 const WORKER_STACK: usize = 256 * 1024;
 
 /// Worker -> loop replies, possibly many per stream, in worker order.
+/// Failure kind travels so only definitive refusals cool the target down.
 struct StreamReply {
     id: u16,
     target: (String, u16),
-    result: Result<Vec<u8>, ()>,
+    result: Result<Vec<u8>, relay::DialFail>,
 }
 
-fn worker_fail(out: &mpsc::Sender<StreamReply>, id: u16, target: (String, u16)) {
+fn worker_fail(
+    out: &mpsc::Sender<StreamReply>,
+    id: u16,
+    target: (String, u16),
+    kind: relay::DialFail,
+) {
     let _ = out.send(StreamReply {
         id,
         target,
-        result: Err(()),
+        result: Err(kind),
     });
 }
 
@@ -143,17 +149,17 @@ fn stream_worker(
     let target = (ip.clone(), port);
     let mut sock = match relay::dial_tcp(&ip, port) {
         Ok(s) => s,
-        Err(_) => {
-            worker_fail(&out, id, target);
+        Err(kind) => {
+            worker_fail(&out, id, target, kind);
             return;
         }
     };
     if sock.set_read_timeout(Some(WORKER_POLL)).is_err() {
-        worker_fail(&out, id, target);
+        worker_fail(&out, id, target, relay::DialFail::Transient);
         return;
     }
     if !first.is_empty() && sock.write_all(&first).is_err() {
-        worker_fail(&out, id, target);
+        worker_fail(&out, id, target, relay::DialFail::Transient);
         return;
     }
     let mut buf = vec![0u8; 65535];
@@ -163,7 +169,7 @@ fn stream_worker(
             match inbox.try_recv() {
                 Ok(payload) => {
                     if !payload.is_empty() && sock.write_all(&payload).is_err() {
-                        worker_fail(&out, id, target);
+                        worker_fail(&out, id, target, relay::DialFail::Transient);
                         return;
                     }
                 }
@@ -194,7 +200,7 @@ fn stream_worker(
             }
             Err(e) if e.kind() == TimedOut || e.kind() == WouldBlock => {}
             Err(_) => {
-                worker_fail(&out, id, target);
+                worker_fail(&out, id, target, relay::DialFail::Transient);
                 return;
             }
         }
@@ -320,13 +326,21 @@ fn handle_stream_reply(
                 }
             }
         }
-        Err(()) => {
+        Err(relay::DialFail::Refused) => {
             workers.remove(&r.id);
             debug_log(&format!(
-                "tunnel: data id={} relay failed, cooling down {}:{}",
+                "tunnel: data id={} relay refused, cooling down {}:{}",
                 r.id, r.target.0, r.target.1
             ));
             relay::mark_dead(dead, &r.target.0, r.target.1, Instant::now());
+            true
+        }
+        Err(relay::DialFail::Transient) => {
+            workers.remove(&r.id);
+            debug_log(&format!(
+                "tunnel: data id={} relay failed (transient, no cooldown)",
+                r.id
+            ));
             true
         }
     }

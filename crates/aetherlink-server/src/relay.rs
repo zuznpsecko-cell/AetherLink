@@ -12,29 +12,52 @@ use crate::{Result, ServerError};
 /// inheriting the ~21s OS connect stall and serially blocking the mux.
 const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How a dial failed: refused is definitive (nothing listens, stable),
+// anything else is transient (congestion, slow path — retry-worthy).
+/// Only [`DialFail::Refused`] may cool a target down; cooling on transient
+/// failures blacks out whole tests after one slow dial (seen live: 0.00 on
+/// speedtest upload after a single stall).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialFail {
+    Refused,
+    Transient,
+}
+
+/// Classify a dial error for cooldown decisions (pure, unit-tested).
+pub fn classify_dial_err(e: &std::io::Error) -> DialFail {
+    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+        DialFail::Refused
+    } else {
+        DialFail::Transient
+    }
+}
+
 /// Dial `(addr, port)` for a relayed stream.
-pub fn dial_tcp(addr: &str, port: u16) -> Result<TcpStream> {
+///
+/// Failure kind travels with the error so the loop cools down only
+/// definitive refusals (see [`DialFail`]).
+pub fn dial_tcp(addr: &str, port: u16) -> std::result::Result<TcpStream, DialFail> {
     let target = format!("{addr}:{port}");
-    let mut last_err = String::new();
-    for sock_addr in target
-        .to_socket_addrs()
-        .map_err(|e| ServerError::RelayError(e.to_string()))?
-    {
+    let mut last = DialFail::Transient;
+    let addrs = match target.to_socket_addrs() {
+        Ok(a) => a,
+        Err(_) => return Err(DialFail::Transient),
+    };
+    for sock_addr in addrs {
         match TcpStream::connect_timeout(&sock_addr, TCP_DIAL_TIMEOUT) {
             Ok(stream) => {
                 // Nagle would stall our small per-frame writes behind
                 // delayed ACKs (seen live as a hard ~40pps cap).
-                stream
-                    .set_nodelay(true)
-                    .map_err(|e| ServerError::RelayError(format!("nodelay: {e}")))?;
+                if stream.set_nodelay(true).is_err() {
+                    return Err(DialFail::Transient);
+                }
                 return Ok(stream);
             }
-            Err(e) => last_err = e.to_string(),
+            Err(e) => last = classify_dial_err(&e),
         }
     }
-    Err(ServerError::RelayError(format!(
-        "dial {target}: {last_err}"
-    )))
+    let _ = target;
+    Err(last)
 }
 
 /// Relay one UDP datagram: send `payload`, wait for the reply.
