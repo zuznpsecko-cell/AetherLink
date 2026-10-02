@@ -147,9 +147,27 @@ fn stream_worker(
 ) {
     use std::io::ErrorKind::{TimedOut, WouldBlock};
     let target = (ip.clone(), port);
+    // TEMP-DIAG(upload): per-stream byte counters, logged at worker exit.
+    let t0 = Instant::now();
+    let mut written: u64 = 0;
+    let mut read_back: u64 = 0;
     let mut sock = match relay::dial_tcp(&ip, port) {
-        Ok(s) => s,
+        Ok(s) => {
+            debug_log(&format!(
+                "TEMP-DIAG id={id} dial {}:{} ok in {:?}",
+                target.0,
+                target.1,
+                t0.elapsed()
+            ));
+            s
+        }
         Err(kind) => {
+            debug_log(&format!(
+                "TEMP-DIAG id={id} dial {}:{} failed {kind:?} in {:?}",
+                target.0,
+                target.1,
+                t0.elapsed()
+            ));
             worker_fail(&out, id, target, kind);
             return;
         }
@@ -158,9 +176,15 @@ fn stream_worker(
         worker_fail(&out, id, target, relay::DialFail::Transient);
         return;
     }
-    if !first.is_empty() && sock.write_all(&first).is_err() {
-        worker_fail(&out, id, target, relay::DialFail::Transient);
-        return;
+    if !first.is_empty() {
+        written += first.len() as u64;
+        if sock.write_all(&first).is_err() {
+            debug_log(&format!(
+                "TEMP-DIAG id={id} first-write failed written={written}"
+            ));
+            worker_fail(&out, id, target, relay::DialFail::Transient);
+            return;
+        }
     }
     let mut buf = vec![0u8; 65535];
     loop {
@@ -168,9 +192,15 @@ fn stream_worker(
         loop {
             match inbox.try_recv() {
                 Ok(payload) => {
-                    if !payload.is_empty() && sock.write_all(&payload).is_err() {
-                        worker_fail(&out, id, target, relay::DialFail::Transient);
-                        return;
+                    if !payload.is_empty() {
+                        written += payload.len() as u64;
+                        if sock.write_all(&payload).is_err() {
+                            debug_log(&format!(
+                                "TEMP-DIAG id={id} write failed written={written}"
+                            ));
+                            worker_fail(&out, id, target, relay::DialFail::Transient);
+                            return;
+                        }
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -181,6 +211,9 @@ fn stream_worker(
             Ok(0) => {
                 // Clean EOF: one empty reply (old semantic), then exit;
                 // the loop forgets the worker.
+                debug_log(&format!(
+                    "TEMP-DIAG id={id} worker end eof written={written} read={read_back}"
+                ));
                 let _ = out.send(StreamReply {
                     id,
                     target,
@@ -189,17 +222,24 @@ fn stream_worker(
                 return;
             }
             Ok(n) => {
+                read_back += n as u64;
                 let reply = StreamReply {
                     id,
                     target: target.clone(),
                     result: Ok(buf[..n].to_vec()),
                 };
                 if out.send(reply).is_err() {
+                    debug_log(&format!(
+                        "TEMP-DIAG id={id} worker end loop-gone written={written} read={read_back}"
+                    ));
                     return;
                 }
             }
             Err(e) if e.kind() == TimedOut || e.kind() == WouldBlock => {}
             Err(_) => {
+                debug_log(&format!(
+                    "TEMP-DIAG id={id} worker end read-err written={written} read={read_back}"
+                ));
                 worker_fail(&out, id, target, relay::DialFail::Transient);
                 return;
             }

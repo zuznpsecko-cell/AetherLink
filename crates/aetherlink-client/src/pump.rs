@@ -80,6 +80,10 @@ struct TcpFlow {
     /// Payload bytes accepted from the client so far (for ACK numbers).
     client_bytes: u32,
     state: TcpState,
+    /// TEMP-DIAG(upload): cumulative sealed bytes (mirrors client_bytes as u64).
+    sealed_total: u64,
+    /// TEMP-DIAG(upload): whether any reply was ever injected for this flow.
+    got_reply: bool,
 }
 
 /// Terminating bridge between TUN packets and sealed mux frames.
@@ -170,6 +174,16 @@ impl DataPump {
     /// the server treats Rst frames as loop-fatal, so none are ever sent).
     fn forget_tcp(&mut self, fk: &FlowKey) {
         if let Some(flow) = self.tcp.remove(fk) {
+            // TEMP-DIAG(upload): lifetime totals per forgotten flow.
+            aetherlink_netstack::debug_log(&format!(
+                "TEMP-DIAG tcp flow {}:{} -> {}:{} forgotten sealed={}B got_reply={}",
+                flow.client_ip,
+                flow.client_port,
+                flow.server_ip,
+                flow.server_port,
+                flow.sealed_total,
+                flow.got_reply,
+            ));
             if let Some(id) = flow.id {
                 self.tcp_by_id.remove(&id);
                 self.by_id.remove(&id);
@@ -245,6 +259,8 @@ impl DataPump {
                             server_next: iss.wrapping_add(1),
                             client_bytes: 0,
                             state: TcpState::SynReceived,
+                            sealed_total: 0,
+                            got_reply: false,
                         };
                         self.send_synack(&flow, tun)?;
                         aetherlink_netstack::debug_log(&format!(
@@ -424,6 +440,7 @@ impl DataPump {
                     }
                 };
                 flow.client_bytes = flow.client_bytes.wrapping_add(seg.payload.len() as u32);
+                flow.sealed_total += seg.payload.len() as u64;
                 frames.push(data);
                 // Split-TCP self-ack: confirm receipt hop-by-hop right away
                 // instead of waiting for the target's reply to piggyback on.
@@ -565,6 +582,15 @@ impl DataPump {
                     flow.server_next = flow.server_next.wrapping_sub(payload.len() as u32);
                     self.tcp.insert(key, flow);
                     return Err(e.into());
+                }
+                // TEMP-DIAG(upload): first injected reply per flow.
+                if !flow.got_reply {
+                    flow.got_reply = true;
+                    aetherlink_netstack::debug_log(&format!(
+                        "TEMP-DIAG tcp id={id} first reply {}B after {}B sealed",
+                        payload.len(),
+                        flow.sealed_total
+                    ));
                 }
                 self.tcp.insert(key, flow);
                 Ok(())
