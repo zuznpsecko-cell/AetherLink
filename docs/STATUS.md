@@ -2,6 +2,11 @@
 
 _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_ISSUES.md)_
 
+> **0l (upload 0.00): фикс в дереве, гейты НЕ прогонялись.** Причины и список правок — в
+> [docs/LIVE_ISSUES.md](LIVE_ISSUES.md#0l-аплоад-000-байты-терялись-молча-fin-убивал-ответ-id-кончались-в-дереве-гейты-не-прогонялись).
+> В рабочей песочнице нет Rust toolchain, поэтому `cargo fmt --check` / `clippy -D warnings` /
+> `cargo test --workspace` и живой замер спидтеста нужно выполнить локально.
+
 ## Overview
 
 | Component | Status | Notes |

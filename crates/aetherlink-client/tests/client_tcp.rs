@@ -219,8 +219,9 @@ fn app_fin_closes_flow_with_fin_ack() {
     let mut tun = FakeTun::default();
     let mut pump = DataPump::new(KEY, PAD);
     let (isn, iss) = handshake(&mut pump, &mut tun, 5000);
-    // When: FIN (no payload) -> Then: FIN+ACK out to TUN, flow forgotten
-    // (later packets for it are dropped, no mux frames ever again).
+    // When: FIN (no payload) -> Then: FIN+ACK out to TUN and the flow is
+    // half-closed: this flow never opened a mux stream, so nothing goes
+    // upstream and later packets for it are dropped silently.
     let fin = build_tcp_packet_full(
         CLIENT_IP,
         DST,
@@ -268,8 +269,10 @@ fn app_rst_forgets_flow_silently() {
     let mut tun = FakeTun::default();
     let mut pump = DataPump::new(KEY, PAD);
     handshake(&mut pump, &mut tun, 6000);
-    // When: RST arrives -> Then: nothing emitted, flow gone (no mux RST:
-    // the server would treat Rst frames as loop-fatal).
+    // When: RST arrives -> Then: nothing emitted, flow gone. No mux RST
+    // frame is ever sent (the server treats Rst as loop-fatal); a flow
+    // that already has a stream tells the relay with an empty DATA
+    // instead (see app_fin_announces_half_close_and_still_delivers_the_answer).
     let rst = build_tcp_packet_full(
         CLIENT_IP,
         DST,
@@ -469,4 +472,226 @@ fn forwarded_data_emits_prompt_ack() {
     assert!(seg.ack && !seg.syn && !seg.fin && !seg.rst);
     assert_eq!(seg.ack_num, isn.wrapping_add(1).wrapping_add(2));
     assert!(seg.payload.is_empty());
+}
+
+/// Build a data segment from the app (`CLIENT_IP:port` -> `DST:80`).
+fn data_at(port: u16, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+    build_tcp_packet(CLIENT_IP, DST, port, 80, false, true, true, seq, ack, payload)
+}
+
+#[test]
+fn app_fin_announces_half_close_and_still_delivers_the_answer() {
+    // Given: established flow with one payload upstream
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 11000);
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"hi",
+    ));
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
+    let id = frames[0].header.stream_id;
+    let _ = tun.take_outbound(); // prompt self-ack
+    let mut peer = MuxManager::new();
+    peer.register_inbound(id, &DST.to_string(), 80, false)
+        .expect("register");
+
+    // When: the app FINs (request complete, send side closed)
+    let fin = build_tcp_packet_full(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        false,
+        true,
+        false,
+        isn.wrapping_add(3),
+        iss.wrapping_add(1),
+        &[],
+    );
+    tun.inbound.push_back(fin);
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    // Then: the app gets its FIN-ACK ...
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1);
+    assert!(out[0].tcp().expect("tcp").fin);
+    // ... and the relay hears the half-close (one empty DATA), so the
+    // target socket is released instead of hanging to its own timeout.
+    assert_eq!(frames.len(), 1, "exactly the close signal");
+    assert_eq!(frames[0].header.stream_id, id);
+    let closed = peer
+        .open_data(&KEY, &frames[0].header, &frames[0].ciphertext)
+        .expect("close signal opens");
+    assert!(closed.is_empty(), "empty DATA = half-close");
+
+    // And: the answer still reaches the app (half-close is not a teardown).
+    let reply = peer.seal_data(&KEY, id, b"ok", PAD).expect("seal reply");
+    pump.receive_mux(&reply.header, &reply.ciphertext, &mut tun)
+        .expect("answer injected");
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].tcp().expect("tcp").payload, b"ok");
+
+    // And: the peer's own close ends the flow (FIN to the app, id freed).
+    let over = peer.seal_data(&KEY, id, b"", PAD).expect("seal close");
+    pump.receive_mux(&over.header, &over.ciphertext, &mut tun)
+        .expect("close injected");
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1);
+    assert!(out[0].tcp().expect("tcp").fin);
+    let after = peer.seal_data(&KEY, id, b"late", PAD).expect("seal late");
+    assert!(
+        pump.receive_mux(&after.header, &after.ciphertext, &mut tun)
+            .is_err(),
+        "flow is gone once both sides closed"
+    );
+}
+
+#[test]
+fn peer_close_fins_the_app_socket() {
+    // Given: established flow with payload upstream
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 12000);
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"hi",
+    ));
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    let id = frames[0].header.stream_id;
+    let _ = tun.take_outbound();
+    let mut peer = MuxManager::new();
+    peer.register_inbound(id, &DST.to_string(), 80, false)
+        .expect("register");
+    // When: the relay reports the stream is over (empty DATA)
+    let over = peer.seal_data(&KEY, id, b"", PAD).expect("seal close");
+    pump.receive_mux(&over.header, &over.ciphertext, &mut tun)
+        .expect("close injected");
+    // Then: the app's socket is closed, not left to hang.
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1);
+    let seg = out[0].tcp().expect("tcp");
+    assert!(seg.fin && seg.ack);
+    assert_eq!(seg.ack_num, isn.wrapping_add(1).wrapping_add(2));
+}
+
+#[test]
+fn finished_flows_free_their_stream_ids() {
+    // Given: a long-lived session (the mux has 4096 ids; a browser burns
+    // far more than that over one session, and the pump used to die there)
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let mut peer = MuxManager::new();
+    let flows = 4200u16;
+    for i in 0..flows {
+        let port = 41000u16.wrapping_add(i);
+        let isn = 20_000 + u32::from(i);
+        // SYN -> SYN-ACK
+        tun.inbound.push_back(build_tcp_packet_full(
+            CLIENT_IP,
+            DST,
+            port,
+            80,
+            true,
+            false,
+            false,
+            false,
+            false,
+            isn,
+            0,
+            &[],
+        ));
+        let frames = pump.poll_once(&mut tun).expect("syn accepted");
+        assert!(frames.is_empty());
+        let out = tun.take_outbound();
+        let iss = out[0].tcp().expect("tcp").seq;
+        // ACK -> established, then one payload byte upstream.
+        tun.inbound.push_back(build_tcp_packet_full(
+            CLIENT_IP,
+            DST,
+            port,
+            80,
+            false,
+            true,
+            false,
+            false,
+            false,
+            isn.wrapping_add(1),
+            iss.wrapping_add(1),
+            &[],
+        ));
+        let _ = pump.poll_once(&mut tun).expect("ack accepted");
+        tun.inbound.push_back(data_at(
+            port,
+            isn.wrapping_add(1),
+            iss.wrapping_add(1),
+            b"x",
+        ));
+        let frames = pump.poll_once(&mut tun).expect("payload forwarded");
+        assert_eq!(frames.len(), 2, "OPEN + DATA on flow {i}");
+        let id = frames[0].header.stream_id;
+        let _ = tun.take_outbound();
+        // FIN -> half-close announced upstream.
+        tun.inbound.push_back(build_tcp_packet_full(
+            CLIENT_IP,
+            DST,
+            port,
+            80,
+            false,
+            true,
+            false,
+            true,
+            false,
+            isn.wrapping_add(2),
+            iss.wrapping_add(1),
+            &[],
+        ));
+        let frames = pump.poll_once(&mut tun).expect("fin accepted");
+        assert_eq!(frames.len(), 1, "close signal on flow {i}");
+        let _ = tun.take_outbound();
+        // Relay closes too: the flow and its id are both released.
+        peer.register_inbound(id, &DST.to_string(), 80, false)
+            .expect("register");
+        let over = peer.seal_data(&KEY, id, b"", PAD).expect("seal close");
+        pump.receive_mux(&over.header, &over.ciphertext, &mut tun)
+            .expect("close injected");
+        let _ = tun.take_outbound();
+        let _ = peer.close(id);
+    }
+    // Then: the session still opens new streams past the old cap.
+    tun.inbound.push_back(syn(900_000));
+    let frames = pump.poll_once(&mut tun).expect("pump alive");
+    assert!(frames.is_empty());
+    let out = tun.take_outbound();
+    let iss = out[0].tcp().expect("tcp").seq;
+    tun.inbound.push_back(build_tcp_packet_full(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        false,
+        false,
+        false,
+        900_001,
+        iss.wrapping_add(1),
+        &[],
+    ));
+    let _ = pump.poll_once(&mut tun).expect("handshake completes");
+    tun.inbound.push_back(data_at(
+        41000,
+        900_001,
+        iss.wrapping_add(1),
+        b"still here",
+    ));
+    let frames = pump.poll_once(&mut tun).expect("new flow forwards");
+    assert_eq!(frames.len(), 2, "OPEN + DATA after {flows} finished flows");
 }

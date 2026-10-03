@@ -660,6 +660,10 @@ fn dead_flow_does_not_kill_healthy_flows() {
 
     // When: handshake, OPEN+DATA to the dead port first, then a healthy flow
     let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .expect("timeout");
     let nonce = [0xE3u8; 32];
     let mut sess =
         aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
@@ -689,13 +693,21 @@ fn dead_flow_does_not_kill_healthy_flows() {
         .seal_data(sess.keys.tx_key(), live, b"alive", 128)
         .expect("seal data");
     wire_help::write_frame(&mut stream, &sealed_data.header, &sealed_data.ciphertext);
-    // Then: the healthy flow still answers (dead flow isolated, loop lives).
-    let (h, c) = wire_help::read_frame(&mut stream);
-    let back = sess
-        .mux
-        .open_data(sess.keys.rx_key(), &h, &c)
-        .expect("open answer");
-    assert_eq!(back, b"alive");
+    // Then: the healthy flow still answers (dead flow isolated, loop
+    // lives). The dead flow announces itself with an empty DATA, so skip
+    // those while looking for the live answer.
+    let mut answered: Option<Vec<u8>> = None;
+    while answered.is_none() {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        if h.stream_id == live {
+            answered = Some(
+                sess.mux
+                    .open_data(sess.keys.rx_key(), &h, &c)
+                    .expect("open answer"),
+            );
+        }
+    }
+    assert_eq!(answered.expect("healthy flow answered"), b"alive");
 
     drop(stream);
     server.join().expect("server thread");
@@ -1013,6 +1025,163 @@ fn burst_and_edge_traffic_keeps_server_alive() {
     // Then: every non-empty payload echoed back, byte-exact.
     assert_eq!(got_tcp, want_tcp, "every TCP payload echoes");
     assert_eq!(got_udp, want_udp, "every UDP payload echoes");
+
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+/// Bulk-upload target: drains the stream to EOF, then answers with the
+/// exact byte count (8B BE). A measuring server (speedtest, a file sink)
+/// behaves the same, so a chunk lost on the way up shows up as a short
+/// count instead of a silent hang.
+fn tcp_sink() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sink bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("sink accept");
+        let mut buf = vec![0u8; 65535];
+        let mut total: u64 = 0;
+        while let Ok(n) = sock.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+        }
+        let _ = sock.write_all(&total.to_be_bytes());
+    });
+    port
+}
+
+#[test]
+fn bulk_upload_arrives_intact_and_closes() {
+    // Given: a counting sink behind the tunnel
+    let sink = tcp_sink();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("timeout");
+    let nonce = [0xE9u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    // When: 320KB in 8KB chunks, then the app's half-close.
+    let id = sess.mux.open_tcp("127.0.0.1", sink).expect("open");
+    let sealed_open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), id, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+    let chunk = vec![0x5Au8; 8192];
+    let mut sent: u64 = 0;
+    for _ in 0..40 {
+        let sealed = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), id, &chunk, 128)
+            .expect("seal data");
+        wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+        sent += chunk.len() as u64;
+    }
+    let sealed_fin = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), id, b"", 128)
+        .expect("seal half-close");
+    wire_help::write_frame(&mut stream, &sealed_fin.header, &sealed_fin.ciphertext);
+
+    // Then: the sink counted every byte — no chunk was dropped on the way
+    // up, and the half-close reached the target so it could answer.
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.stream_id, id);
+    let back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open count");
+    assert_eq!(back.len(), 8, "the sink answers with its byte count");
+    let counted = u64::from_be_bytes(back.try_into().expect("8 bytes"));
+    assert_eq!(counted, sent, "upload must arrive intact");
+
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn failed_relay_closes_the_stream_instead_of_hanging() {
+    // Given: a certainly-closed port plus a healthy echo target
+    let echo = tcp_echo();
+    let probe = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead_port = probe.local_addr().expect("addr").port();
+    drop(probe);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    let nonce = [0xEAu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    // When: a payload for a target that cannot be dialed
+    let dead = sess.mux.open_tcp("127.0.0.1", dead_port).expect("open dead");
+    let sealed_open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), dead, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+    let sealed_data = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), dead, b"void", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed_data.header, &sealed_data.ciphertext);
+
+    // Then: the peer is told the stream is over (one empty DATA) instead
+    // of waiting on bytes nothing will ever deliver.
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.stream_id, dead, "close signal for the dead stream");
+    let back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open close");
+    assert!(back.is_empty(), "empty DATA = stream closed");
+
+    // And: the session is intact — a healthy flow still answers.
+    let live = sess.mux.open_tcp("127.0.0.1", echo).expect("open live");
+    let sealed_open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), live, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+    let sealed_data = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), live, b"alive", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed_data.header, &sealed_data.ciphertext);
+    let mut answered: Option<Vec<u8>> = None;
+    while answered.is_none() {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        if h.stream_id == live {
+            answered = Some(
+                sess.mux
+                    .open_data(sess.keys.rx_key(), &h, &c)
+                    .expect("open answer"),
+            );
+        }
+    }
+    assert_eq!(answered.expect("live answered"), b"alive");
 
     drop(stream);
     server.join().expect("server thread");

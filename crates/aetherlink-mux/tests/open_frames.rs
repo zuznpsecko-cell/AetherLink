@@ -95,3 +95,29 @@ fn open_leaves_data_sequencing_alone() {
     // Then: DATA still starts at seq 1 (OPEN lives in seq 0 + own nonce).
     assert_eq!(data.header.sequence, 1);
 }
+
+#[test]
+fn finished_flows_release_their_id() {
+    // Given: room for two flows and a session that opens far more than
+    // that over its lifetime (a browser burns thousands in a minute).
+    let mut mux = MuxManager::with_max(2);
+    let a = mux.open_tcp("93.184.216.34", 443).expect("first");
+    let b = mux.open_tcp("93.184.216.34", 443).expect("second");
+    // Then: the cap holds while both are open ...
+    assert!(
+        mux.open_tcp("93.184.216.34", 443).is_err(),
+        "cap of two is enforced"
+    );
+    // ... and a finished flow frees its id for the next one.
+    mux.close(a).expect("close");
+    let c = mux.open_tcp("93.184.216.34", 443).expect("recycled");
+    assert_ne!(c, b, "a live id is never handed out twice");
+    mux.close(b).expect("close");
+    mux.close(c).expect("close");
+    // And: eight flows, one after another, all get an id.
+    for i in 0..8 {
+        let id = mux.open_tcp("93.184.216.34", 443).expect("recycled again");
+        assert!(mux.is_open(id), "flow {i} is usable");
+        mux.close(id).expect("close");
+    }
+}
