@@ -110,6 +110,35 @@ const WORKER_QUEUE: usize = 128;
 /// being ACKed) instead of losing bytes. Bound it, because this loop also
 /// carries every other stream of the session.
 const SEND_HOLD: Duration = Duration::from_millis(1000);
+/// Poll step inside the bounded wait below.
+const SEND_HOLD_POLL: Duration = Duration::from_millis(2);
+
+/// Outcome of pushing one message toward a worker with a bounded wait
+/// (std has no send_timeout on SyncSender; this is its manual equivalent).
+enum SendHoldFail {
+    /// Still full after SEND_HOLD: payload dropped, caller closes stream.
+    Stalled(WorkerMsg),
+    /// Worker exited: payload returned for redial.
+    Gone(WorkerMsg),
+}
+
+fn send_hold(tx: &mpsc::SyncSender<WorkerMsg>, msg: WorkerMsg) -> Result<(), SendHoldFail> {
+    let start = Instant::now();
+    let mut msg = msg;
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Disconnected(m)) => return Err(SendHoldFail::Gone(m)),
+            Err(mpsc::TrySendError::Full(m)) => {
+                if start.elapsed() >= SEND_HOLD {
+                    return Err(SendHoldFail::Stalled(m));
+                }
+                msg = m;
+                std::thread::sleep(SEND_HOLD_POLL);
+            }
+        }
+    }
+}
 
 /// Poll quantum of a stream worker: socket reads stay responsive to newly
 /// arrived payloads and to session end. 10ms keeps added latency far under
@@ -274,9 +303,9 @@ fn forward_tcp(
         } else {
             WorkerMsg::Data(pt)
         };
-        match tx.send_timeout(msg, SEND_HOLD) {
+        match send_hold(&tx, msg) {
             Ok(()) => return true,
-            Err(mpsc::SendTimeoutError::Timeout(_)) => {
+            Err(SendHoldFail::Stalled(_)) => {
                 // Worker buried behind a stalled target: hold the peer's
                 // socket no longer, then let it reset and retry rather
                 // than eating a hole it can never repair.
@@ -287,7 +316,7 @@ fn forward_tcp(
                 workers.remove(&id);
                 return false;
             }
-            Err(mpsc::SendTimeoutError::Disconnected(m)) => {
+            Err(SendHoldFail::Gone(m)) => {
                 // Worker gone (previous failure): re-dial below.
                 workers.remove(&id);
                 pt = match m {
@@ -380,7 +409,9 @@ fn close_stream(
         Some(sealed) => match write_sealed(stream, &sealed.header, &sealed.ciphertext) {
             Ok(()) => true,
             Err(e) => {
-                debug_log(&format!("tunnel: close id={id} write failed ({e}), closing"));
+                debug_log(&format!(
+                    "tunnel: close id={id} write failed ({e}), closing"
+                ));
                 false
             }
         },

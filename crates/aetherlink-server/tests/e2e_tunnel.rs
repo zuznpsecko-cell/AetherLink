@@ -1136,7 +1136,10 @@ fn failed_relay_closes_the_stream_instead_of_hanging() {
         aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
 
     // When: a payload for a target that cannot be dialed
-    let dead = sess.mux.open_tcp("127.0.0.1", dead_port).expect("open dead");
+    let dead = sess
+        .mux
+        .open_tcp("127.0.0.1", dead_port)
+        .expect("open dead");
     let sealed_open = sess
         .mux
         .seal_open_tcp(sess.keys.tx_key(), dead, 128)

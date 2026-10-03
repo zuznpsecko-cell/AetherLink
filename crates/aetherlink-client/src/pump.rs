@@ -751,7 +751,17 @@ impl DataPump {
                         &[],
                     );
                     let _ = tun.send_packet(&fin);
-                    let _ = self.forget_tcp(&key, false);
+                    // The flow is already removed above: release its maps
+                    // and mux id here. forget_tcp would find nothing and
+                    // leak the id until the 4096 cap mutes the session.
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tcp flow {}:{} -> {}:{} closed by peer, id {id} freed",
+                        flow.client_ip, flow.client_port, flow.server_ip, flow.server_port
+                    ));
+                    self.tcp_by_id.remove(&id);
+                    self.by_id.remove(&id);
+                    self.by_tuple.remove(&key);
+                    let _ = self.mux.close(id);
                     return Ok(());
                 }
                 let pkt = build_tcp_packet_full(

@@ -476,7 +476,9 @@ fn forwarded_data_emits_prompt_ack() {
 
 /// Build a data segment from the app (`CLIENT_IP:port` -> `DST:80`).
 fn data_at(port: u16, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
-    build_tcp_packet(CLIENT_IP, DST, port, 80, false, true, true, seq, ack, payload)
+    build_tcp_packet(
+        CLIENT_IP, DST, port, 80, false, true, true, seq, ack, payload,
+    )
 }
 
 #[test]
@@ -686,12 +688,8 @@ fn finished_flows_free_their_stream_ids() {
         &[],
     ));
     let _ = pump.poll_once(&mut tun).expect("handshake completes");
-    tun.inbound.push_back(data_at(
-        41000,
-        900_001,
-        iss.wrapping_add(1),
-        b"still here",
-    ));
+    tun.inbound
+        .push_back(data_at(41000, 900_001, iss.wrapping_add(1), b"still here"));
     let frames = pump.poll_once(&mut tun).expect("new flow forwards");
     assert_eq!(frames.len(), 2, "OPEN + DATA after {flows} finished flows");
 }
