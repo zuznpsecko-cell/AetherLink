@@ -95,16 +95,25 @@ impl MuxManager {
         }
     }
 
+    /// Next free id. Ids are recycled once a stream closes (a session
+    /// outlives thousands of connections), so the cursor skips ids that
+    /// are still in use: handing a live id out twice would mix two flows
+    /// into one replay window and one route.
     fn alloc_id(&mut self) -> Result<u16> {
         if self.entries.len() >= self.max {
             return Err(MuxError::Internal("too many streams".to_string()));
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(crate::STREAM_ID_INCREMENT);
-        if self.next_id == 0 {
-            self.next_id = crate::CLIENT_STREAM_ID_START;
+        for _ in 0..self.max {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(crate::STREAM_ID_INCREMENT);
+            if self.next_id == 0 {
+                self.next_id = crate::CLIENT_STREAM_ID_START;
+            }
+            if !self.entries.contains_key(&id) {
+                return Ok(id);
+            }
         }
-        Ok(id)
+        Err(MuxError::Internal("no free stream id".to_string()))
     }
 
     /// Open TCP stream, returns odd client id.

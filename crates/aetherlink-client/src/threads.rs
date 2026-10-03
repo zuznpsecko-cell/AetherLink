@@ -28,6 +28,10 @@ use crate::pump::DataPump;
 /// must not pay 200ms per turn) and stop latency. Replies still arrive
 /// instantly when present; 10ms only prices true idleness.
 const READ_TIMEOUT: Duration = Duration::from_millis(10);
+/// Same read while the TUN is actively producing: an app in mid-upload
+/// gets its device drained again at once instead of paying the idle
+/// quantum per turn (the TUN-side and the wire side share one thread).
+const READ_TIMEOUT_BUSY: Duration = Duration::from_millis(1);
 /// Bound for one frame body across stalls (fail closed eventually).
 const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle sleep in the TUN->wire loop (no busy spin on an empty TUN).
@@ -143,13 +147,21 @@ where
     let (stop_tun, pump_tun, tun_tun) = (Arc::clone(&stop), Arc::clone(&pump), Arc::clone(&tun));
     let tun_thread = std::thread::spawn(move || {
         while !stop_tun.load(Ordering::SeqCst) {
+            // `None` = lock poisoned (fatal); `Some(Err(..))` = one bad
+            // packet, which must never end the session.
             let frames = (|| {
                 let mut tun_guard = tun_tun.lock().ok()?;
                 let mut pump_guard = pump_tun.lock().ok()?;
-                pump_guard.poll_once(&mut *tun_guard).ok()
+                Some(pump_guard.poll_once(&mut *tun_guard))
             })();
             match frames {
-                Some(fs) => {
+                Some(Err(e)) => {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tun drain error: {e}, continuing"
+                    ));
+                    std::thread::sleep(TUN_IDLE);
+                }
+                Some(Ok(fs)) => {
                     if !fs.is_empty() {
                         aetherlink_netstack::debug_log(&format!(
                             "pump: tun->wire {} frame(s)",
@@ -255,15 +267,20 @@ where
     aetherlink_netstack::debug_log("pump: tls thread spawned");
     let thread = std::thread::spawn(move || {
         let mut pump = DataPump::with_mux(sess.mux, *sess.keys.tx_key(), *sess.keys.rx_key(), pad);
+        // Socket read timeout currently installed (switched between the
+        // idle and the busy quantum only when it actually changes).
+        let mut read_quantum = READ_TIMEOUT;
         loop {
             if stop_loop.load(Ordering::SeqCst) {
                 break;
             }
             // TUN -> wire: drain all queued packets.
+            let mut busy = false;
             match tun.lock() {
                 Ok(mut guard) => match pump.poll_once(&mut *guard) {
                     Ok(frames) => {
-                        if !frames.is_empty() {
+                        busy = !frames.is_empty();
+                        if busy {
                             aetherlink_netstack::debug_log(&format!(
                                 "pump: tls tun->wire {} frame(s)",
                                 frames.len()
@@ -284,13 +301,36 @@ where
                         }
                     }
                     Err(e) => {
-                        aetherlink_netstack::debug_log(&format!("pump: tls tun drain: {e}"));
-                        break;
+                        // One bad packet (truncated, unsupported, a full
+                        // device on the way back) must never end the
+                        // session: back off and keep pumping.
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tls tun drain error: {e}, continuing"
+                        ));
+                        std::thread::sleep(TUN_IDLE);
                     }
                 },
                 Err(_) => {
                     aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
                     break;
+                }
+            }
+            // An app mid-upload must not wait out the idle quantum: while
+            // the device is producing, the wire read only peeks.
+            let want = if busy {
+                READ_TIMEOUT_BUSY
+            } else {
+                READ_TIMEOUT
+            };
+            if want != read_quantum {
+                match stream.get_mut().set_read_timeout(Some(want)) {
+                    Ok(()) => read_quantum = want,
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tls read timeout failed ({e}), thread ends"
+                        ));
+                        break;
+                    }
                 }
             }
             // Inject one received frame; false ends the thread.

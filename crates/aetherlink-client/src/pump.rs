@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 use aetherlink_frame::codec::FrameHeader;
 use aetherlink_mux::manager::{MuxManager, SealedFrame};
@@ -27,6 +28,9 @@ struct FlowInfo {
     server_ip: Ipv4Addr,
     server_port: u16,
     is_udp: bool,
+    /// Last packet seen (UDP flows are reaped when it goes stale; TCP
+    /// flows end explicitly, on FIN/RST).
+    last_seen: Instant,
 }
 
 /// Link-local discovery has no business crossing a VPN (TTL 1 by design):
@@ -58,7 +62,24 @@ enum TcpState {
     SynReceived,
     /// Handshake complete; payload flows to/from mux.
     Established,
+    /// The app sent FIN: its bytes are all upstream (relay got a
+    /// half-close), but the peer may still be answering, so the flow stays
+    /// alive for inbound data until the peer ends or the grace expires.
+    HalfClosed,
 }
+
+/// Grace period for a half-closed flow: long enough for any target to
+/// answer a finished request, short enough that abandoned flows do not
+/// pin their mux id (ids are the one scarce resource here).
+const HALF_CLOSED_GRACE: Duration = Duration::from_secs(120);
+
+/// Idle time after which a UDP flow is forgotten. DNS and the like come
+/// and go in milliseconds; a flow silent this long is over (and its mux
+/// id is worth more than the guess that it might return).
+const UDP_IDLE_GRACE: Duration = Duration::from_secs(300);
+
+/// How often stale flows are looked for (a poll-time scan, not per packet).
+const REAP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One terminated TCP flow: the app completes TCP against us, only payload
 /// crosses the mux (OPEN once, then DATA per segment).
@@ -80,10 +101,8 @@ struct TcpFlow {
     /// Payload bytes accepted from the client so far (for ACK numbers).
     client_bytes: u32,
     state: TcpState,
-    /// TEMP-DIAG(upload): cumulative sealed bytes (mirrors client_bytes as u64).
-    sealed_total: u64,
-    /// TEMP-DIAG(upload): whether any reply was ever injected for this flow.
-    got_reply: bool,
+    /// When the app half-closed (`None` while it can still send).
+    closed_at: Option<Instant>,
 }
 
 /// Terminating bridge between TUN packets and sealed mux frames.
@@ -99,6 +118,8 @@ pub struct DataPump {
     tcp: HashMap<FlowKey, TcpFlow>,
     tcp_by_id: HashMap<u16, FlowKey>,
     iss_next: u32,
+    /// Next sweep for stale flows (half-closed TCP, idle UDP).
+    next_reap: Instant,
 }
 
 impl DataPump {
@@ -121,6 +142,7 @@ impl DataPump {
             tcp: HashMap::new(),
             tcp_by_id: HashMap::new(),
             iss_next: 1_000_000,
+            next_reap: Instant::now() + REAP_INTERVAL,
         }
     }
 
@@ -140,6 +162,7 @@ impl DataPump {
             tcp: HashMap::new(),
             tcp_by_id: HashMap::new(),
             iss_next: 1_000_000,
+            next_reap: Instant::now() + REAP_INTERVAL,
         }
     }
 
@@ -148,6 +171,119 @@ impl DataPump {
         let iss = self.iss_next;
         self.iss_next = self.iss_next.wrapping_add(1);
         iss
+    }
+
+    /// Seal the upstream half-close signal for a flow (one empty DATA).
+    ///
+    /// An empty payload never occurs on the wire from a live sender (pure
+    /// ACKs are filtered out), so the relay can read it unambiguously as
+    /// "this stream is finished, shut the target socket down".
+    fn close_signal(&mut self, flow: &TcpFlow) -> Vec<SealedFrame> {
+        let Some(id) = flow.id else {
+            return Vec::new();
+        };
+        if !self.mux.is_open(id) {
+            return Vec::new();
+        }
+        match self.mux.seal_data(&self.tx, id, &[], self.pad) {
+            Ok(sealed) => vec![sealed],
+            Err(e) => {
+                aetherlink_netstack::debug_log(&format!(
+                    "pump: close signal id={id} seal failed: {e}"
+                ));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Forward one in-order payload upstream: OPEN the mux stream on first
+    /// sight, then one DATA frame, then confirm the bytes to the app.
+    ///
+    /// On any failure the flow is put back before returning `Err`, so the
+    /// caller must insert it only on success.
+    fn seal_payload(
+        &mut self,
+        fk: &FlowKey,
+        flow: &mut TcpFlow,
+        payload: &[u8],
+        tun: &mut dyn TunPackets,
+    ) -> Result<Vec<SealedFrame>> {
+        let mut frames = Vec::new();
+        if flow.id.is_none() {
+            let id = match self
+                .mux
+                .open_tcp(&flow.server_ip.to_string(), flow.server_port)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    self.tcp.insert(*fk, *flow);
+                    return Err(e.into());
+                }
+            };
+            aetherlink_netstack::debug_log(&format!(
+                "pump: tcp open id={id} -> {dst}:{dport}",
+                dst = flow.server_ip,
+                dport = flow.server_port,
+            ));
+            let open = match self.mux.seal_open_tcp(&self.tx, id, self.pad) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.tcp.insert(*fk, *flow);
+                    return Err(e.into());
+                }
+            };
+            self.by_tuple.insert(*fk, id);
+            self.by_id.insert(
+                id,
+                FlowInfo {
+                    client_ip: flow.client_ip,
+                    client_port: flow.client_port,
+                    server_ip: flow.server_ip,
+                    server_port: flow.server_port,
+                    is_udp: false,
+                    last_seen: Instant::now(),
+                },
+            );
+            self.tcp_by_id.insert(id, *fk);
+            flow.id = Some(id);
+            frames.push(open);
+        }
+        let id = flow.id.expect("just opened");
+        let data = match self.mux.seal_data(&self.tx, id, payload, self.pad) {
+            Ok(f) => f,
+            Err(e) => {
+                self.tcp.insert(*fk, *flow);
+                return Err(e.into());
+            }
+        };
+        flow.client_bytes = flow.client_bytes.wrapping_add(payload.len() as u32);
+        frames.push(data);
+        // Split-TCP self-ack: confirm receipt hop-by-hop right away
+        // instead of waiting for the target's reply to piggyback on.
+        // Without it bulk upload stalls past cwnd (target ACKs never
+        // cross the relay as frames) and the app measures ~zero
+        // (seen live: 3KB/s then stall). Best-effort: a lost ack is
+        // recovered by the next reply/ack carrying newer numbers.
+        let ackpkt = build_tcp_packet_full(
+            flow.server_ip,
+            flow.client_ip,
+            flow.server_port,
+            flow.client_port,
+            false,
+            true,
+            false,
+            false,
+            false,
+            flow.server_next,
+            flow.client_isn
+                .wrapping_add(1)
+                .wrapping_add(flow.client_bytes),
+            &[],
+        );
+        if let Err(e) = tun.send_packet(&ackpkt) {
+            aetherlink_netstack::debug_log(&format!("pump: tcp self-ack send failed: {e}"));
+        }
+        Ok(frames)
     }
 
     /// Emit a SYN-ACK for a terminated flow toward TUN.
@@ -170,25 +306,78 @@ impl DataPump {
         Ok(())
     }
 
-    /// Forget a TCP flow everywhere (RST/FIN path, always silent upstream:
-    /// the server treats Rst frames as loop-fatal, so none are ever sent).
-    fn forget_tcp(&mut self, fk: &FlowKey) {
-        if let Some(flow) = self.tcp.remove(fk) {
-            // TEMP-DIAG(upload): lifetime totals per forgotten flow.
-            aetherlink_netstack::debug_log(&format!(
-                "TEMP-DIAG tcp flow {}:{} -> {}:{} forgotten sealed={}B got_reply={}",
-                flow.client_ip,
-                flow.client_port,
-                flow.server_ip,
-                flow.server_port,
-                flow.sealed_total,
-                flow.got_reply,
-            ));
-            if let Some(id) = flow.id {
-                self.tcp_by_id.remove(&id);
-                self.by_id.remove(&id);
-                self.by_tuple.remove(fk);
+    /// Forget a TCP flow everywhere.
+    ///
+    /// `announce` emits the upstream half-close (one empty DATA frame) so
+    /// the relay can shut its socket: without it every finished connection
+    /// keeps a relay thread and socket until the target's own timeout, and
+    /// ids are never recycled (the pump dies at the mux cap). It is skipped
+    /// when the peer closed first (it already knows).
+    fn forget_tcp(&mut self, fk: &FlowKey, announce: bool) -> Vec<SealedFrame> {
+        let mut out = Vec::new();
+        let Some(flow) = self.tcp.remove(fk) else {
+            return out;
+        };
+        aetherlink_netstack::debug_log(&format!(
+            "pump: tcp flow {}:{} -> {}:{} forgotten (state {:?})",
+            flow.client_ip, flow.client_port, flow.server_ip, flow.server_port, flow.state
+        ));
+        if let Some(id) = flow.id {
+            self.tcp_by_id.remove(&id);
+            self.by_id.remove(&id);
+            self.by_tuple.remove(fk);
+            if announce && self.mux.is_open(id) {
+                match self.mux.seal_data(&self.tx, id, &[], self.pad) {
+                    Ok(sealed) => out.push(sealed),
+                    Err(e) => aetherlink_netstack::debug_log(&format!(
+                        "pump: close-signal id={id} seal failed: {e}"
+                    )),
+                }
             }
+            // Free the id: the mux has a hard cap and a session lives far
+            // longer than any one connection.
+            let _ = self.mux.close(id);
+        }
+        out
+    }
+
+    /// Forget half-closed flows whose peer never answered (bounds id use).
+    fn reap_half_closed(&mut self, now: Instant) -> Vec<SealedFrame> {
+        let mut out = Vec::new();
+        let stale: Vec<FlowKey> = self
+            .tcp
+            .values()
+            .filter(|f| {
+                f.closed_at
+                    .is_some_and(|t| now.duration_since(t) > HALF_CLOSED_GRACE)
+            })
+            .map(|f| f.key)
+            .collect();
+        for fk in stale {
+            out.extend(self.forget_tcp(&fk, false));
+        }
+        out
+    }
+
+    /// Forget UDP flows that went silent (bounds id use: every DNS query
+    /// used to keep its id for the whole session).
+    fn reap_idle_udp(&mut self, now: Instant) {
+        let stale: Vec<(FlowKey, u16)> = self
+            .by_tuple
+            .iter()
+            .filter(|(fk, id)| {
+                fk.is_udp
+                    && self
+                        .by_id
+                        .get(id)
+                        .is_some_and(|f| now.duration_since(f.last_seen) > UDP_IDLE_GRACE)
+            })
+            .map(|(fk, id)| (*fk, *id))
+            .collect();
+        for (fk, id) in stale {
+            self.by_tuple.remove(&fk);
+            self.by_id.remove(&id);
+            let _ = self.mux.close(id);
         }
     }
 
@@ -198,7 +387,16 @@ impl DataPump {
     /// flows with empty payload (pure ACKs) yield nothing; truncated or
     /// unsupported packets are dropped fail-closed.
     pub fn poll_once(&mut self, tun: &mut dyn TunPackets) -> Result<Vec<SealedFrame>> {
+        // Sweep for finished flows once a second: ids are a scarce
+        // resource (the mux caps them) and a session outlives thousands
+        // of connections.
+        let now = Instant::now();
         let mut out = Vec::new();
+        if now >= self.next_reap {
+            self.next_reap = now + REAP_INTERVAL;
+            out.extend(self.reap_half_closed(now));
+            self.reap_idle_udp(now);
+        }
         while let Some(raw) = tun.try_recv()? {
             if let Some(frames) = self.pump_one(&raw, tun)? {
                 out.extend(frames);
@@ -238,10 +436,12 @@ impl DataPump {
                     dst_port: seg.dst_port,
                     is_udp: false,
                 };
-                // RST always forgets the flow, silently (never RST upstream).
+                // RST forgets the flow and tells the relay to close: an
+                // abandoned stream would otherwise hold a socket, a thread
+                // and a mux id until the target's own timeout.
                 if seg.rst {
-                    self.forget_tcp(&fk);
-                    return Ok(None);
+                    let frames = self.forget_tcp(&fk, true);
+                    return Ok(Some(frames));
                 }
                 // Bare SYN on an unknown flow opens termination.
                 if !self.tcp.contains_key(&fk) {
@@ -259,8 +459,7 @@ impl DataPump {
                             server_next: iss.wrapping_add(1),
                             client_bytes: 0,
                             state: TcpState::SynReceived,
-                            sealed_total: 0,
-                            got_reply: false,
+                            closed_at: None,
                         };
                         self.send_synack(&flow, tun)?;
                         aetherlink_netstack::debug_log(&format!(
@@ -312,6 +511,7 @@ impl DataPump {
                                     server_ip: flow.server_ip,
                                     server_port: flow.server_port,
                                     is_udp: false,
+                                    last_seen: Instant::now(),
                                 },
                             );
                             self.tcp_by_id.insert(id, fk);
@@ -346,8 +546,26 @@ impl DataPump {
                         return Ok(None);
                     }
                 }
-                // FIN closes: FIN-ACK out, forget the flow.
+                // FIN: forward whatever payload it carries (some stacks
+                // combine FIN with the last bytes), then half-close. The
+                // flow is NOT forgotten here: an app that closes its send
+                // side still has to receive the answer (every HTTP request
+                // sent with `Connection: close`). It dies on the peer's
+                // end-of-stream or when the grace period expires.
                 if seg.fin {
+                    let mut frames = Vec::new();
+                    if !seg.payload.is_empty() && flow.state != TcpState::HalfClosed {
+                        let expected = flow
+                            .client_isn
+                            .wrapping_add(1)
+                            .wrapping_add(flow.client_bytes);
+                        if seg.seq == expected {
+                            match self.seal_payload(&fk, &mut flow, &seg.payload, tun) {
+                                Ok(f) => frames.extend(f),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
                     let finack = build_tcp_packet_full(
                         flow.server_ip,
                         flow.client_ip,
@@ -364,8 +582,24 @@ impl DataPump {
                             .wrapping_add(1),
                         &[],
                     );
-                    tun.send_packet(&finack)?;
-                    self.forget_tcp(&fk);
+                    if let Err(e) = tun.send_packet(&finack) {
+                        // Device refused the FIN: keep the flow so the app's
+                        // retransmit can close it again.
+                        self.tcp.insert(fk, flow);
+                        return Err(e.into());
+                    }
+                    if flow.state != TcpState::HalfClosed {
+                        flow.state = TcpState::HalfClosed;
+                        flow.closed_at = Some(Instant::now());
+                        frames.extend(self.close_signal(&flow));
+                    }
+                    self.tcp.insert(fk, flow);
+                    return Ok(Some(frames));
+                }
+                // Half-closed: the app is done sending. Stray late payload
+                // is ignored; inbound data still flows (see FIN above).
+                if flow.state == TcpState::HalfClosed {
+                    self.tcp.insert(fk, flow);
                     return Ok(None);
                 }
                 // Pure ACKs/keepalives: silence.
@@ -392,81 +626,12 @@ impl DataPump {
                     return Ok(None);
                 }
                 // Payload: OPEN the mux stream once, then DATA per segment.
-                let mut frames = Vec::new();
-                if flow.id.is_none() {
-                    let id = match self
-                        .mux
-                        .open_tcp(&flow.server_ip.to_string(), flow.server_port)
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            self.tcp.insert(fk, flow);
-                            return Err(e.into());
-                        }
-                    };
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tcp open id={id} -> {dst}:{dport}",
-                        dst = flow.server_ip,
-                        dport = flow.server_port,
-                    ));
-                    let open = match self.mux.seal_open_tcp(&self.tx, id, self.pad) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            self.tcp.insert(fk, flow);
-                            return Err(e.into());
-                        }
-                    };
-                    self.by_tuple.insert(fk, id);
-                    self.by_id.insert(
-                        id,
-                        FlowInfo {
-                            client_ip: flow.client_ip,
-                            client_port: flow.client_port,
-                            server_ip: flow.server_ip,
-                            server_port: flow.server_port,
-                            is_udp: false,
-                        },
-                    );
-                    self.tcp_by_id.insert(id, fk);
-                    flow.id = Some(id);
-                    frames.push(open);
-                }
-                let id = flow.id.expect("just opened");
-                let data = match self.mux.seal_data(&self.tx, id, &seg.payload, self.pad) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        self.tcp.insert(fk, flow);
-                        return Err(e.into());
-                    }
+                // On error the helper has already restored the flow, so it
+                // must not be inserted again (tables stay in sync).
+                let frames = match self.seal_payload(&fk, &mut flow, &seg.payload, tun) {
+                    Ok(frames) => frames,
+                    Err(e) => return Err(e),
                 };
-                flow.client_bytes = flow.client_bytes.wrapping_add(seg.payload.len() as u32);
-                flow.sealed_total += seg.payload.len() as u64;
-                frames.push(data);
-                // Split-TCP self-ack: confirm receipt hop-by-hop right away
-                // instead of waiting for the target's reply to piggyback on.
-                // Without it bulk upload stalls past cwnd (target ACKs never
-                // cross the relay as frames) and the app measures ~zero
-                // (seen live: 3KB/s then stall). Best-effort: a lost ack is
-                // recovered by the next reply/ack carrying newer numbers.
-                let ackpkt = build_tcp_packet_full(
-                    flow.server_ip,
-                    flow.client_ip,
-                    flow.server_port,
-                    flow.client_port,
-                    false,
-                    true,
-                    false,
-                    false,
-                    false,
-                    flow.server_next,
-                    flow.client_isn
-                        .wrapping_add(1)
-                        .wrapping_add(flow.client_bytes),
-                    &[],
-                );
-                if let Err(e) = tun.send_packet(&ackpkt) {
-                    aetherlink_netstack::debug_log(&format!("pump: tcp self-ack send failed: {e}"));
-                }
                 self.tcp.insert(fk, flow);
                 Ok(Some(frames))
             }
@@ -486,6 +651,9 @@ impl DataPump {
                     is_udp: true,
                 };
                 if let Some(&id) = self.by_tuple.get(&fk) {
+                    if let Some(info) = self.by_id.get_mut(&id) {
+                        info.last_seen = Instant::now();
+                    }
                     let sealed = self
                         .mux
                         .seal_datagram(&self.tx, id, &dgram.payload, self.pad)?;
@@ -508,6 +676,7 @@ impl DataPump {
                             server_ip: parsed.dst,
                             server_port: dgram.dst_port,
                             is_udp: true,
+                            last_seen: Instant::now(),
                         },
                     );
                     let open = self.mux.seal_open_udp(&self.tx, id, self.pad)?;
@@ -558,6 +727,43 @@ impl DataPump {
                         )));
                     }
                 };
+                // Empty DATA = the relay is done with this stream (clean
+                // EOF or a failed relay). Close the app's socket instead of
+                // leaving it to hang until the app's own timeout: a dead
+                // upload is far better than a stalled one (seen live: 0.00
+                // on speedtest upload, every stream waiting on nothing).
+                if payload.is_empty() {
+                    aetherlink_netstack::debug_log(&format!("pump: data id={id} closed by peer"));
+                    let fin = build_tcp_packet_full(
+                        flow.server_ip,
+                        flow.client_ip,
+                        flow.server_port,
+                        flow.client_port,
+                        false,
+                        true,
+                        false,
+                        true,
+                        false,
+                        flow.server_next,
+                        flow.client_isn
+                            .wrapping_add(1)
+                            .wrapping_add(flow.client_bytes),
+                        &[],
+                    );
+                    let _ = tun.send_packet(&fin);
+                    // The flow is already removed above: release its maps
+                    // and mux id here. forget_tcp would find nothing and
+                    // leak the id until the 4096 cap mutes the session.
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tcp flow {}:{} -> {}:{} closed by peer, id {id} freed",
+                        flow.client_ip, flow.client_port, flow.server_ip, flow.server_port
+                    ));
+                    self.tcp_by_id.remove(&id);
+                    self.by_id.remove(&id);
+                    self.by_tuple.remove(&key);
+                    let _ = self.mux.close(id);
+                    return Ok(());
+                }
                 let pkt = build_tcp_packet_full(
                     flow.server_ip,
                     flow.client_ip,
@@ -582,15 +788,6 @@ impl DataPump {
                     flow.server_next = flow.server_next.wrapping_sub(payload.len() as u32);
                     self.tcp.insert(key, flow);
                     return Err(e.into());
-                }
-                // TEMP-DIAG(upload): first injected reply per flow.
-                if !flow.got_reply {
-                    flow.got_reply = true;
-                    aetherlink_netstack::debug_log(&format!(
-                        "TEMP-DIAG tcp id={id} first reply {}B after {}B sealed",
-                        payload.len(),
-                        flow.sealed_total
-                    ));
                 }
                 self.tcp.insert(key, flow);
                 Ok(())
