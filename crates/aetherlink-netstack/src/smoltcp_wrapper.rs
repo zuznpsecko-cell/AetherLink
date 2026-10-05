@@ -76,6 +76,8 @@ pub struct TcpSegment {
     pub seq: u32,
     /// Acknowledgment number.
     pub ack_num: u32,
+    /// Receive window the sender advertises (flow control).
+    pub window: u16,
     /// Segment payload.
     pub payload: Vec<u8>,
 }
@@ -137,6 +139,7 @@ pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
                 fin: tcp.fin(),
                 seq: tcp.seq_number().0 as u32,
                 ack_num: tcp.ack_number().0 as u32,
+                window: tcp.window_len(),
                 payload: body[header..].to_vec(),
             })
         }
@@ -218,6 +221,67 @@ pub fn build_tcp_packet_full(
         tcp.set_ack_number(TcpSeqNumber(ack_num as i32));
         tcp.set_header_len(TCP_HEADER as u8);
         tcp.set_window_len(65535);
+        tcp.set_syn(syn);
+        tcp.set_ack(ack);
+        tcp.set_psh(psh);
+        tcp.set_fin(fin);
+        tcp.set_rst(rst);
+        tcp.payload_mut()[..payload.len()].copy_from_slice(payload);
+        tcp.fill_checksum(&ip_addr(src), &ip_addr(dst));
+    }
+    {
+        let mut ip = Ipv4Packet::new_checked(&mut buf[..]).expect("sized ip buffer");
+        ip.set_version(4);
+        ip.set_header_len(IPV4_HEADER as u8);
+        ip.set_total_len(total as u16);
+        ip.set_next_header(IpProtocol::Tcp);
+        ip.set_src_addr(src.into());
+        ip.set_dst_addr(dst.into());
+        ip.fill_checksum();
+    }
+    buf
+}
+
+/// Build one IPv4/TCP packet with an explicit receive window.
+///
+/// Same as `build_tcp_packet_full` but the window is the caller's: split-TCP
+/// has to close the window when its own uplink is backed up. Advertising a
+/// constant 65535 (as the other builders do) tells the app to send at local
+/// LAN speed into a tunnel that drains an order of magnitude slower — the
+/// surplus is then dropped somewhere upstream with no way to recover it
+/// (see `build_tcp_packet_full`).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_tcp_packet_window(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    syn: bool,
+    ack: bool,
+    psh: bool,
+    fin: bool,
+    rst: bool,
+    seq: u32,
+    ack_num: u32,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    const IPV4_HEADER: usize = 20;
+    const TCP_HEADER: usize = 20;
+    let total = IPV4_HEADER + TCP_HEADER + payload.len();
+    assert!(total <= 65535, "packet too large for IPv4");
+    let mut buf = vec![0u8; total];
+    buf[IPV4_HEADER + 12] = 0x50;
+    {
+        let mut tcp = TcpPacket::new_checked(&mut buf[IPV4_HEADER..]).expect("sized tcp buffer");
+        tcp.clear_flags();
+        tcp.set_src_port(src_port);
+        tcp.set_dst_port(dst_port);
+        tcp.set_seq_number(TcpSeqNumber(seq as i32));
+        tcp.set_ack_number(TcpSeqNumber(ack_num as i32));
+        tcp.set_header_len(TCP_HEADER as u8);
+        tcp.set_window_len(window);
         tcp.set_syn(syn);
         tcp.set_ack(ack);
         tcp.set_psh(psh);
