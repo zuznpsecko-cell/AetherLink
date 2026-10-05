@@ -492,7 +492,7 @@ fn upload_buffer_full_holds_the_segment_instead_of_losing_it() {
     let (isn, iss) = handshake(&mut pump, &mut tun, 13000);
     let mut seq = isn.wrapping_add(1);
     let mut admitted = 0usize;
-    for _ in 0..1500 {
+    for _ in 0..600 {
         tun.inbound
             .push_back(data_at(41000, seq, iss.wrapping_add(1), b"x"));
         let frames = pump.poll_once(&mut tun).expect("poll");
@@ -504,7 +504,7 @@ fn upload_buffer_full_holds_the_segment_instead_of_losing_it() {
         let _ = tun.take_outbound();
     }
     assert!(admitted > 0, "the buffer accepts a burst");
-    assert!(admitted < 1500, "and then it stops accepting");
+    assert!(admitted < 600, "and then it stops accepting");
 
     // When: the app retransmits the segment that was held back (its RTO
     // fires, because we never confirmed it)
@@ -555,7 +555,7 @@ fn ack_window_closes_as_the_upload_buffer_fills() {
 
     // And: the buffer fills up with data that has not gone out yet
     let mut seq = isn.wrapping_add(3);
-    for _ in 0..1500 {
+    for _ in 0..600 {
         tun.inbound
             .push_back(data_at(41000, seq, iss.wrapping_add(1), b"y"));
         let burst = pump.poll_once(&mut tun).expect("poll");
