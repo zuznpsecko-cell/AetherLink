@@ -83,15 +83,16 @@ const UDP_IDLE_GRACE: Duration = Duration::from_secs(300);
 const REAP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How many sealed frames may be admitted from the app before some of them
-/// have actually left for the server (upload buffer, ~0.4MB at a 1460B
-/// payload — about one bandwidth-delay product for a 30-60Mbps uplink).
+/// have actually left for the server (upload buffer, ~1.6MB at a 1460B
+/// payload — room for the drain rate to grow past the initial 12Mbps
+/// equilibrium without drowning the app in bufferbloat).
 ///
 /// Split-TCP means we ACK the app ourselves, so nothing else stops it from
 /// sending at LAN speed into a tunnel that drains an order of magnitude
 /// slower: the surplus then has nowhere to go but the bin, and a dropped
 /// chunk is unrecoverable (the app's retransmit is rejected as a duplicate
 /// by our in-order check — seen live: 20Mbps down, upload 0.00).
-const PENDING_FRAMES_MAX: usize = 256;
+const PENDING_FRAMES_MAX: usize = 1024;
 
 /// Nominal payload of one frame, only used to translate the pending-frame
 /// budget into a TCP window for the app.
