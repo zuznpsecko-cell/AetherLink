@@ -465,13 +465,120 @@ fn forwarded_data_emits_prompt_ack() {
     // When: payload forwarded upstream
     let frames = pump.poll_once(&mut tun).expect("poll");
     assert_eq!(frames.len(), 2);
-    // Then: a pure ACK is injected immediately (no SYN/FIN, no payload).
+    // Then: the ACK waits for the frame to be written. Confirming at
+    // admission is what let the app overrun the tunnel and lose the
+    // surplus with no way to recover it (upload 0.00, seen live).
+    assert!(
+        tun.take_outbound().is_empty(),
+        "no ack before the bytes have left"
+    );
+    pump.frames_written(frames.len());
+    pump.flush_acks(&mut tun);
+    // And: once written, a pure ACK is injected (no SYN/FIN, no payload).
     let out = tun.take_outbound();
     assert_eq!(out.len(), 1);
     let seg = out[0].tcp().expect("tcp");
     assert!(seg.ack && !seg.syn && !seg.fin && !seg.rst);
     assert_eq!(seg.ack_num, isn.wrapping_add(1).wrapping_add(2));
     assert!(seg.payload.is_empty());
+}
+
+#[test]
+fn upload_buffer_full_holds_the_segment_instead_of_losing_it() {
+    // Given: established flow, upload buffer filled by earlier payloads
+    // that were never written out (the tunnel is slower than the app).
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 13000);
+    let mut seq = isn.wrapping_add(1);
+    let mut admitted = 0usize;
+    for _ in 0..600 {
+        tun.inbound
+            .push_back(data_at(41000, seq, iss.wrapping_add(1), b"x"));
+        let frames = pump.poll_once(&mut tun).expect("poll");
+        if frames.is_empty() {
+            break;
+        }
+        admitted += 1;
+        seq = seq.wrapping_add(1);
+        let _ = tun.take_outbound();
+    }
+    assert!(admitted > 0, "the buffer accepts a burst");
+    assert!(admitted < 600, "and then it stops accepting");
+
+    // When: the app retransmits the segment that was held back (its RTO
+    // fires, because we never confirmed it)
+    tun.inbound
+        .push_back(data_at(41000, seq, iss.wrapping_add(1), b"x"));
+    let held = pump.poll_once(&mut tun).expect("poll");
+    assert!(held.is_empty(), "still no room while nothing is written");
+
+    // And: the frames that were queued finally go out
+    pump.frames_written(admitted * 2);
+    pump.flush_acks(&mut tun);
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1, "one ack for the flow");
+    let seg = out[0].tcp().expect("tcp");
+    assert_eq!(
+        seg.ack_num, seq,
+        "nothing beyond the last accepted byte is confirmed"
+    );
+    assert!(seg.window > 0, "the window reopens once there is room");
+
+    // Then: the retransmitted segment is accepted now (its seq is exactly
+    // what we expect) — the upload resumes instead of stalling forever.
+    tun.inbound
+        .push_back(data_at(41000, seq, iss.wrapping_add(1), b"x"));
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 1, "DATA for the resumed segment");
+}
+
+#[test]
+fn ack_window_closes_as_the_upload_buffer_fills() {
+    // Given: established flow with a payload upstream
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 14000);
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"hi",
+    ));
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    assert_eq!(frames.len(), 2);
+    // When: the frames are written and the app is confirmed
+    pump.frames_written(frames.len());
+    pump.flush_acks(&mut tun);
+    let out = tun.take_outbound();
+    let wide = out[0].tcp().expect("tcp").window;
+
+    // And: the buffer fills up with data that has not gone out yet
+    let mut seq = isn.wrapping_add(3);
+    for _ in 0..600 {
+        tun.inbound
+            .push_back(data_at(41000, seq, iss.wrapping_add(1), b"y"));
+        let burst = pump.poll_once(&mut tun).expect("poll");
+        if burst.is_empty() {
+            break;
+        }
+        seq = seq.wrapping_add(1);
+    }
+    pump.frames_written(1);
+    pump.flush_acks(&mut tun);
+    let out = tun.take_outbound();
+    let narrow = out
+        .last()
+        .expect("an ack went out")
+        .tcp()
+        .expect("tcp")
+        .window;
+    // Then: the window the app is offered shrinks with the backlog, so it
+    // paces itself instead of overrunning the tunnel.
+    assert!(
+        narrow < wide,
+        "window {narrow} must be smaller than {wide} when the buffer is full"
+    );
 }
 
 /// Build a data segment from the app (`CLIENT_IP:port` -> `DST:80`).
@@ -639,6 +746,8 @@ fn finished_flows_free_their_stream_ids() {
         let frames = pump.poll_once(&mut tun).expect("payload forwarded");
         assert_eq!(frames.len(), 2, "OPEN + DATA on flow {i}");
         let id = frames[0].header.stream_id;
+        // The loop writes them out: that is what frees the upload buffer.
+        pump.frames_written(frames.len());
         let _ = tun.take_outbound();
         // FIN -> half-close announced upstream.
         tun.inbound.push_back(build_tcp_packet_full(
@@ -657,6 +766,7 @@ fn finished_flows_free_their_stream_ids() {
         ));
         let frames = pump.poll_once(&mut tun).expect("fin accepted");
         assert_eq!(frames.len(), 1, "close signal on flow {i}");
+        pump.frames_written(frames.len());
         let _ = tun.take_outbound();
         // Relay closes too: the flow and its id are both released.
         peer.register_inbound(id, &DST.to_string(), 80, false)

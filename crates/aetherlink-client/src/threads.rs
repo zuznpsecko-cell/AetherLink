@@ -181,6 +181,19 @@ where
                     if !ok {
                         break;
                     }
+                    // These frames are gone: free the upload buffer and
+                    // confirm them to the app (never confirm earlier — see
+                    // DataPump::flush_acks).
+                    {
+                        let mut pump_guard = pump_tun.lock().ok();
+                        let mut tun_guard = tun_tun.lock().ok();
+                        if let (Some(p), Some(t)) =
+                            (pump_guard.as_deref_mut(), tun_guard.as_deref_mut())
+                        {
+                            p.frames_written(fs.len());
+                            p.flush_acks(t);
+                        }
+                    }
                     if fs.is_empty() {
                         std::thread::sleep(TUN_IDLE);
                     }
@@ -286,6 +299,7 @@ where
                                 frames.len()
                             ));
                         }
+                        let mut written = 0usize;
                         let mut ok = true;
                         for f in &frames {
                             if write_sealed(&mut stream, &f.header, &f.ciphertext).is_err() {
@@ -295,7 +309,15 @@ where
                                 ok = false;
                                 break;
                             }
+                            written += 1;
                         }
+                        // Only now are these bytes really gone: free the
+                        // upload buffer and confirm them to the app. The app
+                        // is throttled by this confirmation, so it paces
+                        // itself to what the tunnel can actually carry
+                        // instead of overrunning it and losing the surplus.
+                        pump.frames_written(written);
+                        pump.flush_acks(&mut *guard);
                         if !ok {
                             break;
                         }
@@ -307,6 +329,7 @@ where
                         aetherlink_netstack::debug_log(&format!(
                             "pump: tls tun drain error: {e}, continuing"
                         ));
+                        pump.flush_acks(&mut *guard);
                         std::thread::sleep(TUN_IDLE);
                     }
                 },

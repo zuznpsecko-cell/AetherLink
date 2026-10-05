@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use aetherlink_frame::codec::FrameHeader;
 use aetherlink_mux::manager::{MuxManager, SealedFrame};
 use aetherlink_netstack::smoltcp_wrapper::{
-    build_tcp_packet_full, build_udp_packet, parse_ipv4_packet, ParsedPayload,
+    build_tcp_packet_full, build_tcp_packet_window, build_udp_packet, parse_ipv4_packet,
+    ParsedPayload,
 };
 use aetherlink_netstack::tun::TunPackets;
 use aetherlink_protocol::FrameType;
@@ -81,6 +82,21 @@ const UDP_IDLE_GRACE: Duration = Duration::from_secs(300);
 /// How often stale flows are looked for (a poll-time scan, not per packet).
 const REAP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How many sealed frames may be admitted from the app before some of them
+/// have actually left for the server (upload buffer, ~0.4MB at a 1460B
+/// payload — about one bandwidth-delay product for a 30-60Mbps uplink).
+///
+/// Split-TCP means we ACK the app ourselves, so nothing else stops it from
+/// sending at LAN speed into a tunnel that drains an order of magnitude
+/// slower: the surplus then has nowhere to go but the bin, and a dropped
+/// chunk is unrecoverable (the app's retransmit is rejected as a duplicate
+/// by our in-order check — seen live: 20Mbps down, upload 0.00).
+const PENDING_FRAMES_MAX: usize = 256;
+
+/// Nominal payload of one frame, only used to translate the pending-frame
+/// budget into a TCP window for the app.
+const NOMINAL_FRAME: usize = 1460;
+
 /// One terminated TCP flow: the app completes TCP against us, only payload
 /// crosses the mux (OPEN once, then DATA per segment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +136,14 @@ pub struct DataPump {
     iss_next: u32,
     /// Next sweep for stale flows (half-closed TCP, idle UDP).
     next_reap: Instant,
+    /// Frames admitted from the app that have not been written out yet
+    /// (upload buffer; see `PENDING_FRAMES_MAX`).
+    pending: usize,
+    /// Flows whose admitted bytes deserve an ACK (emitted once written).
+    ack_pending: Vec<FlowKey>,
+    /// Flows held back because the upload buffer was full; they get a
+    /// window update as soon as there is room again.
+    throttled: Vec<FlowKey>,
 }
 
 impl DataPump {
@@ -143,6 +167,9 @@ impl DataPump {
             tcp_by_id: HashMap::new(),
             iss_next: 1_000_000,
             next_reap: Instant::now() + REAP_INTERVAL,
+            pending: 0,
+            ack_pending: Vec::new(),
+            throttled: Vec::new(),
         }
     }
 
@@ -163,6 +190,9 @@ impl DataPump {
             tcp_by_id: HashMap::new(),
             iss_next: 1_000_000,
             next_reap: Instant::now() + REAP_INTERVAL,
+            pending: 0,
+            ack_pending: Vec::new(),
+            throttled: Vec::new(),
         }
     }
 
@@ -206,7 +236,6 @@ impl DataPump {
         fk: &FlowKey,
         flow: &mut TcpFlow,
         payload: &[u8],
-        tun: &mut dyn TunPackets,
     ) -> Result<Vec<SealedFrame>> {
         let mut frames = Vec::new();
         if flow.id.is_none() {
@@ -258,13 +287,80 @@ impl DataPump {
         };
         flow.client_bytes = flow.client_bytes.wrapping_add(payload.len() as u32);
         frames.push(data);
-        // Split-TCP self-ack: confirm receipt hop-by-hop right away
-        // instead of waiting for the target's reply to piggyback on.
-        // Without it bulk upload stalls past cwnd (target ACKs never
-        // cross the relay as frames) and the app measures ~zero
-        // (seen live: 3KB/s then stall). Best-effort: a lost ack is
-        // recovered by the next reply/ack carrying newer numbers.
-        let ackpkt = build_tcp_packet_full(
+        // The ACK is NOT emitted here: it goes out once these bytes have
+        // actually been written to the server (see `flush_acks`). Confirming
+        // them at admission tells the app to send at LAN speed into a tunnel
+        // that drains far slower, and everything that does not fit is lost
+        // with no way back — the app's retransmit is rejected here as a
+        // duplicate, so the stream never recovers (seen live: upload 0.00).
+        self.pending += frames.len();
+        self.push_ack(*fk);
+        Ok(frames)
+    }
+
+    /// Window the app may still fill (bytes), from the upload buffer left.
+    #[must_use]
+    fn adv_window(&self) -> u16 {
+        let free = PENDING_FRAMES_MAX.saturating_sub(self.pending);
+        u16::try_from(free.saturating_mul(NOMINAL_FRAME)).unwrap_or(u16::MAX)
+    }
+
+    fn push_ack(&mut self, fk: FlowKey) {
+        if !self.ack_pending.contains(&fk) {
+            self.ack_pending.push(fk);
+        }
+    }
+
+    /// Admission control: is there room in the upload buffer for one more
+    /// segment? A refused segment is dropped *without* being confirmed, so
+    /// the app retransmits it later and the in-order check accepts it.
+    fn admit(&mut self, fk: &FlowKey) -> bool {
+        if self.pending < PENDING_FRAMES_MAX {
+            return true;
+        }
+        if !self.throttled.contains(fk) {
+            self.throttled.push(*fk);
+        }
+        false
+    }
+
+    /// `n` sealed frames have been written to the server: free their room
+    /// in the upload buffer.
+    pub fn frames_written(&mut self, n: usize) {
+        self.pending = self.pending.saturating_sub(n);
+    }
+
+    /// Confirm to the app whatever has left for the server, and reopen the
+    /// flows that were held back while the buffer was full.
+    ///
+    /// The window carried by these ACKs is the real one: when the tunnel is
+    /// backed up the app is told to stop instead of being left to discover
+    /// it by retransmission timeout (the RTO storm of issue 0g).
+    pub fn flush_acks(&mut self, tun: &mut dyn TunPackets) {
+        let mut flows = std::mem::take(&mut self.ack_pending);
+        // Reopen flows held back by a full buffer, but only when there is
+        // really room: a zero-window ACK would just be noise. Called every
+        // turn, so a flow can never be left waiting with room available.
+        if !self.throttled.is_empty() && self.adv_window() > 0 {
+            for fk in std::mem::take(&mut self.throttled) {
+                if !flows.contains(&fk) {
+                    flows.push(fk);
+                }
+            }
+        }
+        for fk in &flows {
+            if let Err(e) = self.emit_ack(fk, tun) {
+                aetherlink_netstack::debug_log(&format!("pump: tcp ack send failed: {e}"));
+            }
+        }
+    }
+
+    /// One cumulative ACK toward the app, carrying the current window.
+    fn emit_ack(&self, fk: &FlowKey, tun: &mut dyn TunPackets) -> Result<()> {
+        let Some(flow) = self.tcp.get(fk) else {
+            return Ok(());
+        };
+        let pkt = build_tcp_packet_window(
             flow.server_ip,
             flow.client_ip,
             flow.server_port,
@@ -278,12 +374,10 @@ impl DataPump {
             flow.client_isn
                 .wrapping_add(1)
                 .wrapping_add(flow.client_bytes),
+            self.adv_window(),
             &[],
         );
-        if let Err(e) = tun.send_packet(&ackpkt) {
-            aetherlink_netstack::debug_log(&format!("pump: tcp self-ack send failed: {e}"));
-        }
-        Ok(frames)
+        tun.send_packet(&pkt).map_err(|e| e.into())
     }
 
     /// Emit a SYN-ACK for a terminated flow toward TUN.
@@ -559,8 +653,8 @@ impl DataPump {
                             .client_isn
                             .wrapping_add(1)
                             .wrapping_add(flow.client_bytes);
-                        if seg.seq == expected {
-                            match self.seal_payload(&fk, &mut flow, &seg.payload, tun) {
+                        if seg.seq == expected && self.admit(&fk) {
+                            match self.seal_payload(&fk, &mut flow, &seg.payload) {
                                 Ok(f) => frames.extend(f),
                                 Err(e) => return Err(e),
                             }
@@ -625,10 +719,24 @@ impl DataPump {
                     self.tcp.insert(fk, flow);
                     return Ok(None);
                 }
+                // Upload buffer full: drop silently (no ACK, no sequence
+                // advance) so the app retransmits this very segment once
+                // there is room. Confirming it here and losing it later is
+                // unrecoverable — the retransmit would be rejected above as
+                // a duplicate (seen live: upload measures 0.00).
+                if !self.admit(&fk) {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tcp id={} upload buffer full ({} pending), holding",
+                        flow.id.unwrap_or(u16::MAX),
+                        self.pending
+                    ));
+                    self.tcp.insert(fk, flow);
+                    return Ok(None);
+                }
                 // Payload: OPEN the mux stream once, then DATA per segment.
                 // On error the helper has already restored the flow, so it
                 // must not be inserted again (tables stay in sync).
-                let frames = match self.seal_payload(&fk, &mut flow, &seg.payload, tun) {
+                let frames = match self.seal_payload(&fk, &mut flow, &seg.payload) {
                     Ok(frames) => frames,
                     Err(e) => return Err(e),
                 };
@@ -754,10 +862,6 @@ impl DataPump {
                     // The flow is already removed above: release its maps
                     // and mux id here. forget_tcp would find nothing and
                     // leak the id until the 4096 cap mutes the session.
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tcp flow {}:{} -> {}:{} closed by peer, id {id} freed",
-                        flow.client_ip, flow.client_port, flow.server_ip, flow.server_port
-                    ));
                     self.tcp_by_id.remove(&id);
                     self.by_id.remove(&id);
                     self.by_tuple.remove(&key);
