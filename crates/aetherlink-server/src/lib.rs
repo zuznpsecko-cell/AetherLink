@@ -108,7 +108,9 @@ impl Server {
                     }
                     list
                 },
-                blocklist: {
+                blocklist: if !self.config.blocklist_enabled {
+                    crate::blocklist::Blocklist::default()
+                } else {
                     // Seed + config + optional file, merged (file missing =
                     // seed+config only, logged, never fatal).
                     let mut entries: Vec<&str> = crate::blocklist::seed_entries().to_vec();

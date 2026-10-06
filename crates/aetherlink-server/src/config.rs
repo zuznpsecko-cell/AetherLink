@@ -26,6 +26,8 @@ pub struct ServerConfig {
     pub blocked_domains: Vec<String>,
     /// Optional path to a flat blocklist file (category-ads-all format).
     pub blocked_domains_file: Option<String>,
+    /// Master switch (default true). False = no blocking at all.
+    pub blocklist_enabled: bool,
 }
 
 fn required_str(doc: &serde_json::Value, field: &str) -> Result<String> {
@@ -83,6 +85,10 @@ impl ServerConfig {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let blocklist_enabled = doc
+            .get("blocklist_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         Ok(Self {
             listen,
             tls_cert,
@@ -92,6 +98,7 @@ impl ServerConfig {
             dns_upstream,
             blocked_domains,
             blocked_domains_file,
+            blocklist_enabled,
             max_streams: doc
                 .get("max_streams")
                 .and_then(serde_json::Value::as_u64)

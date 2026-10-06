@@ -11,6 +11,8 @@ server:
   max_streams: 4096
   # Domain blocklist (ads/trackers): suffix match, `full:` prefix = exact.
   # Enforced on DNS answers + OPEN targets; fail closed, loop lives.
+  # Master switch: blocklist_enabled: false disables everything.
+  blocklist_enabled: true
   blocked_domains:
     - "doubleclick.net"
   # Optional flat file (one suffix per line, `#` comments) with the full
