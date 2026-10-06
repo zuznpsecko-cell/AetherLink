@@ -9,3 +9,10 @@ server:
     - "1.1.1.1:53"
     - "8.8.8.8:53"
   max_streams: 4096
+  # Domain blocklist (ads/trackers): suffix match, `full:` prefix = exact.
+  # Enforced on DNS answers + OPEN targets; fail closed, loop lives.
+  blocked_domains:
+    - "doubleclick.net"
+  # Optional flat file (one suffix per line, `#` comments) with the full
+  # category-ads-all DB. Fetch it via scripts/fetch-blocklist.ps1.
+  # blocked_domains_file: "assets/blocklist-ads.txt"

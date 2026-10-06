@@ -55,6 +55,8 @@ pub struct ServerCtx {
     /// DNS upstreams `"ip:port"` (primary first) for the virtual
     /// resolver intercept; tried in order per datagram.
     pub dns_upstream: Vec<String>,
+    /// Domain blocklist (ads/trackers): DNS answers and OPEN targets.
+    pub blocklist: crate::blocklist::Blocklist,
 }
 
 /// Relay read timeout: a silent target burns one worker for this long;
@@ -783,6 +785,30 @@ fn tunnel_loop(
                             && port.parse::<u16>().ok() == Some(target.port())
                     })
                 });
+                // Blocked QNAME: answer empty locally, never burn a
+                // worker or leak the query to upstream resolvers.
+                if is_virtual {
+                    if let Some(qname) = crate::blocklist::dns_query_name(&pt) {
+                        if ctx.blocklist.is_blocked(&qname) {
+                            debug_log(&format!(
+                                "tunnel: datagram id={} DNS {qname} blocked",
+                                header.stream_id
+                            ));
+                            let reply = dns::empty_response(&pt);
+                            match send_chunked(&mut sess, stream, header.stream_id, &reply, true) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    debug_log(&format!(
+                                        "tunnel: datagram id={} blocked-reply write failed ({e}), closing",
+                                        header.stream_id
+                                    ));
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let key = FlowKey {
                     id: header.stream_id,
                     target: (target.ip().to_string(), target.port()),
@@ -831,6 +857,16 @@ fn tunnel_loop(
                         break;
                     }
                 };
+                if ctx.blocklist.is_blocked(&target.addr) {
+                    // Unresolved domain target on the list: fail closed
+                    // before resolve+dial (also avoids leaking the lookup
+                    // to the system resolver). IP literals never match.
+                    debug_log(&format!(
+                        "tunnel: open_tcp id={} to blocked {}, skipping flow",
+                        header.stream_id, target.addr
+                    ));
+                    continue;
+                }
                 if workers.remove(&header.stream_id).is_some() {
                     // The peer recycles ids, so this is a new flow on a
                     // fresh id: dropping the sender ends the stale relay
@@ -879,6 +915,15 @@ fn tunnel_loop(
                         break;
                     }
                 };
+                if ctx.blocklist.is_blocked(&flow.addr) {
+                    // Unresolved domain target on the list (the virtual
+                    // resolver address itself never matches).
+                    debug_log(&format!(
+                        "tunnel: open_udp id={} to blocked {}, skipping flow",
+                        flow.id, flow.addr
+                    ));
+                    continue;
+                }
                 // Virtual-resolver intercept: the client only knows
                 // 10.255.0.1:53; the server terminates it at its upstream
                 // (dialing .1 would time out and kill the loop instead).

@@ -33,6 +33,7 @@ fn ctx() -> ServerCtx {
         cache: NonceCache::new(),
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
+        blocklist: aetherlink_server::blocklist::Blocklist::default(),
     }
 }
 
@@ -462,6 +463,160 @@ fn slow_stream_does_not_stall_fast_stream() {
         .open_data(sess.keys.rx_key(), &h, &c)
         .expect("open echo");
     assert_eq!(back, b"hi");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn blocked_dns_gets_empty_answer_without_upstream() {
+    // Given: blocklist holding the queried name; upstream is a blackhole
+    // port (any relay attempt would fail, not answer)
+    let probe = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead_port = probe.local_addr().expect("addr").port();
+    drop(probe);
+    let mut base = ctx();
+    base.dns_upstream = vec![format!("127.0.0.1:{dead_port}")];
+    base.blocklist = aetherlink_server::blocklist::Blocklist::from_entries(["blocked.test"]);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &base, &mut routes), Path::Tunnel);
+    });
+
+    // When: handshake, OPEN_UDP to the virtual resolver, A query for the
+    // blocked name (txid 0x1234, example.com shape)
+    let mut stream = client_tls(port);
+    let nonce = [0xE3u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let id = sess
+        .mux
+        .open_udp("10.255.0.1", 53)
+        .expect("open virtual dns");
+    let open = sess
+        .mux
+        .seal_open_udp(sess.keys.tx_key(), id, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+    let mut q = vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    q.extend_from_slice(b"\x07blocked\x04test\x00\x00\x01\x00\x01");
+    let sealed = sess
+        .mux
+        .seal_datagram(sess.keys.tx_key(), id, &q, 128)
+        .expect("seal query");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    // Then: immediate empty NOERROR (same txid, zero answers) — no upstream
+    // round trip (which would fail against the blackhole).
+    let (h, c) = wire_help::read_frame(&mut stream);
+    let answer = sess
+        .mux
+        .open_datagram(sess.keys.rx_key(), &h, &c)
+        .expect("open answer");
+    assert!(answer.len() >= 12, "dns header present");
+    assert_eq!(&answer[0..2], b"\x12\x34", "txid mirrored");
+    assert_eq!(answer[2] & 0x80, 0x80, "QR set");
+    assert_eq!(u16::from_be_bytes([answer[6], answer[7]]), 0, "no answers");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn blocked_open_tcp_is_skipped_loop_lives() {
+    // Given: echo target counting dials; "localhost" blocked (it resolves
+    // locally, so a dial would land — counting proves it never happens)
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dials = std::sync::Arc::new(AtomicUsize::new(0));
+    let echo = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let echo_port = echo.local_addr().expect("addr").port();
+    {
+        let dials = std::sync::Arc::clone(&dials);
+        std::thread::spawn(move || loop {
+            let (sock, _) = match echo.accept() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            dials.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let mut sock = sock;
+                let mut buf = [0u8; 4096];
+                use std::io::{Read, Write};
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+    let mut base = ctx();
+    base.blocklist = aetherlink_server::blocklist::Blocklist::from_entries(["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &base, &mut routes), Path::Tunnel);
+    });
+
+    // When: OPEN_TCP to the blocked name, then a healthy echo flow
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let nonce = [0xE4u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let b = sess
+        .mux
+        .open_tcp("localhost", echo_port)
+        .expect("open blocked");
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), b, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    // Payload on the blocked stream too: without the block this dials.
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), b, b"probe", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let g = sess
+        .mux
+        .open_tcp("127.0.0.1", echo_port)
+        .expect("open good");
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), g, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), g, b"hi", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    // Then: echo answers on the healthy flow; the blocked name caused no dial.
+    let (h, c) = wire_help::read_frame(&mut stream);
+    let back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open echo");
+    assert_eq!(back, b"hi");
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "only the healthy flow dialed"
+    );
     drop(stream);
     server.join().expect("server thread");
 }

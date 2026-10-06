@@ -36,6 +36,7 @@ fn ctx() -> ServerCtx {
         cache: NonceCache::new(),
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
+        blocklist: aetherlink_server::blocklist::Blocklist::default(),
     }
 }
 

@@ -5,6 +5,7 @@
 
 pub mod accept;
 pub mod auth;
+pub mod blocklist;
 pub mod config;
 pub mod debug;
 pub mod dns;
@@ -106,6 +107,31 @@ impl Server {
                         list.push(crate::dns::upstream().to_string());
                     }
                     list
+                },
+                blocklist: {
+                    // Seed + config + optional file, merged (file missing =
+                    // seed+config only, logged, never fatal).
+                    let mut entries: Vec<&str> = crate::blocklist::seed_entries().to_vec();
+                    entries.extend(self.config.blocked_domains.iter().map(String::as_str));
+                    let file_text = self
+                        .config
+                        .blocked_domains_file
+                        .as_deref()
+                        .map(std::fs::read_to_string);
+                    let owned;
+                    match file_text {
+                        Some(Ok(text)) => {
+                            owned = text;
+                            entries.extend(owned.lines());
+                        }
+                        Some(Err(e)) => {
+                            crate::debug::debug_log(&format!(
+                                "blocklist file unreadable ({e}), seed+config only"
+                            ));
+                        }
+                        None => {}
+                    }
+                    crate::blocklist::Blocklist::from_entries(entries)
                 },
             },
         })

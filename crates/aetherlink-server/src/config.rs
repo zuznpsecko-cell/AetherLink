@@ -22,6 +22,10 @@ pub struct ServerConfig {
     pub dns_upstream: Vec<String>,
     /// Max concurrent streams.
     pub max_streams: usize,
+    /// Inline blocked suffixes (`full:` prefix = exact host).
+    pub blocked_domains: Vec<String>,
+    /// Optional path to a flat blocklist file (category-ads-all format).
+    pub blocked_domains_file: Option<String>,
 }
 
 fn required_str(doc: &serde_json::Value, field: &str) -> Result<String> {
@@ -64,6 +68,21 @@ impl ServerConfig {
         if dns_upstream.is_empty() {
             return Err(ServerError::ConfigError("empty dns_upstream".to_string()));
         }
+        let blocked_domains = doc
+            .get("blocked_domains")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let blocked_domains_file = doc
+            .get("blocked_domains_file")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         Ok(Self {
             listen,
             tls_cert,
@@ -71,6 +90,8 @@ impl ServerConfig {
             psk,
             local_static_root,
             dns_upstream,
+            blocked_domains,
+            blocked_domains_file,
             max_streams: doc
                 .get("max_streams")
                 .and_then(serde_json::Value::as_u64)
