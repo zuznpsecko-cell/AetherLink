@@ -170,6 +170,19 @@ if [ ! -f "$PREFIX/server.yaml" ]; then
 else
   echo "Keeping existing $PREFIX/server.yaml (PSK preserved)."
 fi
+echo "==> [8b/9] Ad blocklist (best-effort; seed covers offline)..."
+BL="$PREFIX/blocklist-ads.txt"
+if bash "$WORK/scripts/fetch-blocklist.sh" "$BL" >/dev/null 2>&1; then
+  if grep -qE '^[[:space:]]*#?[[:space:]]*blocked_domains_file:' "$PREFIX/server.yaml"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*blocked_domains_file:.*|  blocked_domains_file: \"$BL\"|" "$PREFIX/server.yaml"
+  else
+    printf '\n  blocked_domains_file: "%s"\n' "$BL" >> "$PREFIX/server.yaml"
+  fi
+  chmod 600 "$PREFIX/server.yaml"
+  echo "Blocklist ready ($BL)."
+else
+  echo "Blocklist fetch failed (offline?); continuing with the built-in seed."
+fi
 echo "==> [9/9] Service + firewall + start..."
 install -m 0644 deploy/linux/aetherlink-server.service /etc/systemd/system/
 systemctl daemon-reload

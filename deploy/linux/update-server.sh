@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# AetherLink server updater: refresh binaries on an installed VPS.
-# Run ON the VPS as root. Touches NOTHING else: server.yaml (PSK),
-# certs, firewall and the systemd unit are kept as-is.
+# AetherLink server updater: refresh binaries + ad-blocklist on an
+# installed VPS. Run ON the VPS as root. Kept as-is: server.yaml (PSK),
+# certs, firewall and the systemd unit. The blocklist refresh is
+# best-effort (old file/seed on failure) and needs a service restart
+# below to take effect (included).
 #
 #   sudo bash deploy/linux/update-server.sh
 #
@@ -42,12 +44,25 @@ dotnet publish dotnet/AetherLink.Server/AetherLink.Server.csproj \
   -c Release -r linux-x64 --self-contained -o dist/ubuntu-server
 cp -f target/release/libaetherlink_ffi.so dist/ubuntu-server/libaetherlink_core.so
 
-echo "==> [3/4] Restage $PREFIX/server (stop first: ETXTBSY)..."
+echo "==> [3/5] Ad blocklist refresh (best-effort; old file kept on failure)..."
+BL="$PREFIX/blocklist-ads.txt"
+if bash "$WORK/scripts/fetch-blocklist.sh" "$BL" >/dev/null 2>&1; then
+  if grep -qE '^[[:space:]]*#?[[:space:]]*blocked_domains_file:' "$PREFIX/server.yaml"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*blocked_domains_file:.*|  blocked_domains_file: \"$BL\"|" "$PREFIX/server.yaml"
+  else
+    printf '\n  blocked_domains_file: "%s"\n' "$BL" >> "$PREFIX/server.yaml"
+  fi
+  echo "Blocklist refreshed ($BL)."
+else
+  echo "Blocklist refresh failed (offline?); keeping the old file/seed."
+fi
+
+echo "==> [4/5] Restage $PREFIX/server (stop first: ETXTBSY)..."
 systemctl stop "$UNIT" 2>/dev/null || true
 cp -a dist/ubuntu-server/. "$PREFIX/server/"
 chmod 0755 "$PREFIX/server/AetherLink.Server"
 
-echo "==> [4/4] Start + verify..."
+echo "==> [5/5] Start + verify..."
 systemctl start "$UNIT"
 sleep 2
 systemctl is-active "$UNIT"
