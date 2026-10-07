@@ -10,7 +10,9 @@
 Блокировка рекламных/трекерных доменов на сервере: suffix-матчинг
 (ull: = точное), seed из ~50 сетей + опциональный файл с полной базой
 category-ads-all (v2fly/domain-list-community; fetch via
-scripts/fetch-blocklist.ps1). Энфорсмент в двух точках: DNS-ответы
+scripts/fetch-blocklist.ps1, on VPS scripts/fetch-blocklist.sh).
+  Fixed VPS path /opt/aetherlink/blocklist-ads.txt: install fetches it on
+  setup, update-server.sh refreshes best-effort on every update. Энфорсмент в двух точках: DNS-ответы
 (пустой NOERROR вместо похода к апстриму) и OPEN-таргеты (скип до
 resolve/dial). Гейты: 250/250.
 
