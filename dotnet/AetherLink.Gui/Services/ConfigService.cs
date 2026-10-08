@@ -54,6 +54,14 @@ internal static class ConfigService
             {
                 cfg.Client.PadMultiple = pm;
             }
+            if (m.TryGetValue("keepalive_s", out v) && int.TryParse(Str(v), out var ka))
+            {
+                cfg.Client.KeepaliveS = ka;
+            }
+            if (m.TryGetValue("wintun_dll_path", out v) && Str(v).Length > 0)
+            {
+                cfg.Client.WintunDllPath = Str(v);
+            }
         }
 
         if (root.TryGetValue("full_tunnel", out var f))
@@ -67,6 +75,18 @@ internal static class ConfigService
             if (m.TryGetValue("mtu", out v) && int.TryParse(Str(v), out var mtu))
             {
                 cfg.FullTunnel.Mtu = mtu;
+            }
+            if (m.TryGetValue("kill_switch", out v) && bool.TryParse(Str(v), out var ks))
+            {
+                cfg.FullTunnel.KillSwitch = ks;
+            }
+            if (m.TryGetValue("restore_on_exit", out v) && bool.TryParse(Str(v), out var ro))
+            {
+                cfg.FullTunnel.RestoreOnExit = ro;
+            }
+            if (m.TryGetValue("include_private_lan_direct", out v) && bool.TryParse(Str(v), out var lan))
+            {
+                cfg.FullTunnel.IncludePrivateLanDirect = lan;
             }
         }
 
@@ -102,12 +122,17 @@ internal static class ConfigService
                 ["outer_sni"] = cfg.Client.OuterSni,
                 ["psk"] = cfg.Client.Psk,
                 ["pad_multiple"] = cfg.Client.PadMultiple,
+                ["keepalive_s"] = cfg.Client.KeepaliveS,
+                ["wintun_dll_path"] = cfg.Client.WintunDllPath,
             },
             ["full_tunnel"] = new Dictionary<string, object>
             {
                 ["enabled"] = cfg.FullTunnel.Enabled,
                 ["mtu"] = cfg.FullTunnel.Mtu,
                 ["dns_mode"] = cfg.FullTunnel.DnsMode,
+                ["kill_switch"] = cfg.FullTunnel.KillSwitch,
+                ["restore_on_exit"] = cfg.FullTunnel.RestoreOnExit,
+                ["include_private_lan_direct"] = cfg.FullTunnel.IncludePrivateLanDirect,
             },
             ["routing"] = new Dictionary<string, object>
             {

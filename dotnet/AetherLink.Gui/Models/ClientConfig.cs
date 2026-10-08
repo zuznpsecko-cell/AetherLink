@@ -1,6 +1,6 @@
 // Typed subset of configs/client.example.yaml that the GUI edits.
-// Unknown keys are dropped on save (documented v1 limitation); the core
-// re-validates everything at Up() time.
+// All scalar transport fields round-trip (Load+Save); anything truly
+// unknown is still dropped on save, but the core re-validates at Up().
 
 using YamlDotNet.Serialization;
 
@@ -19,6 +19,12 @@ public sealed class ClientSection
 
     [YamlMember(Alias = "pad_multiple")]
     public int PadMultiple { get; set; } = 128;
+
+    [YamlMember(Alias = "keepalive_s")]
+    public int KeepaliveS { get; set; } = 15;
+
+    [YamlMember(Alias = "wintun_dll_path")]
+    public string WintunDllPath { get; set; } = "./wintun.dll";
 }
 
 public sealed class FullTunnelSection
@@ -31,6 +37,15 @@ public sealed class FullTunnelSection
 
     [YamlMember(Alias = "dns_mode")]
     public string DnsMode { get; set; } = "tunnel";
+
+    [YamlMember(Alias = "kill_switch")]
+    public bool KillSwitch { get; set; } = false;
+
+    [YamlMember(Alias = "restore_on_exit")]
+    public bool RestoreOnExit { get; set; } = true;
+
+    [YamlMember(Alias = "include_private_lan_direct")]
+    public bool IncludePrivateLanDirect { get; set; } = true;
 }
 
 public sealed class RouteRule
