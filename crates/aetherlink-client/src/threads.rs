@@ -38,6 +38,11 @@ const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const TUN_IDLE: Duration = Duration::from_millis(10);
 /// Absurd ciphertext length: fail closed instead of allocating.
 const MAX_WIRE_BODY: usize = 65535 + 1024;
+/// Write stall bound. Without it a write to a silently dead peer blocks
+/// until the kernel gives up on retransmits (minutes), and `stop()` — and
+/// with it `down` — waits on that join while the FFI lock is held.
+/// Progress resets the clock per syscall, so a slow but live link is fine.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Write one sealed frame: 24B header + ciphertext.
 ///
@@ -101,6 +106,9 @@ pub fn read_sealed<R: Read>(r: &mut R) -> std::io::Result<(FrameHeader, Vec<u8>)
 pub struct PumpHandle {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Second handle to the wire socket, used only to unblock the threads
+    /// on `stop()` (a blocked read/write cannot see the stop flag).
+    sock: Option<TcpStream>,
 }
 
 impl PumpHandle {
@@ -108,10 +116,23 @@ impl PumpHandle {
     pub fn stop(&mut self) {
         aetherlink_netstack::debug_log("pump: stop requested");
         self.stop.store(true, Ordering::SeqCst);
+        // Shut the socket first: a thread parked in a read/write on a dead
+        // peer wakes up with an error instead of holding the join hostage.
+        if let Some(sock) = self.sock.take() {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
         while let Some(h) = self.threads.pop() {
             let _ = h.join();
         }
         aetherlink_netstack::debug_log("pump: stopped");
+    }
+
+    /// True while every pump thread is still running. A finished thread
+    /// means the wire or TUN side ended: the session is dead even though
+    /// routes/DNS are still applied, so callers must tear it down.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        !self.threads.is_empty() && self.threads.iter().all(|h| !h.is_finished())
     }
 }
 
@@ -137,7 +158,9 @@ where
     T: TunPackets + Send + 'static,
 {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let read_side = stream.try_clone()?;
+    let shutdown_side = stream.try_clone()?;
     let mut write_side = stream;
     let stop = Arc::new(AtomicBool::new(false));
     let pump = Arc::new(Mutex::new(DataPump::new_split(tx, rx, pad)));
@@ -256,6 +279,7 @@ where
     Ok(PumpHandle {
         stop,
         threads: vec![tun_thread, wire_thread],
+        sock: Some(shutdown_side),
     })
 }
 
@@ -275,6 +299,8 @@ where
 {
     let ConnectedTunnel { mut stream, sess } = tunnel;
     stream.get_mut().set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.get_mut().set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let shutdown_side = stream.get_ref().try_clone()?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_loop = Arc::clone(&stop);
     aetherlink_netstack::debug_log("pump: tls thread spawned");
@@ -402,6 +428,7 @@ where
     Ok(PumpHandle {
         stop,
         threads: vec![thread],
+        sock: Some(shutdown_side),
     })
 }
 

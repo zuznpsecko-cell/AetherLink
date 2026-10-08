@@ -204,9 +204,14 @@ impl Client {
     }
 
     /// Status snapshot as a JSON document (no secrets).
+    ///
+    /// `pump_alive` is false when the tunnel is up but its pump is gone
+    /// (wire or TUN thread ended). Routes and DNS still point into the TUN
+    /// in that state, so the host must tear it down rather than show "Up".
     pub fn status(&self) -> Result<String> {
         serde_json::to_string(&serde_json::json!({
             "up": self.up,
+            "pump_alive": self.pump.as_ref().is_some_and(|p| p.is_alive()),
             "server": self.config.server_addr,
             "dns_mode": self.config.dns_mode,
         }))

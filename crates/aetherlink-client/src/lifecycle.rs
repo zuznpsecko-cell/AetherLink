@@ -9,6 +9,7 @@
 
 use std::net::{Ipv4Addr, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use rustls::client::danger::ServerCertVerifier;
@@ -25,6 +26,12 @@ pub const CLIENT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 0, 2);
 
 /// Virtual DNS gateway forced while up (DNS_NO_LEAK).
 pub const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 0, 1);
+
+/// Bound for the TLS + AUTH handshake. A peer that accepts TCP but never
+/// answers (black-holing middlebox, fallback that keeps the socket open)
+/// would otherwise block `up` forever while the core's global lock is held,
+/// so Connect spins and Disconnect can never get in.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Reconfiguration mutex: up/down never interleave.
 static RECONFIGURE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -216,6 +223,11 @@ pub fn connect(
     // Nagle would stall our small per-frame writes behind delayed ACKs.
     sock.set_nodelay(true)
         .map_err(|e| ClientError::PlatformError(format!("tcp nodelay: {e}")))?;
+    // Bounded handshake; the pump re-arms its own quanta once attached.
+    sock.set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|e| ClientError::PlatformError(format!("tcp read timeout: {e}")))?;
+    sock.set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|e| ClientError::PlatformError(format!("tcp write timeout: {e}")))?;
     aetherlink_netstack::debug_log(&format!("connect: tcp {host}:{port} ok"));
     let name = tls::server_name(&config.outer_sni).map_err(ClientError::Core)?;
     let tls_cfg = Arc::new(match verifier {

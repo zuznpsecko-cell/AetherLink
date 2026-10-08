@@ -44,6 +44,9 @@
                     <TextBlock Text="{Binding ConfigPath, StringFormat='Config: {0}'}" FontSize="11" />
                     <Button Content="Refresh egress IP" Command="{Binding RefreshEgressCommand}"
                             HorizontalAlignment="Left" />
+                    <TextBlock Text="After a crash or forced shutdown the network may still point into the tunnel. Restore it before reconnecting." FontSize="11" TextWrapping="Wrap" />
+                    <Button Content="Restore network" Command="{Binding RestoreNetworkCommand}"
+                            HorizontalAlignment="Left" />
                 </StackPanel>
             </TabItem>
             <TabItem Header="Routes">

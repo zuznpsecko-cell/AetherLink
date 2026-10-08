@@ -29,6 +29,13 @@ public partial class App : Application
             window.Closing += (_, _) => _vm.Shutdown();
             desktop.MainWindow = window;
 
+            // Task Manager kills, sign-out and Windows shutdown skip the
+            // window's Closing event. Without these hooks the tunnel outlives
+            // the process with routes and DNS still pointing into the TUN, and
+            // the machine is offline until someone runs a manual restore.
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => _vm?.Shutdown();
+            Microsoft.Win32.SystemEvents.SessionEnding += (_, _) => _vm?.Shutdown();
+
             _tray = new TrayIcon
             {
                 Icon = new WindowIcon(AssetLoader.Open(new Uri("avares://AetherLink.Gui/Assets/avalonia-logo.ico"))),
@@ -65,7 +72,6 @@ public partial class App : Application
         quit.Click += (_, _) =>
         {
             _tray = null;
-            Services.GuiLog.Close();
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
             {
                 desktop.Shutdown();

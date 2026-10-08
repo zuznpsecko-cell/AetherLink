@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
@@ -7,6 +8,10 @@ namespace AetherLink.Gui.ViewModels;
 public partial class MainViewModel : ViewModelBase
 {
     private readonly Services.TunnelService _tunnel = new();
+
+    // UI-thread only. Set while an Up/Down/restore is in flight so repeated
+    // clicks cannot queue a second tunnel behind the first.
+    private bool _busy;
 
     [ObservableProperty]
     public partial string StatusText { get; set; } = "Down";
@@ -45,15 +50,46 @@ public partial class MainViewModel : ViewModelBase
 
     public MainViewModel()
     {
+        // Changed fires on worker and poll threads; bindings must only be
+        // touched on the UI thread.
+        // Notifications must never break the caller: this also runs from the
+        // process-exit teardown, where a throw would abort the cleanup.
         _tunnel.Changed += () =>
         {
-            StatusText = _tunnel.IsUp ? $"Up ({_tunnel.ServerLabel})" : _tunnel.StatusText;
-            LastError = _tunnel.LastError;
-            OnPropertyChanged(nameof(IsUp));
-            OnPropertyChanged(nameof(ConnectLabel));
+            try
+            {
+                Dispatcher.UIThread.Post(OnTunnelChanged);
+            }
+            catch (Exception ex)
+            {
+                Services.GuiLog.Warn($"ui notify skipped: {ex.Message}");
+            }
         };
         ConfigPath = Services.ConfigService.ResolvePath();
         LoadConfig();
+    }
+
+    private void OnTunnelChanged()
+    {
+        StatusText = _tunnel.PumpDead
+            ? "Lost"
+            : _tunnel.IsUp ? $"Up ({_tunnel.ServerLabel})" : _tunnel.StatusText;
+        if (!string.IsNullOrEmpty(_tunnel.LastError))
+        {
+            LastError = _tunnel.LastError;
+        }
+
+        OnPropertyChanged(nameof(IsUp));
+        OnPropertyChanged(nameof(ConnectLabel));
+
+        // A dead pump leaves the default route in the TUN, which means no
+        // connectivity at all. Restore the network now instead of leaving the
+        // user offline behind a green "Up".
+        if (_tunnel.PumpDead && !_busy)
+        {
+            LastError = "Tunnel lost: the link to the server died. Network restored; press Connect to retry.";
+            _ = TeardownAsync();
+        }
     }
 
     private string? ValidateRules()
@@ -83,14 +119,18 @@ public partial class MainViewModel : ViewModelBase
     [RelayCommand]
     private async Task ConnectDisconnect()
     {
-        LastError = "";
-        if (_tunnel.IsUp)
+        if (_busy)
         {
-            await Task.Run(() => _tunnel.Down()).ConfigureAwait(false);
-            EgressIp = "-";
             return;
         }
 
+        if (_tunnel.IsUp)
+        {
+            await TeardownAsync();
+            return;
+        }
+
+        LastError = "";
         var ruleError = ValidateRules();
         if (ruleError is not null)
         {
@@ -102,35 +142,101 @@ public partial class MainViewModel : ViewModelBase
         SaveConfig();
         var raw = Services.ConfigService.RawText(ConfigPath);
         var label = ServerAddr;
-        var ok = await Task.Run(() =>
+        _busy = true;
+        StatusText = "Connecting...";
+        bool ok;
+        try
         {
-            try
-            {
-                _tunnel.Up(raw, label);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                LastError = ex.Message;
-                return false;
-            }
-        }).ConfigureAwait(false);
+            ok = await Task.Run(() => _tunnel.Up(raw, label));
+        }
+        catch (Exception ex)
+        {
+            LastError = ex.Message;
+            Services.GuiLog.Error($"up threw: {ex.Message}");
+            ok = false;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        OnTunnelChanged();
         if (ok)
         {
-            await RefreshEgressAsync().ConfigureAwait(false);
+            await RefreshEgressAsync();
         }
+    }
+
+    private async Task TeardownAsync()
+    {
+        if (_busy)
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await Task.Run(() => _tunnel.Down());
+        }
+        catch (Exception ex)
+        {
+            LastError = $"disconnect failed: {ex.Message}";
+            Services.GuiLog.Error($"down threw: {ex.Message}");
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        EgressIp = "-";
+        OnTunnelChanged();
+    }
+
+    [RelayCommand]
+    private async Task RestoreNetwork()
+    {
+        if (_busy || _tunnel.IsUp)
+        {
+            LastError = "Disconnect first, then restore the network.";
+            return;
+        }
+
+        LastError = "";
+        _busy = true;
+        string? err;
+        try
+        {
+            err = await Task.Run(() => _tunnel.ForceCleanup());
+        }
+        catch (Exception ex)
+        {
+            err = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+
+        if (err is not null)
+        {
+            LastError = $"restore failed: {err}";
+        }
+
+        OnTunnelChanged();
+        await RefreshEgressAsync();
     }
 
     [RelayCommand]
     private async Task RefreshEgress()
     {
-        await RefreshEgressAsync().ConfigureAwait(false);
+        await RefreshEgressAsync();
     }
 
     private async Task RefreshEgressAsync()
     {
         EgressIp = "checking...";
-        EgressIp = await Services.EgressService.GetEgressIpAsync().ConfigureAwait(false);
+        EgressIp = await Services.EgressService.GetEgressIpAsync();
     }
 
     [RelayCommand]
@@ -226,5 +332,16 @@ public partial class MainViewModel : ViewModelBase
         }
     }
 
-    public void Shutdown() => _tunnel.Down();
+    /// <summary>Window close / process exit / logoff: always bring the tunnel down.</summary>
+    public void Shutdown()
+    {
+        try
+        {
+            _tunnel.Down();
+        }
+        catch (Exception ex)
+        {
+            Services.GuiLog.Error($"shutdown teardown failed: {ex.Message}");
+        }
+    }
 }
