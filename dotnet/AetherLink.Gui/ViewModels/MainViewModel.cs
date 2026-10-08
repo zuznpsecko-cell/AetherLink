@@ -56,6 +56,30 @@ public partial class MainViewModel : ViewModelBase
         LoadConfig();
     }
 
+    private string? ValidateRules()
+    {
+        for (var i = 0; i < Rules.Count; i++)
+        {
+            var r = Rules[i];
+            if (string.IsNullOrWhiteSpace(r.Name))
+            {
+                return $"rule #{i + 1}: name is empty (core requires a name)";
+            }
+
+            if (r.Action != "direct" && r.Action != "tunnel")
+            {
+                return $"rule '{r.Name}': action must be direct|tunnel";
+            }
+
+            if (string.IsNullOrWhiteSpace(r.WhenValue))
+            {
+                return $"rule '{r.Name}': match value is empty";
+            }
+        }
+
+        return null;
+    }
+
     [RelayCommand]
     private async Task ConnectDisconnect()
     {
@@ -64,6 +88,14 @@ public partial class MainViewModel : ViewModelBase
         {
             await Task.Run(() => _tunnel.Down()).ConfigureAwait(false);
             EgressIp = "-";
+            return;
+        }
+
+        var ruleError = ValidateRules();
+        if (ruleError is not null)
+        {
+            LastError = $"config error: {ruleError}";
+            Services.GuiLog.Warn($"connect blocked: {ruleError}");
             return;
         }
 
@@ -118,6 +150,14 @@ public partial class MainViewModel : ViewModelBase
     {
         try
         {
+            // Prefer this app's own log; fall back to newest core log.
+            var guiLog = Services.GuiLog.CurrentPath;
+            if (!string.IsNullOrEmpty(guiLog) && File.Exists(guiLog))
+            {
+                LogText = File.ReadAllText(guiLog);
+                return;
+            }
+
             var dir = Path.Combine(AppContext.BaseDirectory, "logs");
             var latest = new DirectoryInfo(dir).GetFiles("*.txt")
                 .OrderByDescending(f => f.LastWriteTime)

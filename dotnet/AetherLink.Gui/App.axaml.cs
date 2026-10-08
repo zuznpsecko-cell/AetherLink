@@ -21,6 +21,7 @@ public partial class App : Application
 
     public override void OnFrameworkInitializationCompleted()
     {
+        Services.GuiLog.Init();
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             _vm = new MainViewModel();
@@ -64,6 +65,7 @@ public partial class App : Application
         quit.Click += (_, _) =>
         {
             _tray = null;
+            Services.GuiLog.Close();
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
             {
                 desktop.Shutdown();

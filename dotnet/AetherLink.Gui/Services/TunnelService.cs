@@ -25,11 +25,13 @@ internal sealed class TunnelService : IDisposable
             return;
         }
 
+        GuiLog.Info($"up requested ({serverLabel})");
         LastError = "";
         var handle = Native.aether_client_create(configJson);
         if (handle == nuint.Zero)
         {
             Fail(Native.LastError());
+            GuiLog.Error($"create failed: {LastError}");
             return;
         }
 
@@ -46,12 +48,14 @@ internal sealed class TunnelService : IDisposable
         IsUp = true;
         ServerLabel = serverLabel;
         StatusText = "Up";
+        GuiLog.Info($"tunnel up ({serverLabel})");
         StartPolling();
         Changed?.Invoke();
     }
 
     public void Down()
     {
+        GuiLog.Info("tunnel down requested");
         StopPolling();
         if (_handle != nuint.Zero)
         {
@@ -141,6 +145,7 @@ internal sealed class TunnelService : IDisposable
         IsUp = false;
         LastError = err;
         StatusText = "Failed";
+        GuiLog.Error($"tunnel failed: {err}");
         Changed?.Invoke();
     }
 
