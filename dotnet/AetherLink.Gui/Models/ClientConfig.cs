@@ -35,18 +35,55 @@ public sealed class FullTunnelSection
 
 public sealed class RouteRule
 {
-    // Free-form rule document row; the core validates on load.
-    // Common shape: {action, domain} | {action, cidr} — kept generic.
+    // Flat UI shape; serialized as {name, action, priority?, when:{kind: value}}
+    // to match the core schema (Rule::from_doc).
+    [YamlMember(Alias = "name")]
+    public string Name { get; set; } = "";
+
     [YamlMember(Alias = "action")]
     public string Action { get; set; } = "direct";
 
-    [YamlMember(Alias = "domain")]
-    public string? Domain { get; set; }
+    [YamlMember(Alias = "priority")]
+    public int Priority { get; set; } = 50;
 
-    [YamlMember(Alias = "cidr")]
-    public string? Cidr { get; set; }
+    [YamlIgnore]
+    public string WhenKind { get; set; } = "domain";
 
-    public string Display => string.IsNullOrEmpty(Domain) ? (Cidr ?? "?") : Domain;
+    [YamlIgnore]
+    public string WhenValue { get; set; } = "";
+
+    public string Display => string.IsNullOrEmpty(WhenValue) ? Name : $"{WhenKind}:{WhenValue}";
+
+    public Dictionary<string, object> ToMapping() => new()
+    {
+        ["name"] = Name,
+        ["action"] = Action,
+        ["priority"] = Priority,
+        ["when"] = new Dictionary<string, object> { [WhenKind] = WhenValue },
+    };
+
+    public static RouteRule FromMapping(IDictionary<object, object?> map)
+    {
+        static string Str(object? v) => v?.ToString() ?? "";
+        var r = new RouteRule();
+        foreach (var kv in map)
+        {
+            var k = Str(kv.Key);
+            if (k == "name") r.Name = Str(kv.Value);
+            else if (k == "action") r.Action = Str(kv.Value);
+            else if (k == "priority" && int.TryParse(Str(kv.Value), out var p)) r.Priority = p;
+            else if (k == "when" && kv.Value is IDictionary<object, object?> w)
+            {
+                foreach (var ww in w)
+                {
+                    r.WhenKind = Str(ww.Key);
+                    r.WhenValue = Str(ww.Value);
+                    break;
+                }
+            }
+        }
+        return r;
+    }
 }
 
 public sealed class RoutingSection

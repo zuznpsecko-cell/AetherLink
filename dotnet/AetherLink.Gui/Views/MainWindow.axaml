@@ -54,9 +54,10 @@
                     <DataGrid ItemsSource="{Binding Rules}" AutoGenerateColumns="False"
                               CanUserResizeColumns="True" Margin="4">
                         <DataGrid.Columns>
-                            <DataGridTextColumn Header="Action" Binding="{Binding Action}" Width="100" />
-                            <DataGridTextColumn Header="Domain" Binding="{Binding Domain}" Width="*" />
-                            <DataGridTextColumn Header="CIDR" Binding="{Binding Cidr}" Width="160" />
+                            <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="140" />
+                            <DataGridTextColumn Header="Action" Binding="{Binding Action}" Width="90" />
+                            <DataGridTextColumn Header="Match" Binding="{Binding WhenKind}" Width="90" />
+                            <DataGridTextColumn Header="Value" Binding="{Binding WhenValue}" Width="*" />
                             <DataGridTemplateColumn Header="" Width="80">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>

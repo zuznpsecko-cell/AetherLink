@@ -10,8 +10,15 @@ internal static class EgressService
     {
         try
         {
-            var ip = await Http.GetStringAsync("https://ifconfig.me", token).ConfigureAwait(false);
-            return ip.Trim();
+            var ip = (await Http.GetStringAsync("https://ifconfig.me", token).ConfigureAwait(false)).Trim();
+            // ifconfig.me answers plain IP text; anything else (HTML error
+            // page when rate-limited, captive portal) is not an address.
+            if (System.Net.IPAddress.TryParse(ip, out _))
+            {
+                return ip;
+            }
+
+            return "unavailable (unexpected reply — rate-limited?)";
         }
         catch (Exception ex)
         {
