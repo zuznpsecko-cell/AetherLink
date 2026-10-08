@@ -183,6 +183,13 @@ public partial class MainViewModel : ViewModelBase
             Rules.Clear();
             foreach (var r in cfg.Routing.Rules)
             {
+                // Drop fully-empty rows (stale junk from builds without
+                // validation); anything half-filled stays for the user to fix.
+                if (string.IsNullOrWhiteSpace(r.Name) && string.IsNullOrWhiteSpace(r.WhenValue))
+                {
+                    continue;
+                }
+
                 Rules.Add(r);
             }
         }
