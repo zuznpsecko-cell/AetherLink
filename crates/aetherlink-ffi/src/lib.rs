@@ -84,13 +84,21 @@ impl HandleMap {
     }
 }
 
-/// Thread-local last error message
+/// Thread-local last error message, stored **NUL-terminated**: the C ABI
+/// pointer must always be a valid C string — a Rust `String` has no NUL, so
+/// handing out `String::as_ptr()` let CStr read past the allocation into
+/// heap garbage (Utf8Error / garbage tails in every GUI error).
 thread_local! {
-    static LAST_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static LAST_ERROR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn set_last_error(msg: &str) {
-    LAST_ERROR.with(|e| *e.borrow_mut() = msg.to_string());
+    LAST_ERROR.with(|e| {
+        let mut buf = e.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(msg.as_bytes());
+        buf.push(0);
+    });
 }
 
 /// Log callback type: `level` (0 info, higher = more severe), nul-terminated message.
@@ -125,19 +133,21 @@ pub extern "C" fn aether_version() -> *const c_char {
 
 /// Last error message for the calling thread.
 ///
-/// Returns a pointer into the thread-local buffer: valid until the next FFI
-/// call on this thread, and owned by the core — callers must copy the text,
-/// never free the pointer. (The previous `CString::into_raw` leaked on every
-/// call and, worse, let .NET free Rust-allocated memory with CoTaskMemFree
-/// for `string` return values — heap corruption, random GUI crashes.)
+/// Returns a pointer into the thread-local NUL-terminated buffer: valid until
+/// the next FFI call on this thread, and owned by the core — callers must
+/// copy the text, never free the pointer. Null when no error was recorded.
+/// (The previous `CString::into_raw` leaked on every call and, worse, let
+/// .NET free Rust-allocated memory with CoTaskMemFree for `string` return
+/// values — heap corruption, random GUI crashes.)
 #[no_mangle]
 pub extern "C" fn aether_last_error() -> *const c_char {
     LAST_ERROR.with(|e| {
-        let msg = e.borrow();
-        if msg.is_empty() {
+        let buf = e.borrow();
+        // Empty (never set) or just the NUL (set to "") both mean "no error".
+        if buf.len() <= 1 {
             std::ptr::null()
         } else {
-            msg.as_ptr() as *const c_char
+            buf.as_ptr() as *const c_char
         }
     })
 }

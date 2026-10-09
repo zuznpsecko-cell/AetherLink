@@ -181,14 +181,19 @@ fn ffi_last_error_is_thread_local_and_copyable() {
     // Given: a fresh test thread — no error recorded yet
     // Then: null pointer (hosts map it to a default message)
     assert!(aether_last_error().is_null());
-    // When: a call fails on this thread
-    let bad = c("[unclosed");
-    assert_eq!(unsafe { aether_client_create(bad.as_ptr()) }, 0);
-    // Then: the error text is readable, repeatedly (callers copy, never free)
+    // When: a call fails on this thread with a known exact message
+    assert_eq!(
+        unsafe { aether_client_up(usize::MAX) },
+        AetherError::InvalidHandle as i32
+    );
+    // Then: the text is NUL-terminated and EXACT — a Rust String has no NUL,
+    // so the old `String::as_ptr()` handout let CStr read past the allocation
+    // into heap garbage (Utf8Error / garbage tails in every GUI error).
     let ptr = aether_last_error();
     assert!(!ptr.is_null(), "error must be set after a failed call");
     let msg = unsafe { CStr::from_ptr(ptr) }.to_str().expect("utf8");
-    assert!(!msg.is_empty(), "error text must not be empty");
+    assert_eq!(msg, "Invalid client handle");
+    // And: stable across reads until the next FFI call (callers copy, never free)
     let again = aether_last_error();
     assert!(!again.is_null());
     let msg2 = unsafe { CStr::from_ptr(again) }.to_str().expect("utf8");

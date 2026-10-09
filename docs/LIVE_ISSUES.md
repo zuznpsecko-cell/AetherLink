@@ -44,8 +44,10 @@
     делает force_cleanup и один retry Connect.
 11. **`aether_last_error` портил кучу.** `CString::into_raw` утекал на каждый вызов, а .NET
     для `string`-return освобождал Rust-память через CoTaskMemFree ⇒ heap corruption,
-    случайные крэши/зависания GUI. Фикс: thread-local указатель (copy, never free), C#
-    читает через `Marshal.PtrToStringUTF8` (GUI + CLI).
+    случайные крэши/зависания GUI. Фикс: thread-local **NUL-терминированный** буфер
+    (у Rust-`String` нет NUL, поэтому первый вариант с `String::as_ptr()` читался CStr за
+    границу аллокации — ловится тестом на точное совпадение сообщения), C# читает через
+    `Marshal.PtrToStringUTF8` (GUI + CLI + Server).
 12. **Клиенты копились в FFI-карте** (не было `aether_client_free`). Фикс: free после down
     и после failed up (GUI + CLI); drop клиента сам дожимает pump/TUN.
 13. **Autostart (`--minimized`) игнорировался** — окно всё равно показывалось. Фикс: старт

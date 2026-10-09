@@ -121,20 +121,30 @@ fn connect_fails_fast_on_refused_port() {
 
 #[test]
 fn connect_respects_connect_deadline() {
-    // Given: a black-holed address (TEST-NET-1, packets go nowhere) and a
-    // tiny connect deadline — plain TcpStream::connect would hang for the
-    // OS SYN-retry budget (~2min) while holding the FFI lock.
+    // Given: an address that goes nowhere (TEST-NET-1) and a tiny connect
+    // deadline — plain TcpStream::connect would hang for the OS SYN-retry
+    // budget (~2min) while holding the FFI lock.
+    //
+    // Environment note: a middlebox may complete the TCP handshake anyway
+    // (SYN accepted, nothing behind it) — then the connect phase is fast and
+    // the bounded TLS handshake timeout (HANDSHAKE_TIMEOUT) dominates. So the
+    // assertion is BOUNDEDNESS, not a strict wall-clock: the whole call must
+    // fit in connect deadline + handshake timeout + slack, never the OS
+    // SYN-retry budget.
+    let connect_deadline = std::time::Duration::from_millis(150);
     let started = std::time::Instant::now();
     let result = lifecycle::connect_with_timeout(
         &test_config("192.0.2.1:65000"),
         Some(Arc::new(AcceptAll)),
-        std::time::Duration::from_millis(150),
+        connect_deadline,
     );
-    // Then: fails fast with the deadline, never the OS retry budget.
+    // Then: fails, bounded by connect deadline + handshake timeout + slack.
     assert!(result.is_err());
+    let bound =
+        connect_deadline + lifecycle::HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(5);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "connect must respect the deadline, took {:?}",
+        started.elapsed() < bound,
+        "connect must be bounded (deadline + handshake timeout), took {:?} (bound {bound:?})",
         started.elapsed()
     );
 }
