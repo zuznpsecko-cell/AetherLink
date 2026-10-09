@@ -110,8 +110,10 @@ systemctl stop aetherlink-server 2>/dev/null || true
 cp -a dist/ubuntu-server/. "$PREFIX/server/"
 chmod 0755 "$PREFIX/server/AetherLink.Server"
 mkdir -p "$PREFIX/server/fallback"
+# Neutral video-production decoy (never advertise the tunnel here: active
+# probing must see an innocent site). Keep an existing custom page.
 [ -f "$PREFIX/server/fallback/index.html" ] || \
-  echo "<html><body>AetherLink</body></html>" > "$PREFIX/server/fallback/index.html"
+  cp -f "$WORK/deploy/linux/fallback/index.html" "$PREFIX/server/fallback/index.html"
 
 echo "==> [7/9] TLS identity (Cloudflare wildcard or self-signed)..."
 

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>СелМедиа — видеопродакшн: монтаж и постпродакшн</title>
+<meta name="description" content="Студия видеопродакшна СелМедиа: монтаж, цветокоррекция, моушн-дизайн, звуковой постпродакшн.">
+<style>
+:root{--bg:#0d0f14;--card:#161a23;--line:#262c3a;--txt:#e8eaf0;--mut:#9aa3b5;--acc:#e0a458}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:16px/1.6 -apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+.wrap{max-width:960px;margin:0 auto;padding:0 20px}
+header{border-bottom:1px solid var(--line);padding:18px 0}
+header .wrap{display:flex;align-items:center;gap:12px}
+.logo{width:34px;height:34px;flex:none}
+.brand{font-weight:700;font-size:18px;letter-spacing:.5px}
+.brand small{display:block;font-weight:400;font-size:12px;color:var(--mut);letter-spacing:2px}
+nav{margin-left:auto;display:flex;gap:18px;font-size:14px}
+nav a{color:var(--mut);text-decoration:none}
+nav a:hover{color:var(--txt)}
+.hero{padding:64px 0 48px;text-align:left}
+.hero h1{font-size:clamp(28px,5vw,44px);line-height:1.2;margin-bottom:14px}
+.hero h1 span{color:var(--acc)}
+.hero p{color:var(--mut);max-width:640px;margin-bottom:26px}
+.btn{display:inline-block;background:var(--acc);color:#141414;font-weight:600;padding:12px 26px;border-radius:8px;text-decoration:none}
+.btn:hover{filter:brightness(1.08)}
+section{padding:36px 0}
+h2{font-size:22px;margin-bottom:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px}
+.card svg{width:28px;height:28px;stroke:var(--acc);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;margin-bottom:10px}
+.card h3{font-size:16px;margin-bottom:6px}
+.card p{font-size:14px;color:var(--mut)}
+.steps{list-style:none;counter-reset:s}
+.steps li{counter-increment:s;display:flex;gap:14px;padding:12px 0;border-bottom:1px solid var(--line);font-size:15px}
+.steps li::before{content:counter(s,decimal-leading-zero);color:var(--acc);font-weight:700}
+.steps p{color:var(--mut);font-size:14px}
+.about p{color:var(--mut);margin-bottom:12px}
+footer{border-top:1px solid var(--line);padding:22px 0 34px;color:var(--mut);font-size:14px}
+footer a{color:var(--txt)}
+@media(max-width:600px){nav{display:none}.hero{padding:44px 0 32px}}
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<svg class="logo" viewBox="0 0 34 34" fill="none" stroke="#e0a458" stroke-width="2"><rect x="3" y="6" width="28" height="22" rx="4"/><path d="M3 12h28M9 6v6M25 6v6M14 17l6 3.5-6 3.5z" fill="#e0a458" stroke="none"/></svg>
+<div class="brand">СЕЛМЕДИА<small>ВИДЕОПРОДАКШН</small></div>
+<nav><a href="#services">Услуги</a><a href="#process">Процесс</a><a href="#about">О студии</a><a href="#contacts">Контакты</a></nav>
+</div></header>
+<div class="wrap">
+<div class="hero">
+<h1>Монтаж и постпродакшн <span>полного цикла</span></h1>
+<p>Принимаем отснятый материал и доводим его до эфирного качества: режем, красим, озвучиваем и упаковываем под любую площадку — от рекламных роликов до YouTube и корпоративного видео.</p>
+<a class="btn" href="#contacts">Обсудить проект</a>
+</div>
+<section id="services"><h2>Услуги</h2><div class="grid">
+<div class="card">
+<svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M8 7.5 20 19M8 16.5 20 5"/></svg>
+<h3>Монтаж</h3><p>Линейный и нелинейный монтаж, рекламные версии 6/15/30 секунд, нарезки, тизеры и трейлеры.</p></div>
+<div class="card">
+<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18M12 8v4l3 2"/></svg>
+<h3>Цветокоррекция</h3><p>Плёночные и рекламные LUT, выравнивание мультикам-съёмки, HDR-мастеринг, грейдинг под эфир.</p></div>
+<div class="card">
+<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5l5 2.5-5 2.5z"/></svg>
+<h3>Моушн-дизайн и титры</h3><p>Анимированная инфографика, lower thirds, заставки, субтитры и локализация роликов.</p></div>
+<div class="card">
+<svg viewBox="0 0 24 24"><path d="M4 10v4h3l4 4V6l-4 4zM16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11"/></svg>
+<h3>Звуковой постпродакшн</h3><p>Чистка диалогов, дикторская озвучка, саунд-дизайн, сведение и мастеринг под стандарты площадок.</p></div>
+<div class="card">
+<svg viewBox="0 0 24 24"><path d="M12 3v10M12 13l-4-4M12 13l4-4M4 17v3h16v-3"/></svg>
+<h3>Финализация и дистрибуция</h3><p>Мастер-файлы ProRes/DNx, адаптация форматов 16:9, 9:16, 1:1, QC перед сдачей.</p></div>
+<div class="card">
+<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+<h3>Прямые эфиры</h3><p>Мультикам-коммутация, графика и титры в реальном времени, запись и монтаж хайлайтов.</p></div>
+</div></section>
+<section id="process"><h2>Как мы работаем</h2><ul class="steps">
+<li><div><strong>Бриф и исходники</strong><p>Принимаем футажи любым способом, фиксируем задачу, хронометраж и дедлайн.</p></div></li>
+<li><div><strong>Черновой монтаж</strong><p>Первая версия за 3–5 дней: структура, ритм, отбор дублей.</p></div></li>
+<li><div><strong>Постпродакшн</strong><p>Цвет, графика, звук. Две итерации правок включены в смету.</p></div></li>
+<li><div><strong>Сдача</strong><p>Мастер-файл и все версии под площадки, исходный проект — в архив.</p></div></li>
+</ul></section>
+<section id="about" class="about"><h2>О студии</h2>
+<p>«СелМедиа» — небольшая монтажная студия. Работаем с агентствами, брендами и авторами: берём на себя весь постпродакшн, чтобы съёмочная группа занималась съёмкой.</p>
+<p>Монтируем в DaVinci Resolve и Premiere Pro, красим на калиброванных мониторах, звук сводим в treated-комнате.</p></section>
+<section id="contacts"><h2>Контакты</h2>
+<p>Почта: <a href="mailto:hello@selmedia.ru">hello@selmedia.ru</a><br>
+Студия: Москва, работаем по всей стране удалённо<br>
+В письме укажите хронометраж, объём исходников и желаемый срок — ответим со сметой в течение дня.</p></section>
+</div>
+<footer><div class="wrap">© 2026 Студия «СелМедиа» — монтаж и постпродакшн.</div></footer>
+</body>
+</html>
