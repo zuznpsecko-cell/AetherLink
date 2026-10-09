@@ -1,8 +1,10 @@
 //! TDD RED: TLS 1.3-only transport with ALPN (G1).
 //!
 //! Localhost handshake over `aetherlink_core::tls`: version must be TLS 1.3,
-//! ALPN must negotiate `h2`, bytes must flow. Negative paths (TLS 1.2-only
-//! client, plaintext probe) must fail the handshake, never yield a tunnel.
+//! ALPN must negotiate `http/1.1` (the server offers no `h2`: browsers
+//! enforce negotiated framing and the static fallback speaks raw HTTP/1.1),
+//! bytes must flow. Negative paths (TLS 1.2-only client, plaintext probe)
+//! must fail the handshake, never yield a tunnel.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,7 +16,7 @@ mod tls_common;
 use tls_common::{client_tls_config, localhost_cert, server_tls_config, AcceptAll};
 
 #[test]
-fn tls13_handshake_negotiates_h2_and_echoes() {
+fn tls13_handshake_negotiates_http11_and_echoes() {
     // Given: TLS1.3-only server + accepting client
     let (chain, key_der) = localhost_cert();
     let server_cfg = Arc::new(tls::server_config(chain, &key_der).expect("server cfg"));
@@ -35,12 +37,12 @@ fn tls13_handshake_negotiates_h2_and_echoes() {
     let name = tls::server_name("localhost").expect("sni");
     let mut tls = tls::connect_tls(sock, name, &client_cfg).expect("client handshake");
 
-    // Then: TLS 1.3, ALPN h2, transparent bytes
+    // Then: TLS 1.3, ALPN http/1.1, transparent bytes
     assert_eq!(
         tls.conn.protocol_version(),
         Some(rustls::ProtocolVersion::TLSv1_3)
     );
-    assert_eq!(tls.conn.alpn_protocol(), Some(b"h2".as_slice()));
+    assert_eq!(tls.conn.alpn_protocol(), Some(b"http/1.1".as_slice()));
     tls.write_all(b"ping").expect("write");
     let mut back = [0u8; 4];
     tls.read_exact(&mut back).expect("read");

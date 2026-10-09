@@ -1,8 +1,14 @@
-//! TLS 1.3 transport (G1): rustls, ALPN `h2,http/1.1`, sync I/O.
+//! TLS 1.3 transport (G1): rustls, ALPN `http/1.1`, sync I/O.
 //!
 //! The server offers TLS 1.3 ONLY; older versions fail the handshake.
 //! Async (`tokio-rustls`) migration is a later transport task; the cipher
 //! contract (versions, ALPN) is version-agnostic and locked by tests here.
+//!
+//! The server deliberately does NOT offer `h2`: the static fallback speaks
+//! raw HTTP/1.1, and browsers enforce the negotiated framing — an `h2`
+//! negotiation followed by HTTP/1.1 bytes is a protocol error, so every
+//! modern browser would fail the decoy page. The tunnel treats the TLS
+//! stream as an opaque byte pipe and is unaffected by the ALPN choice.
 
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -38,7 +44,11 @@ pub fn load_cert_key(
     Ok((chain, key))
 }
 
-/// TLS1.3-only server config with ALPN `h2,http/1.1`.
+/// TLS1.3-only server config with ALPN `http/1.1`.
+///
+/// No `h2`: browsers enforce negotiated framing, and the static fallback
+/// answers in raw HTTP/1.1 — offering `h2` would break the decoy page in
+/// every modern browser while gaining nothing (the tunnel ignores ALPN).
 pub fn server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key_der: &[u8],
@@ -48,7 +58,7 @@ pub fn server_config(
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
         .map_err(|e| CoreError::TlsError(format!("bad cert/key: {e}")))?;
-    cfg.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+    cfg.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
     Ok(cfg)
 }
 
