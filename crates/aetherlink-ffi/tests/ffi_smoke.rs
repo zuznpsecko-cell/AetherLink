@@ -163,7 +163,9 @@ fn ffi_client_free_releases_handle() {
     // Then: the handle is gone — status/down/free all report InvalidHandle.
     let mut buf = vec![0u8; 256];
     assert_eq!(
-        unsafe { aether_client_status(h, buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len()) },
+        unsafe {
+            aether_client_status(h, buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len())
+        },
         AetherError::InvalidHandle as i32
     );
     assert_eq!(

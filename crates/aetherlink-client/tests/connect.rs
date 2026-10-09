@@ -140,8 +140,7 @@ fn connect_respects_connect_deadline() {
     );
     // Then: fails, bounded by connect deadline + handshake timeout + slack.
     assert!(result.is_err());
-    let bound =
-        connect_deadline + lifecycle::HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(5);
+    let bound = connect_deadline + lifecycle::HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(5);
     assert!(
         started.elapsed() < bound,
         "connect must be bounded (deadline + handshake timeout), took {:?} (bound {bound:?})",
