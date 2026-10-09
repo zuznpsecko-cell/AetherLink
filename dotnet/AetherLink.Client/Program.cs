@@ -30,11 +30,19 @@ internal static partial class Native
     [LibraryImport(Lib)]
     internal static partial int aether_client_force_cleanup();
 
-    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial string? aether_last_error();
+    /// <summary>Release a client handle (best-effort down + drop).</summary>
+    [LibraryImport(Lib)]
+    internal static partial int aether_client_free(nuint handle);
+
+    // The core returns a pointer into its thread-local error buffer: valid
+    // until the next FFI call on this thread, owned by the core — copy the
+    // text, never free the pointer. (Marshalling it as `string` would make
+    // the runtime free Rust-allocated memory with CoTaskMemFree.)
+    [LibraryImport(Lib)]
+    internal static partial IntPtr aether_last_error();
 
     internal static string LastError()
-        => aether_last_error() ?? "unknown core error";
+        => Marshal.PtrToStringUTF8(aether_last_error()) ?? "unknown core error";
 }
 
 internal sealed class AetherClient : IDisposable
@@ -77,6 +85,8 @@ internal sealed class AetherClient : IDisposable
         if (_handle != nuint.Zero)
         {
             _ = Native.aether_client_down(_handle);
+            // Release the client from the core's handle map.
+            _ = Native.aether_client_free(_handle);
             _handle = nuint.Zero;
         }
     }

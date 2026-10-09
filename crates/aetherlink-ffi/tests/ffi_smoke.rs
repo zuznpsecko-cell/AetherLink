@@ -8,8 +8,9 @@
 use std::ffi::{CStr, CString};
 
 use aetherlink_ffi::{
-    aether_client_create, aether_client_down, aether_client_up, aether_server_start,
-    aether_server_stop, aether_version, AetherError,
+    aether_client_create, aether_client_down, aether_client_free, aether_client_status,
+    aether_client_up, aether_last_error, aether_server_start, aether_server_stop, aether_version,
+    AetherError,
 };
 
 fn c(s: &str) -> CString {
@@ -146,4 +147,50 @@ fn ffi_client_create_and_invalid_handle() {
     let no_psk = c(r#"{"server_addr":"example.com:443"}"#);
     assert_eq!(unsafe { aether_client_create(no_psk.as_ptr()) }, 0);
     let _ = h;
+}
+
+#[test]
+fn ffi_client_free_releases_handle() {
+    // Given: a live client handle
+    let cfg = c(r#"{"server_addr":"example.com:443","psk":"x"}"#);
+    let h = unsafe { aether_client_create(cfg.as_ptr()) };
+    assert_ne!(h, 0, "create must yield a handle");
+    // When: freeing it
+    assert_eq!(
+        unsafe { aether_client_free(h) },
+        AetherError::Success as i32
+    );
+    // Then: the handle is gone — status/down/free all report InvalidHandle.
+    let mut buf = vec![0u8; 256];
+    assert_eq!(
+        unsafe { aether_client_status(h, buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len()) },
+        AetherError::InvalidHandle as i32
+    );
+    assert_eq!(
+        unsafe { aether_client_down(h) },
+        AetherError::InvalidHandle as i32
+    );
+    assert_eq!(
+        unsafe { aether_client_free(h) },
+        AetherError::InvalidHandle as i32
+    );
+}
+
+#[test]
+fn ffi_last_error_is_thread_local_and_copyable() {
+    // Given: a fresh test thread — no error recorded yet
+    // Then: null pointer (hosts map it to a default message)
+    assert!(aether_last_error().is_null());
+    // When: a call fails on this thread
+    let bad = c("[unclosed");
+    assert_eq!(unsafe { aether_client_create(bad.as_ptr()) }, 0);
+    // Then: the error text is readable, repeatedly (callers copy, never free)
+    let ptr = aether_last_error();
+    assert!(!ptr.is_null(), "error must be set after a failed call");
+    let msg = unsafe { CStr::from_ptr(ptr) }.to_str().expect("utf8");
+    assert!(!msg.is_empty(), "error text must not be empty");
+    let again = aether_last_error();
+    assert!(!again.is_null());
+    let msg2 = unsafe { CStr::from_ptr(again) }.to_str().expect("utf8");
+    assert_eq!(msg, msg2, "error text is stable until the next FFI call");
 }

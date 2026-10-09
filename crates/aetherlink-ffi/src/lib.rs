@@ -13,7 +13,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::Mutex;
 
-use aetherlink_client::Client;
+use aetherlink_client::{Client, ClientError};
 use aetherlink_server::{Server, ServerGuard};
 
 /// Opaque handle type for FFI
@@ -33,6 +33,10 @@ pub enum AetherError {
     InternalError = -8,
     InvalidArgument = -9,
     PermissionDenied = -10,
+    /// `aether_client_up` refused: a leftover state file (previous run died
+    /// without teardown) blocks bring-up. Hosts auto-recover: force_cleanup
+    /// + retry once.
+    StaleState = -11,
 }
 
 /// Global handle storage
@@ -69,6 +73,10 @@ impl HandleMap {
 
     fn get_client(&mut self, handle: usize) -> Option<&mut Client> {
         self.clients.get_mut(&handle)
+    }
+
+    fn remove_client(&mut self, handle: usize) -> Option<Client> {
+        self.clients.remove(&handle)
     }
 
     fn remove_server(&mut self, handle: usize) -> Option<ServerGuard> {
@@ -115,6 +123,13 @@ pub extern "C" fn aether_version() -> *const c_char {
     VERSION.as_ptr() as *const c_char
 }
 
+/// Last error message for the calling thread.
+///
+/// Returns a pointer into the thread-local buffer: valid until the next FFI
+/// call on this thread, and owned by the core — callers must copy the text,
+/// never free the pointer. (The previous `CString::into_raw` leaked on every
+/// call and, worse, let .NET free Rust-allocated memory with CoTaskMemFree
+/// for `string` return values — heap corruption, random GUI crashes.)
 #[no_mangle]
 pub extern "C" fn aether_last_error() -> *const c_char {
     LAST_ERROR.with(|e| {
@@ -122,9 +137,7 @@ pub extern "C" fn aether_last_error() -> *const c_char {
         if msg.is_empty() {
             std::ptr::null()
         } else {
-            // Leak the string for C caller (they must not free)
-            let cstr = CString::new(msg.as_str()).unwrap();
-            cstr.into_raw()
+            msg.as_ptr() as *const c_char
         }
     })
 }
@@ -231,9 +244,35 @@ pub extern "C" fn aether_client_up(handle: AetherHandle) -> c_int {
 
     match client.up_full(None) {
         Ok(_) => AetherError::Success as c_int,
+        Err(ClientError::StaleState(msg)) => {
+            // Distinct code so hosts can auto-recover (force_cleanup + retry)
+            // instead of just surfacing "run down/cleanup first".
+            set_last_error(&format!("Client up failed: {msg}"));
+            AetherError::StaleState as c_int
+        }
         Err(e) => {
             set_last_error(&format!("Client up failed: {}", e));
             AetherError::NetworkError as c_int
+        }
+    }
+}
+
+/// Release a client handle: best-effort `down` (idempotent) + drop from the
+/// handle map. Hosts call it after `aether_client_down` and after a failed
+/// `aether_client_up`, so repeated connect attempts do not accumulate
+/// clients (each holds a platform with its TUN session).
+#[no_mangle]
+pub extern "C" fn aether_client_free(handle: AetherHandle) -> c_int {
+    let client = HANDLES.lock().unwrap().remove_client(handle);
+    match client {
+        Some(mut c) => {
+            let _ = c.down();
+            ffi_log(0, "client freed");
+            AetherError::Success as c_int
+        }
+        None => {
+            set_last_error("Invalid client handle");
+            AetherError::InvalidHandle as c_int
         }
     }
 }

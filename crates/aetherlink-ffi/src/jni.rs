@@ -93,6 +93,9 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientUp<'local>(
     match handles.get_client(handle as usize) {
         Some(c) => match c.up() {
             Ok(()) => crate::AetherError::Success as jint,
+            Err(aetherlink_client::ClientError::StaleState(_)) => {
+                crate::AetherError::StaleState as jint
+            }
             Err(_) => crate::AetherError::NetworkError as jint,
         },
         None => crate::AetherError::InvalidHandle as jint,

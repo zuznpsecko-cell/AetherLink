@@ -120,6 +120,26 @@ fn connect_fails_fast_on_refused_port() {
 }
 
 #[test]
+fn connect_respects_connect_deadline() {
+    // Given: a black-holed address (TEST-NET-1, packets go nowhere) and a
+    // tiny connect deadline — plain TcpStream::connect would hang for the
+    // OS SYN-retry budget (~2min) while holding the FFI lock.
+    let started = std::time::Instant::now();
+    let result = lifecycle::connect_with_timeout(
+        &test_config("192.0.2.1:65000"),
+        Some(Arc::new(AcceptAll)),
+        std::time::Duration::from_millis(150),
+    );
+    // Then: fails fast with the deadline, never the OS retry budget.
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "connect must respect the deadline, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn connections_get_isolated_keys() {
     // Given: one server, one shared replay cache
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");

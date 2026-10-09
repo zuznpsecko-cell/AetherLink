@@ -26,15 +26,24 @@ public partial class App : Application
         {
             _vm = new MainViewModel();
             var window = new MainWindow { DataContext = _vm };
-            window.Closing += (_, _) => _vm.Shutdown();
+            // Bounded teardown: down() can wait on an in-flight up() and on
+            // pump joins; the window must still close (a missed teardown is
+            // recovered by the stale-state auto-restore on the next Connect).
+            window.Closing += (_, _) => _vm.Shutdown(TimeSpan.FromSeconds(10));
             desktop.MainWindow = window;
+            if (desktop.Args?.Contains("--minimized") == true)
+            {
+                // Autostart passes --minimized: stay in the tray.
+                window.WindowState = WindowState.Minimized;
+            }
 
             // Task Manager kills, sign-out and Windows shutdown skip the
             // window's Closing event. Without these hooks the tunnel outlives
             // the process with routes and DNS still pointing into the TUN, and
             // the machine is offline until someone runs a manual restore.
-            AppDomain.CurrentDomain.ProcessExit += (_, _) => _vm?.Shutdown();
-            Microsoft.Win32.SystemEvents.SessionEnding += (_, _) => _vm?.Shutdown();
+            // ProcessExit gets only ~2s from the runtime: keep the wait short.
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => _vm?.Shutdown(TimeSpan.FromSeconds(2));
+            Microsoft.Win32.SystemEvents.SessionEnding += (_, _) => _vm?.Shutdown(TimeSpan.FromSeconds(2));
 
             _tray = new TrayIcon
             {

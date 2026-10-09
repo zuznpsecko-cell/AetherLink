@@ -27,6 +27,29 @@
    Connect не работает, сеть указывает в мёртвый TUN. Фикс: кнопка «Restore network».
 6. **Выход без teardown.** Kill из диспетчера, sign-out и shutdown Windows не вызывали `Down`.
    Фикс: `AppDomain.ProcessExit` и `SystemEvents.SessionEnding` → `Shutdown()`.
+7. **TCP connect без таймаута.** `lifecycle::connect` звал `TcpStream::connect` — при
+   дропающем SYN сервере `up` висел до ~2 минут (OS retry budget), держа глобальный мьютекс
+   FFI: Connect крутился «вечно», Disconnect не мог вклиниться. Фикс: `CONNECT_TIMEOUT` 10с
+   (`connect_timeout` по каждому резолвленному адресу, первый успешный wins).
+8. **Disconnect во время Connect молча игнорировался.** `_busy` → return, кнопка не меняла
+   подпись ⇒ «при дисконнекте всё зависает». Фикс: подпись «Cancel», teardown дожидается
+   `up` (теперь bounded таймаутами) и снимает туннель сразу после его возврата.
+9. **Shutdown зависал на UI thread.** `window.Closing` вызывал `_tunnel.Down()` синхронно
+   без таймаута — окно не закрывалось, пока down ждал in-flight up/pump join. Фикс:
+   `Shutdown(timeout)` на Task.Run (10с при закрытии окна, 2с в ProcessExit/SessionEnding);
+   невыполненный teardown восстанавливается авто-ретраем по state-файлу (п.10).
+10. **Stale state-файл блокировал Connect навсегда.** После краша/kill `up` падал с
+    «stale state file», GUI не восстанавливал сеть сам ⇒ «не поднимается туннель». Фикс:
+    ядро возвращает спецкод `StaleState` (-11, `ClientError::StaleState`), GUI автоматически
+    делает force_cleanup и один retry Connect.
+11. **`aether_last_error` портил кучу.** `CString::into_raw` утекал на каждый вызов, а .NET
+    для `string`-return освобождал Rust-память через CoTaskMemFree ⇒ heap corruption,
+    случайные крэши/зависания GUI. Фикс: thread-local указатель (copy, never free), C#
+    читает через `Marshal.PtrToStringUTF8` (GUI + CLI).
+12. **Клиенты копились в FFI-карте** (не было `aether_client_free`). Фикс: free после down
+    и после failed up (GUI + CLI); drop клиента сам дожимает pump/TUN.
+13. **Autostart (`--minimized`) игнорировался** — окно всё равно показывалось. Фикс: старт
+    свёрнутым в трей.
 
 Не сделано (следующий шаг, нужны решения по протоколу):
 - **keepalive_s не используется.** Клиент не шлёт Ping, поэтому idle-сессия через NAT может
@@ -34,9 +57,9 @@
   dead-peer детекции при простое нет (сработает таймаут записи при трафике). Нужно: клиент шлёт
   зашифрованный Ping с непустым телом (пустой фрейм сервер читает как EOF и закрывает сессию,
   `read` в пустой буфер даёт `Ok(0)`), сервер эхо-отвечает Ping. Требует тестов на протокол.
-- FFI держит глобальный мьютекс `HANDLES` на всё время `aether_client_up` (после таймаутов
-  это до ~15с + TCP connect). Клиенты в мапе не освобождаются (нет `aether_client_free`);
-  `aether_last_error` утекает по CString на каждый вызов.
+- FFI держит глобальный мьютекс `HANDLES` на всё время `aether_client_up` — теперь bounded:
+  connect 10с + handshake 15с + netsh retries; per-client lock вместо глобального —
+  отдельная задача (сейчас один клиент на процесс, выигрыш малый).
 - Сборка и тесты не запускались (в песочнице нет cargo и dotnet). Перед мержем:
   `cargo test --workspace`, `cargo clippy -- -D warnings`, `dotnet build` GUI, живой прогон
   на Windows: обрыв сети во время туннеля, kill процесса, Restore network.

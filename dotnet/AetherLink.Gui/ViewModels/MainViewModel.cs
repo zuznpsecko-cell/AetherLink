@@ -13,6 +13,15 @@ public partial class MainViewModel : ViewModelBase
     // clicks cannot queue a second tunnel behind the first.
     private bool _busy;
 
+    // UI-thread only. Set when the user presses Disconnect while a Connect
+    // is still in flight: the teardown runs as soon as up() returns (it is
+    // bounded by the core's connect/handshake timeouts).
+    private bool _disconnectRequested;
+
+    // Guards TeardownAsync against re-entry (user click + auto-teardown on a
+    // dead pump can race); TunnelService.Down is idempotent under _opGate.
+    private int _teardownInFlight;
+
     [ObservableProperty]
     public partial string StatusText { get; set; } = "Down";
 
@@ -46,7 +55,7 @@ public partial class MainViewModel : ViewModelBase
     public ObservableCollection<Models.RouteRule> Rules { get; } = new();
 
     public bool IsUp => _tunnel.IsUp;
-    public string ConnectLabel => IsUp ? "Disconnect" : "Connect";
+    public string ConnectLabel => _busy && !_tunnel.IsUp ? "Cancel" : IsUp ? "Disconnect" : "Connect";
 
     public MainViewModel()
     {
@@ -119,18 +128,37 @@ public partial class MainViewModel : ViewModelBase
     [RelayCommand]
     private async Task ConnectDisconnect()
     {
-        if (_busy)
-        {
-            return;
-        }
-
         if (_tunnel.IsUp)
         {
             await TeardownAsync();
             return;
         }
 
+        if (_busy)
+        {
+            // A Connect is still in flight (slow/unreachable server). The
+            // click must not be swallowed: mark the cancel and tear down as
+            // soon as up() returns — down() waits on the same gate, and the
+            // core's connect/handshake timeouts bound that wait.
+            _disconnectRequested = true;
+            StatusText = "Disconnecting...";
+            await TeardownAsync();
+            return;
+        }
+
         LastError = "";
+        if (string.IsNullOrWhiteSpace(ServerAddr))
+        {
+            LastError = "config error: server address is empty";
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(Psk))
+        {
+            LastError = "config error: PSK is empty";
+            return;
+        }
+
         var ruleError = ValidateRules();
         if (ruleError is not null)
         {
@@ -142,8 +170,10 @@ public partial class MainViewModel : ViewModelBase
         SaveConfig();
         var raw = Services.ConfigService.RawText(ConfigPath);
         var label = ServerAddr;
+        _disconnectRequested = false;
         _busy = true;
         StatusText = "Connecting...";
+        OnPropertyChanged(nameof(ConnectLabel));
         bool ok;
         try
         {
@@ -155,12 +185,56 @@ public partial class MainViewModel : ViewModelBase
             Services.GuiLog.Error($"up threw: {ex.Message}");
             ok = false;
         }
-        finally
+
+        if (!ok && _tunnel.StaleState && !_disconnectRequested)
         {
-            _busy = false;
+            // A previous run died without teardown and its state file blocks
+            // bring-up (routes/DNS may still point into a dead TUN). Restore
+            // the network from it and retry once, automatically — otherwise
+            // Connect could never succeed until a manual "Restore network".
+            Services.GuiLog.Warn("stale tunnel state: restoring network, retrying connect");
+            LastError = "Previous session left the network in tunnel state — restoring, retrying…";
+            string? cleanupErr;
+            try
+            {
+                cleanupErr = await Task.Run(() => _tunnel.ForceCleanup());
+            }
+            catch (Exception ex)
+            {
+                cleanupErr = ex.Message;
+            }
+
+            if (cleanupErr is null)
+            {
+                try
+                {
+                    ok = await Task.Run(() => _tunnel.Up(raw, label));
+                }
+                catch (Exception ex)
+                {
+                    LastError = ex.Message;
+                    Services.GuiLog.Error($"up retry threw: {ex.Message}");
+                    ok = false;
+                }
+            }
+            else
+            {
+                LastError = $"restore failed: {cleanupErr}";
+                Services.GuiLog.Error($"stale-state cleanup failed: {cleanupErr}");
+            }
         }
 
+        _busy = false;
+        OnPropertyChanged(nameof(ConnectLabel));
+
         OnTunnelChanged();
+        if (ok && _disconnectRequested)
+        {
+            // Cancelled while connecting: tear down immediately.
+            await TeardownAsync();
+            return;
+        }
+
         if (ok)
         {
             await RefreshEgressAsync();
@@ -169,12 +243,15 @@ public partial class MainViewModel : ViewModelBase
 
     private async Task TeardownAsync()
     {
-        if (_busy)
+        // One teardown at a time. Deliberately NOT gated on _busy: a
+        // Disconnect pressed while Connect is in flight must run (it waits
+        // on TunnelService's gate until up() returns) instead of being
+        // ignored — that ignore was the "disconnect hangs" bug.
+        if (Interlocked.Exchange(ref _teardownInFlight, 1) != 0)
         {
             return;
         }
 
-        _busy = true;
         try
         {
             await Task.Run(() => _tunnel.Down());
@@ -186,7 +263,7 @@ public partial class MainViewModel : ViewModelBase
         }
         finally
         {
-            _busy = false;
+            _teardownInFlight = 0;
         }
 
         EgressIp = "-";
@@ -332,12 +409,23 @@ public partial class MainViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Window close / process exit / logoff: always bring the tunnel down.</summary>
-    public void Shutdown()
+    /// <summary>Window close: bring the tunnel down, bounded wait.</summary>
+    public void Shutdown() => Shutdown(TimeSpan.FromSeconds(10));
+
+    /// <summary>
+    /// Window close / process exit / logoff: always bring the tunnel down.
+    ///
+    /// Never blocks the caller indefinitely: down() waits for any in-flight
+    /// up() (bounded by the core's connect/handshake timeouts) and joins the
+    /// pump threads. On timeout the process exits anyway; the leftover state
+    /// file is recovered automatically on the next Connect (stale-state
+    /// auto-restore), so a missed teardown cannot wedge the machine.
+    /// </summary>
+    public void Shutdown(TimeSpan timeout)
     {
         try
         {
-            _tunnel.Down();
+            Task.Run(() => _tunnel.Down()).Wait(timeout);
         }
         catch (Exception ex)
         {

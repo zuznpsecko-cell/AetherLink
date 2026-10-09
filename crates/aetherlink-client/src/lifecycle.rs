@@ -7,7 +7,7 @@
 //! `down` is a safe no-op when the tunnel is not up. One global mutex
 //! serializes reconfiguration.
 
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +33,13 @@ pub const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 0, 1);
 /// so Connect spins and Disconnect can never get in.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Bound for the TCP connect itself. `TcpStream::connect` has no timeout:
+/// a black-holed server (SYN dropped) would block `up` for the OS retry
+/// budget (~2min on Windows) while the FFI lock is held — Connect spins and
+/// Disconnect can never get in. Handshake timeouts cover everything after
+/// the socket is established.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Reconfiguration mutex: up/down never interleave.
 static RECONFIGURE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -49,7 +56,7 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         .ok_or_else(|| ClientError::ConfigError("server_addr must be host:port".to_string()))?;
     let state_path = platform.state_path();
     if state_path.exists() {
-        return Err(ClientError::PlatformError(
+        return Err(ClientError::StaleState(
             "tunnel already up or stale state file: run down/cleanup first".to_string(),
         ));
     }
@@ -71,7 +78,7 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         .iter()
         .any(|s| s == &VIRTUAL_DNS_IP.to_string())
     {
-        return Err(ClientError::PlatformError(
+        return Err(ClientError::StaleState(
             "stale tunnel DNS in snapshot: run down/cleanup first".to_string(),
         ));
     }
@@ -211,6 +218,18 @@ pub fn connect(
     config: &ClientConfig,
     verifier: Option<Arc<dyn ServerCertVerifier>>,
 ) -> Result<ConnectedTunnel> {
+    connect_with_timeout(config, verifier, CONNECT_TIMEOUT)
+}
+
+/// Connect with an explicit TCP-connect deadline (tests shrink it).
+///
+/// Each resolved address gets its own `connect_timeout` budget: the first
+/// reachable one wins, all failing reports the last error.
+pub fn connect_with_timeout(
+    config: &ClientConfig,
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
+    connect_timeout: Duration,
+) -> Result<ConnectedTunnel> {
     let (host, port) = config
         .server_addr
         .rsplit_once(':')
@@ -218,8 +237,25 @@ pub fn connect(
     let port: u16 = port
         .parse()
         .map_err(|_| ClientError::ConfigError("server_addr port invalid".to_string()))?;
-    let sock = TcpStream::connect((host, port))
-        .map_err(|e| ClientError::PlatformError(format!("tcp connect: {e}")))?;
+    // Resolve once, then race each address against the connect deadline:
+    // plain TcpStream::connect has no timeout and would hold the FFI lock
+    // for the OS SYN-retry budget (~2min on Windows) on a black-holed peer.
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| ClientError::PlatformError(format!("resolve {host}: {e}")))?
+        .collect();
+    let mut last_err = "no server address".to_string();
+    let mut sock = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, connect_timeout) {
+            Ok(s) => {
+                sock = Some(s);
+                break;
+            }
+            Err(e) => last_err = format!("tcp connect {addr}: {e}"),
+        }
+    }
+    let sock = sock.ok_or_else(|| ClientError::PlatformError(last_err))?;
     // Nagle would stall our small per-frame writes behind delayed ACKs.
     sock.set_nodelay(true)
         .map_err(|e| ClientError::PlatformError(format!("tcp nodelay: {e}")))?;

@@ -46,6 +46,12 @@ pub enum ClientError {
 
     #[error("Platform error: {0}")]
     PlatformError(String),
+
+    /// A leftover state file (previous run died without teardown) blocks
+    /// `up`. Distinct from a generic platform error so FFI hosts can
+    /// auto-recover (force_cleanup + retry) instead of just reporting.
+    #[error("Stale tunnel state: {0}")]
+    StaleState(String),
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;

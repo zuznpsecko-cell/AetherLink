@@ -35,6 +35,13 @@ internal sealed class TunnelService : IDisposable
     public string LastError { get; private set; } = "";
     public string ServerLabel { get; private set; } = "";
 
+    /// <summary>
+    /// Set when the core refused `up` because a leftover state file (a
+    /// previous run died without teardown) blocks bring-up. The UI reacts:
+    /// force_cleanup + one automatic retry.
+    /// </summary>
+    public bool StaleState { get; private set; }
+
     public event Action? Changed;
 
     /// <summary>Bring the tunnel up. Returns true when it is up afterwards.</summary>
@@ -50,6 +57,7 @@ internal sealed class TunnelService : IDisposable
             GuiLog.Info($"up requested ({serverLabel})");
             LastError = "";
             PumpDead = false;
+            StaleState = false;
             var handle = Native.aether_client_create(configJson);
             if (handle == nuint.Zero)
             {
@@ -58,13 +66,19 @@ internal sealed class TunnelService : IDisposable
                 return false;
             }
 
-            if (Native.aether_client_up(handle) != 0)
+            var rc = Native.aether_client_up(handle);
+            if (rc != 0)
             {
                 var err = Native.LastError();
-                // Core already rolls routes/DNS back on failure; the down call
-                // only releases whatever a half-finished attempt left behind.
+                StaleState = rc == Native.StaleStateCode;
+                // Core already rolls routes/DNS back on failure; down+free
+                // only release whatever a half-finished attempt left behind
+                // (and keep the core's handle map from accumulating clients).
                 _ = Native.aether_client_down(handle);
-                Fail($"{err} (routes/DNS rolled back by core).");
+                _ = Native.aether_client_free(handle);
+                Fail(StaleState
+                    ? $"{err} (network will be restored, retrying)"
+                    : $"{err} (routes/DNS rolled back by core).");
                 return false;
             }
 
@@ -89,9 +103,15 @@ internal sealed class TunnelService : IDisposable
             StopPolling();
             var handle = _handle;
             _handle = nuint.Zero;
-            if (handle != nuint.Zero && Native.aether_client_down(handle) != 0)
+            if (handle != nuint.Zero)
             {
-                GuiLog.Error($"down reported: {Native.LastError()}");
+                if (Native.aether_client_down(handle) != 0)
+                {
+                    GuiLog.Error($"down reported: {Native.LastError()}");
+                }
+                // Release the client from the core's handle map (idempotent;
+                // its down is a safety net, the pump is already stopped).
+                _ = Native.aether_client_free(handle);
             }
 
             IsUp = false;
