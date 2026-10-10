@@ -87,6 +87,27 @@ if (Test-Path -LiteralPath $nm) {
     Write-Output "skip jni symbol checks (llvm-nm not found)"
 }
 
+# --- Native Linux thin host (aetherlink-cli): core lifecycle + hotspot only ---
+# DEC-013: the CLI links the Rust client crate directly; it must still carry
+# NO protocol/crypto/packet code of its own (AGENT_INSTRUCTIONS §1.1).
+$cliMain    = "$root/crates/aetherlink-cli/src/main.rs"
+$cliHotspot = "$root/crates/aetherlink-cli/src/hotspot_cmd.rs"
+$cliSignals = "$root/crates/aetherlink-cli/src/signals.rs"
+$cliCargo   = "$root/crates/aetherlink-cli/Cargo.toml"
+Check "exists $cliMain" (Test-Path -LiteralPath $cliMain)
+Check "exists $cliHotspot" (Test-Path -LiteralPath $cliHotspot)
+Check "exists $cliSignals" (Test-Path -LiteralPath $cliSignals)
+Check "exists $cliCargo" (Test-Path -LiteralPath $cliCargo)
+Check "cli drives core up_full" (Has-Text $cliMain "up_full")
+Check "cli drives core down" (Has-Text $cliMain "\.down\(\)")
+Check "cli drives force_cleanup" (Has-Text $cliMain "force_cleanup")
+Check "cli drives hotspot lifecycle" (Has-Text $cliMain "aetherlink_hotspot::(up|status|down)")
+Check "cli depends on no protocol crate" (No-Text $cliCargo "aetherlink-protocol")
+Check "cli depends on no crypto crate" (No-Text $cliCargo "aetherlink-crypto")
+Check "cli depends on no frame/mux crate" (No-Text $cliCargo "aetherlink-(frame|mux|netstack)")
+Check "cli depends on no TLS stack" (No-Text $cliCargo "rustls")
+Check "cli code has no crypto calls" (No-Text $cliMain "(chacha|ChaCha|hmac|HMAC|AesGcm|rustls)")
+
 # --- deploy scripts mention lifecycle + DNS restore ---
 Check "linux deploy restores DNS" (Has-Text $linDeploy "(resolv|systemd-resolved|DNS)")
 Check "linux deploy cleanup" (Has-Text $linDeploy "(cleanup|force_cleanup|state\.json)")

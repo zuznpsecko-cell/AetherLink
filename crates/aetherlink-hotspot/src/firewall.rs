@@ -16,6 +16,30 @@ pub const RULESET_PATH: &str = "/run/aetherlink/hotspot.nft";
 /// Tunnel interface client traffic is allowed into.
 pub const TUN_IFACE: &str = "aether0";
 
+/// The tunnel interface the guard protects, resolved against what actually
+/// exists: `up` requests `aether0`, but the kernel may grant a renamed
+/// device on name collision — guarding a ghost would fail-closed forever.
+/// When nothing exists yet (hotspot before tunnel) fall back to the
+/// canonical name.
+#[must_use]
+pub fn resolve_tun_iface() -> String {
+    if std::path::Path::new(&format!("/sys/class/net/{TUN_IFACE}")).exists() {
+        return TUN_IFACE.to_string();
+    }
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("aether"))
+            .collect();
+        names.sort();
+        if let Some(first) = names.into_iter().next() {
+            return first;
+        }
+    }
+    TUN_IFACE.to_string()
+}
+
 /// Render the guard ruleset (pure; tested without privileges).
 ///
 /// Rule order: MSS clamp for client SYNs (TUN MTU is smaller than WiFi's),
@@ -39,10 +63,12 @@ pub fn ruleset_text(wlan_iface: &str, tun_iface: &str) -> String {
 }
 
 /// Apply the guard: delete any stale table, load the fresh one (idempotent).
-pub fn apply(wlan_iface: &str) -> Result<()> {
+/// Returns the tunnel interface name the ruleset was bound to.
+pub fn apply(wlan_iface: &str) -> Result<String> {
     std::fs::create_dir_all("/run/aetherlink")
         .map_err(|e| HotspotError::Tool(format!("create /run/aetherlink: {e}")))?;
-    let text = ruleset_text(wlan_iface, TUN_IFACE);
+    let tun_iface = resolve_tun_iface();
+    let text = ruleset_text(wlan_iface, &tun_iface);
     std::fs::write(RULESET_PATH, &text)
         .map_err(|e| HotspotError::Tool(format!("write {RULESET_PATH}: {e}")))?;
     // Idempotency: a stale table (crash between apply and state save) must
@@ -57,7 +83,7 @@ pub fn apply(wlan_iface: &str) -> Result<()> {
             "{e} (install `nftables`: apt install nftables)"
         ))
     })?;
-    Ok(())
+    Ok(tun_iface)
 }
 
 /// Delete the guard table. Best-effort by contract (teardown path): an

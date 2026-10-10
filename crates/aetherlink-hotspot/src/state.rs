@@ -27,6 +27,13 @@ pub struct HotspotState {
     /// NetworkManager for the AP's lifetime; `down` flips it back.
     #[serde(default)]
     pub nm_unmanaged: bool,
+    /// Tunnel interface the nftables guard was bound to (status/debug).
+    #[serde(default = "default_tun_iface")]
+    pub tun_iface: String,
+}
+
+fn default_tun_iface() -> String {
+    crate::firewall::TUN_IFACE.to_string()
 }
 
 fn dir() -> &'static str {
@@ -75,12 +82,14 @@ mod tests {
             subnet: "192.168.243.0/24".to_string(),
             prev_ip_forward: "0".to_string(),
             nm_unmanaged: true,
+            tun_iface: "aether0".to_string(),
         };
         let raw = serde_json::to_string(&st).expect("encode");
         let back: HotspotState = serde_json::from_str(&raw).expect("decode");
         assert_eq!(back.backend, BackendKind::Hostapd);
         assert_eq!(back.prev_ip_forward, "0");
         assert!(back.nm_unmanaged);
+        assert_eq!(back.tun_iface, "aether0");
         // The on-disk format pins backend spellings other tools rely on.
         assert!(raw.contains("\"backend\":\"hostapd\""));
     }
@@ -94,5 +103,7 @@ mod tests {
                       "prev_ip_forward":"0"}"#;
         let back: HotspotState = serde_json::from_str(old).expect("decode old");
         assert!(!back.nm_unmanaged);
+        // Older states get the canonical tunnel name, not an empty string.
+        assert_eq!(back.tun_iface, "aether0");
     }
 }

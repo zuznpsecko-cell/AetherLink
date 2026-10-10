@@ -31,7 +31,7 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | **Phase 15: Deploy Scripts** | ✅ Done | install/uninstall from dist + example configs + checks |
 | **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live runbook pending privs |
 | **Phase I: Assembly (VPN works)** | ⏳ Next | OPEN frames → bind/serve loop → client up tail → FFI threads → live E2E (see PLAN_FINAL_TDD.md) |
-| **Phase L: Linux client (Ubuntu 24.04)** | ✅ Code | `/dev/net/tun` + iproute2 + resolvectl platform (DEC-013), native `aetherlink-cli` thin host, WiFi hotspot sharing the tunnel (DEC-014: NM/hostapd backends, fail-closed nft guard, NM auto-detach for hostapd, lowest-metric default snapshot); live runs pending root + a WiFi NIC |
+| **Phase L: Linux client (Ubuntu 24.04)** | ✅ Code | `/dev/net/tun` + iproute2 + resolvectl platform (DEC-013), native `aetherlink-cli` thin host, WiFi hotspot sharing the tunnel (DEC-014: NM/hostapd backends, fail-closed nft guard with kernel-rename-tolerant tunnel iface, NM auto-detach for hostapd, lowest-metric default snapshot, thin-host contract check); live runs pending root + a WiFi NIC |
 
 ## Detailed Status
 

@@ -127,7 +127,8 @@ pub fn up(cfg: &HotspotConfig) -> Result<state::HotspotState> {
 
     // Fail-closed guard before any client can associate: wlan traffic may
     // only leave through the tunnel interface; everything else drops.
-    firewall::apply(&iface)?;
+    // Returns the tunnel name it was bound to (kernel renames tolerated).
+    let tun_iface = firewall::apply(&iface)?;
 
     let prev_ip_forward = match proc::ensure_ip_forward() {
         Ok(prev) => prev,
@@ -162,6 +163,7 @@ pub fn up(cfg: &HotspotConfig) -> Result<state::HotspotState> {
         subnet: cfg.subnet.clone(),
         prev_ip_forward,
         nm_unmanaged,
+        tun_iface,
     };
     state::save(&st)?;
     log(&format!(
@@ -213,6 +215,7 @@ pub fn status() -> String {
         "interface": st.interface,
         "ssid": st.ssid,
         "subnet": st.subnet,
+        "tunnel_iface": st.tun_iface,
     })
     .to_string()
 }
