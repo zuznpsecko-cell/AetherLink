@@ -31,6 +31,7 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | **Phase 15: Deploy Scripts** | ✅ Done | install/uninstall from dist + example configs + checks |
 | **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live runbook pending privs |
 | **Phase I: Assembly (VPN works)** | ⏳ Next | OPEN frames → bind/serve loop → client up tail → FFI threads → live E2E (see PLAN_FINAL_TDD.md) |
+| **Phase L: Linux client (Ubuntu 24.04)** | ✅ Code | `/dev/net/tun` + iproute2 + resolvectl platform (DEC-013), native `aetherlink-cli` thin host, WiFi hotspot sharing the tunnel (DEC-014: NM/hostapd backends, fail-closed nft guard, NM auto-detach for hostapd, lowest-metric default snapshot); live runs pending root + a WiFi NIC |
 
 ## Detailed Status
 
@@ -52,9 +53,11 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | aetherlink-netstack | ✅ | ✅ 1 + 11 + 6 + 4 |
 | aetherlink-core | ✅ | ✅ 3 + 4 + 4 |
 | aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 |
-| aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 6 + 4 + 2 + 13 + 10 |
+| aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 6 + 4 + 2 + 13 + 10 (+ Linux platform: linux_net + linux_up_down, privilege-tolerant) |
 | aetherlink-ffi | ✅ | ✅ 3 + 5 + 5 (+cdylib) |
 | aetherlink-protocol | ✅ | ✅ 6 + 5 |
+| aetherlink-hotspot | ✅ | ✅ config + nm + hostapd + firewall pure-builder tests (no privs) |
+| aetherlink-cli | ✅ | n/a (thin bin: lifecycle + hotspot dispatch; exercised via live runs) |
 
 ## DoD Checklist (from AGENT_INSTRUCTIONS.md)
 
@@ -66,7 +69,9 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | 4 | DNS when up only through tunnel (no leak test) | 🔄 (policy green; live capture pending privs) |
 | 5 | Domain direct: resolve via tunnel, connect direct | 🔄 (engine green; live pending privs) |
 | 6 | Wintun path Windows (like v2rayN) | 🔄 (crate 0.5.1 open path green; live session pending privs) |
-| 7 | Linux TUN full tunnel + rollback | 🔄 (planner green; live pending privs) |
+| 7 | Linux TUN full tunnel + rollback | ✅ code (`platform::linux`, `/dev/net/tun`, iproute2, resolvectl; journal replay; live pending root) |
+| 13 | Linux native client (Ubuntu 24.04) | ✅ code (`aetherlink-cli`, DEC-013; live pending root) |
+| 14 | Share tunnel over WiFi (hotspot) | ✅ code (`aetherlink-hotspot`, DEC-014: NM + hostapd, fail-closed nft guard; live pending root + WiFi NIC) |
 | 8 | .NET hosts self-contained win/linux | ✅ (both build 0/0) |
 | 9 | Android+TV split default all | 🔄 (APK builds; on-device pending) |
 | 10 | G2 static fallback | ✅ (decision + accept-loop tested) |

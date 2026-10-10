@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Quickstart contract checks (TDD RED first, then GREEN).
 # scripts/ must let a user go from zero to running server/client with one command
 # on Windows (PowerShell) and Ubuntu (bash): build core -> publish hosts ->
@@ -41,8 +41,10 @@ Check "win-client needs admin" (Has-Text $winClient "(admin|Admin|elevat)")
 Check "ubu-server builds ffi cdylib" (Has-Text $ubuServer "cargo build.*aetherlink-ffi")
 Check "ubu-server publishes host" (Has-Text $ubuServer "dotnet publish.*AetherLink\.Server")
 Check "ubu-server runs server yaml" (Has-Text $ubuServer "server\.example\.yaml|server\.yaml")
-Check "ubu-client builds ffi cdylib" (Has-Text $ubuClient "cargo build.*aetherlink-ffi")
-Check "ubu-client publishes host" (Has-Text $ubuClient "dotnet publish.*AetherLink\.Client")
+# Linux client is the native thin host (aetherlink-cli) over the Rust core:
+# no .NET runtime on the client box (DEC-013; the FFI/.NET path still works).
+Check "ubu-client builds native client" (Has-Text $ubuClient "cargo build.*aetherlink-cli")
+Check "ubu-client stages the binary" (Has-Text $ubuClient "aetherlink-cli")
 Check "ubu-client ups with sudo" (Has-Text $ubuClient "sudo")
 Check "ubu-client traps teardown" (Has-Text $ubuClient "trap")
 Check "ubu-client restores on exit" (Has-Text $ubuClient "(cleanup|down)")

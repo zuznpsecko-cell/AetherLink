@@ -7,10 +7,14 @@ set -euo pipefail
 PREFIX="${PREFIX:-/opt/aetherlink}"
 STATE_DIR="/var/lib/aetherlink"
 
-if [ -x "$PREFIX/client/AetherLink.Client" ]; then
+if [ -x "$PREFIX/client/aetherlink-cli" ]; then
+  "$PREFIX/client/aetherlink-cli" "$PREFIX/client.example.yaml" cleanup || true
+elif [ -x "$PREFIX/client/AetherLink.Client" ]; then
   "$PREFIX/client/AetherLink.Client" "$PREFIX/client.example.yaml" cleanup || true
 fi
+systemctl disable --now aetherlink-client 2>/dev/null || true
 systemctl disable --now aetherlink-server 2>/dev/null || true
+rm -f /etc/systemd/system/aetherlink-client.service
 rm -f /etc/systemd/system/aetherlink-server.service
 systemctl daemon-reload 2>/dev/null || true
 rm -rf "$PREFIX" "$STATE_DIR"

@@ -20,5 +20,20 @@ routing:
   default_action: tunnel
   rules: []
 
+# Linux only (Ubuntu 24.04): share the tunneled traffic over WiFi.
+# Ignored by the Windows/.NET and Android hosts. Start with
+#   aetherlink-cli <config> up            (needs hotspot.enabled: true)
+#   aetherlink-cli hotspot up             (standalone, flags below)
+# Clients that join the AP route through the tunnel; when the tunnel is
+# down they are blocked (fail-closed), never leaked direct. See
+# docs/LINUX_CLIENT.md.
+#hotspot:
+#  enabled: true
+#  interface: wlan0              # omit to autodetect the first WiFi device
+#  ssid: AetherLink
+#  password: change-me-8-plus    # WPA2-PSK, 8..=63 chars
+#  subnet: 192.168.243.0/24      # client pool; avoid your home LAN subnet
+#  backend: auto                 # auto | network-manager | hostapd
+
 # Android only:
 # split_tunnel: { mode: all, apps: [] }

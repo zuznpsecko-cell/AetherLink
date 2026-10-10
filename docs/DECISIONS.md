@@ -292,3 +292,106 @@ passive observation and unsolicited connection attempts.
 ### Non-goals (explicitly out of scope)
 - Custom per-browser ClientHello mimicry libraries; ECH; traffic decoys.
   Revisit only with measured need, as separate DECs.
+
+---
+
+## DEC-013: Linux Client Platform (Ubuntu 24.04)
+
+**Date:** 2026-10-10
+**Status:** Accepted
+
+### Context
+The Windows client (Wintun + `route`/`netsh` + .NET host over FFI) is
+working. A Linux client is needed on the same Rust core, targeting
+Ubuntu 24.04, with the same full-tunnel safety invariants (pin route,
+def1 default swap, DNS-no-leak, snapshot/rollback, crash journal).
+
+### Decision
+- **Host:** native thin Rust binary `aetherlink-cli` (crate
+  `aetherlink-cli`) linking `aetherlink-client` directly. No second
+  protocol stack — all wire/crypto/netstack stays in the core
+  (AGENT_INSTRUCTIONS §1.1; the CLI is the sanctioned "optional Rust
+  CLI" host). The .NET-over-FFI path also works on Linux now (the
+  platform backend is chosen at compile time), but the native binary is
+  the deliverable: no .NET runtime on the client box.
+- **TUN:** `/dev/net/tun` via `TUNSETIFF` (IFF_TUN | IFF_NO_PI), raw IP
+  packets, non-blocking fd held for the session. The device is created
+  non-persistent, so closing the last fd deletes it — a crashed client
+  cannot leave a stale TUN behind.
+- **Routes:** iproute2 `ip`. Server pin + direct rules via
+  `ip route add ... via <prev-gw>`; default swap is the same
+  OpenVPN-style **def1** pair as Windows (`0.0.0.0/1` + `128.0.0.0/1`),
+  gatewayed at the virtual DNS IP `10.255.0.1` which is on-link on the
+  TUN /30 (TUN is NOARP, so the kernel hands packets straight to the fd).
+- **DNS:** Ubuntu 24.04 runs `systemd-resolved`. Force = `resolvectl dns
+  <phys> 10.255.0.1` + `resolvectl domain <phys> '~.'` (route every name
+  into the tunnel resolver); restore = `resolvectl revert <phys>`.
+  Fallback for resolved-less systems: rewrite `/etc/resolv.conf` with an
+  exact-restore marker (symlink vs file vs missing).
+- **Crash recovery:** identical journal contract to Windows
+  (`UpState` applied-change log, replayed by `down`/`force_cleanup`),
+  state at `/var/lib/aetherlink/state.json`.
+
+### Rationale
+- iproute2 + resolvectl are the stock, locale-independent tooling on the
+  target; parsing their keyword-shaped output is robust (parsers are pure
+  and unit-tested, mirroring `platform/windows.rs`).
+- def1 avoids touching/metric-warring the real default route and makes
+  rollback trivial, already proven on Windows.
+- A native binary keeps the client box dependency-free (Rust is only a
+  build-time requirement).
+
+---
+
+## DEC-014: WiFi Hotspot — Sharing the Tunnel (Linux)
+
+**Date:** 2026-10-10
+**Status:** Accepted
+
+### Context
+The Linux client must be able to *share* the tunneled traffic over WiFi
+(the box becomes an access point; joined devices go through the tunnel).
+Ubuntu 24.04 installs differ: Desktop has NetworkManager, Server does not.
+
+### Decision
+- **Two backends, one entry point** (`aetherlink-hotspot` crate,
+  `hotspot up/down/status` CLI + `hotspot:` config section):
+  - `network-manager`: one `nmcli` connection, `wifi.mode ap` +
+    `ipv4.method shared` (NM runs DHCP + NAT). Desktop default.
+  - `hostapd` + `dnsmasq`: generated configs in `/run/aetherlink/`.
+    Headless default. `auto` picks NM when it runs and manages the WiFi
+    device, else hostapd. When hostapd is used on a box where
+    NetworkManager runs, the WiFi device is set `managed no` for the AP's
+    lifetime (NM would otherwise grab the channel and kill hostapd) and
+    handed back on `down` — recorded in state so only a device we flipped
+    is ever re-managed.
+- **Client subnet:** default `192.168.243.0/24` (away from common home
+  /24s so the LAN-direct rules rarely shadow it); gateway/DNS = `.1`,
+  DHCP pool `.100-.199` (full remaining range on tiny prefixes).
+- **Fail-closed guard:** a dedicated nftables table
+  (`inet aetherlink_hotspot`) lets traffic from the AP interface leave
+  **only** through the tunnel interface `aether0`; everything else from
+  the AP is dropped, and client TCP SYN gets an MSS clamp to the tunnel
+  MTU. If the tunnel is down, clients are blocked instead of leaking
+  direct. The table is applied on `up`, deleted on `down` — owned
+  end-to-end by the hotspot.
+- **DNS:** clients receive the box's hotspot address as DNS; dnsmasq/NM
+  forward upstream to the box resolver, which is tunnel-forced while up
+  (DNS_NO_LEAK) — no separate leak path for hotspot clients.
+- **ip_forward** is enabled on `up` and restored to its exact previous
+  value on `down`; runtime state (backend, iface, subnet, prev
+  ip_forward) persists in `/run/aetherlink/hotspot.json` (tmpfs: a
+  reboot clears it together with the AP).
+
+### Rationale
+- Supporting both backends covers Desktop and Server 24.04 installs with
+  one code path each; all config/render logic is pure and unit-tested.
+- Fail-closed matches the product's no-leak posture: a half-tunnel that
+  silently routes clients direct would be a privacy bug, so the guard is
+  brought up *before* clients can associate.
+- Keeping hotspot state in `/run` means nothing survives a reboot that
+  the kernel hasn't already torn down.
+
+### Non-goals (explicitly out of scope)
+- 5 GHz / per-band steering (config knob later); client isolation toggle;
+  per-client accounting; IPv6 for hotspot clients.

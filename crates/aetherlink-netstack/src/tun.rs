@@ -1,15 +1,31 @@
 //! TUN device management + bring-up safety planning (§5).
 //!
 //! Pure parts (snapshot persistence, rollback planning, privilege probe)
-//! are implemented and tested here. Real device ioctls (TUN fd, Wintun
-//! session, route/DNS application) land in the platform task; until then
-//! `open` fails gracefully with a privilege error instead of panicking.
+//! are implemented and tested here. Real device I/O: Wintun session on
+//! Windows, `/dev/net/tun` ioctls on Linux. Route/DNS application lives in
+//! the client platform module. Without privileges `open` fails gracefully
+//! with a named error instead of panicking.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{NetstackError, Result};
+
+/// `TUNSETIFF` (`_IOW('T', 202, int)`), stable kernel ABI — duplicated as a
+/// constant so the build does not depend on which `libc` flavor exports it.
+#[cfg(target_os = "linux")]
+const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+
+/// Kernel `struct ifreq` (16-byte name + 24-byte union): hand-rolled so the
+/// ioctl layout never depends on libc's per-target type aliases.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct IfReq {
+    name: [libc::c_char; 16],
+    flags: libc::c_short,
+    _pad: [u8; 22],
+}
 
 /// One routing table entry worth snapshotting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +168,8 @@ pub trait TunPackets: Send {
     fn send_packet(&mut self, pkt: &[u8]) -> Result<()>;
 }
 
-/// TUN interface handle (owns the driver session on Windows).
+/// TUN interface handle (owns the driver session on Windows, the
+/// `/dev/net/tun` descriptor on Linux).
 pub struct TunInterface {
     /// Interface name.
     pub name: String,
@@ -165,6 +182,11 @@ pub struct TunInterface {
     /// (open-by-name is unreliable across runs; the handle is exact).
     #[cfg(windows)]
     adapter: Option<std::sync::Arc<wintun::Adapter>>,
+    /// Live `/dev/net/tun` descriptor (Linux). The device is created
+    /// non-persistent, so closing the last fd deletes the interface —
+    /// `delete` is exactly that, and a crashed host cannot leave stale TUNs.
+    #[cfg(target_os = "linux")]
+    fd: Option<std::fs::File>,
 }
 
 impl std::fmt::Debug for TunInterface {
@@ -229,10 +251,71 @@ impl TunInterface {
         config.validate()?;
         #[cfg(windows)]
         return Self::open_windows(config);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        return Self::open_linux(config);
+        #[cfg(not(any(windows, target_os = "linux")))]
         return Err(NetstackError::TunError(
-            "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task".to_string(),
+            "TUN is implemented on Windows (Wintun) and Linux (/dev/net/tun) only".to_string(),
         ));
+    }
+
+    /// Linux open: `/dev/net/tun` + `TUNSETIFF` (IFF_TUN, no packet info).
+    ///
+    /// Needs root/CAP_NET_ADMIN; every failure names its cause (missing
+    /// device node, missing privilege) instead of panicking. The fd is held
+    /// non-blocking for the whole session; the interface is born DOWN —
+    /// addressing/`up` is the platform step, mirroring the Wintun path.
+    #[cfg(target_os = "linux")]
+    fn open_linux(config: &TunConfig) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .map_err(|e| {
+                NetstackError::TunError(if e.kind() == std::io::ErrorKind::NotFound {
+                    "/dev/net/tun missing: `sudo modprobe tun` (or TUN disabled in this container)"
+                        .to_string()
+                } else {
+                    format!("/dev/net/tun open: {e} (need root/CAP_NET_ADMIN)")
+                })
+            })?;
+        let fd = file.as_raw_fd();
+        let mut ifr = IfReq {
+            name: [0; 16],
+            flags: 0,
+            _pad: [0; 22],
+        };
+        for (slot, byte) in ifr.name.iter_mut().zip(config.name.as_bytes()) {
+            *slot = *byte as libc::c_char;
+        }
+        // IFF_TUN = 0x0001, IFF_NO_PI = 0x1000 (raw IP packets, no header).
+        ifr.flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        if unsafe { libc::ioctl(fd, TUNSETIFF, &ifr as *const IfReq) } < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(NetstackError::TunError(format!(
+                "TUNSETIFF '{}': {err} (need root/CAP_NET_ADMIN)",
+                config.name
+            )));
+        }
+        // The kernel may rewrite the name when the request collides; trust
+        // what it granted, not what we asked for.
+        let mut granted = Vec::new();
+        for &c in &ifr.name {
+            if c == 0 {
+                break;
+            }
+            granted.push(c as u8);
+        }
+        let granted = String::from_utf8_lossy(&granted).into_owned();
+        file.set_nonblocking(true)
+            .map_err(|e| NetstackError::TunError(format!("tun nonblock: {e}")))?;
+        crate::debug_log(&format!("tun: /dev/net/tun granted '{granted}'"));
+        Ok(Self {
+            name: granted,
+            mtu: config.mtu,
+            fd: Some(file),
+        })
     }
 
     /// Windows open: load wintun.dll (next to the exe, then CWD), open or
@@ -329,12 +412,25 @@ impl TunInterface {
                 .get_adapter_index()
                 .map_err(|e| NetstackError::TunError(format!("adapter index: {e}")))
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let name = std::ffi::CString::new(self.name.clone())
+                .map_err(|e| NetstackError::TunError(format!("ifindex name: {e}")))?;
+            let idx = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            if idx == 0 {
+                return Err(NetstackError::TunError(format!(
+                    "if_nametoindex '{}': {}",
+                    self.name,
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(idx)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = self;
             Err(NetstackError::TunError(
-                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
-                    .to_string(),
+                "adapter_index unsupported on this platform".to_string(),
             ))
         }
     }
@@ -361,12 +457,22 @@ impl TunInterface {
                 None => Ok(()),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            // The device was created non-persistent: `self` (and thus the
+            // fd) is consumed right after this, and the kernel removes the
+            // interface on the last close. No ioctl needed.
+            crate::debug_log(&format!(
+                "tun: '{}' fd released, kernel removes the device",
+                self.name
+            ));
+            Ok(())
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = self;
             Err(NetstackError::TunError(
-                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
-                    .to_string(),
+                "TUN delete unsupported on this platform".to_string(),
             ))
         }
     }
@@ -393,12 +499,33 @@ impl TunPackets for TunInterface {
                     NetstackError::TunError(format!("wintun recv: {e}"))
                 })
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Read;
+            let fd = self
+                .fd
+                .as_mut()
+                .ok_or_else(|| NetstackError::TunError("tun fd not open".to_string()))?;
+            // Jumbo-safe upper bound; TUN delivers one packet per read.
+            let mut buf = vec![0u8; 65536];
+            match fd.read(&mut buf) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    crate::debug_log(&format!("tun: recv {n}B"));
+                    Ok(Some(buf))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => {
+                    crate::debug_log(&format!("tun: recv failed: {e}"));
+                    Err(NetstackError::TunError(format!("tun read: {e}")))
+                }
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = self;
             Err(NetstackError::TunError(
-                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
-                    .to_string(),
+                "TUN recv unsupported on this platform".to_string(),
             ))
         }
     }
@@ -422,13 +549,48 @@ impl TunPackets for TunInterface {
             crate::debug_log(&format!("tun: sent {}B", pkt.len()));
             Ok(())
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write;
+            let fd = self
+                .fd
+                .as_mut()
+                .ok_or_else(|| NetstackError::TunError("tun fd not open".to_string()))?;
+            // A TUN packet must land as ONE write (one skb per write); the
+            // qdisc can briefly fill up (EAGAIN), so retry that for a bounded
+            // time. A short write would emit a truncated packet and then a
+            // corrupt second one — fail named instead.
+            for _ in 0..100 {
+                match fd.write(pkt) {
+                    Ok(n) if n == pkt.len() => {
+                        crate::debug_log(&format!("tun: sent {}B", pkt.len()));
+                        return Ok(());
+                    }
+                    Ok(n) => {
+                        return Err(NetstackError::TunError(format!(
+                            "tun write short ({n} of {}B); packet would corrupt",
+                            pkt.len()
+                        )));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(e) => {
+                        crate::debug_log(&format!("tun: send failed: {e}"));
+                        return Err(NetstackError::TunError(format!("tun write: {e}")));
+                    }
+                }
+            }
+            Err(NetstackError::TunError(
+                "tun write: device stayed full".to_string(),
+            ))
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = pkt;
             let _ = self;
             Err(NetstackError::TunError(
-                "need root/CAP_NET_ADMIN: /dev/net/tun ioctls land in the platform task"
-                    .to_string(),
+                "TUN send unsupported on this platform".to_string(),
             ))
         }
     }

@@ -82,12 +82,16 @@
       polls, mapping `MuxManager`↔sockets, DNS-перехват к `10.255.0.1:53`.
 - [ ] D3. Red: `netstack/tests/tun_io.rs` (помечены `#[ignore]` без прав) —
       open/close устройства, чтение/запись IP-пакета loopback.
-- [ ] D4. Green: `netstack/tun.rs::TunInterface::open` — Linux
-      `/dev/net/tun` (ioctl; stub with named privilege error until a Linux
-      dev host exists), Windows — crate `wintun` **0.5.1** (latest real;
-      there is no 0.14): load order exe-dir → CWD, open-or-create adapter,
-      `start_session(MAX_RING_CAPACITY)`; `wintun.dll` рядом с хостом.
-      DONE on Windows except live run (see Phase W).
+- [x] D4. Green: `netstack/tun.rs::TunInterface::open` — Linux
+      `/dev/net/tun` (`TUNSETIFF`, IFF_TUN|IFF_NO_PI, non-blocking fd,
+      non-persistent device; named privilege errors without root) +
+      `client/platform/linux.rs` (iproute2 + resolvectl, def1, журнал,
+      crash-replay; DEC-013) — код готов, живая проверка под root в очереди.
+      Плюс `aetherlink-cli` (нативный Linux-хост) и раздача туннеля по WiFi
+      (`aetherlink-hotspot`, DEC-014). Windows — crate `wintun` **0.5.1**
+      (latest real; there is no 0.14): load order exe-dir → CWD,
+      open-or-create adapter, `start_session(MAX_RING_CAPACITY)`;
+      `wintun.dll` рядом с хостом. DONE on Windows except live run (Phase W).
 - [ ] D5. Живая проверка под root/admin: `up` → ping/TCP через туннель,
       `kill -9` → `force_cleanup` → сеть+DNS целы; снять `#[ignore]`
       локально, в CI оставить ignore с пометкой.
@@ -238,7 +242,7 @@
 | `client/lifecycle.rs` + `lib.rs` | `up`/`status` | C |
 | `client/config.rs` | схема §8 | C4 |
 | `netstack/smoltcp_wrapper.rs` | userspace stack + памп | D2 ✅ |
-| `netstack/tun.rs` open path | Windows wintun open (Linux ioctls — только под root) | W2 ✅ / D4🔄 |
+| `netstack/tun.rs` open path | Windows wintun open + Linux `/dev/net/tun` ioctls | W2 ✅ / D4 ✅ (live pending root) |
 | `netstack/sockets.rs` | socket-level pump (TCP/UDP state machines) | D-sock ✅ (4 теста) |
 | TunPackets + DataPump + pump threads | мост TUN↔mux в `up()`/`down()` | W3 ✅ / W4 ⏳ активное |
 | `ffi/lib.rs` | rules, log cb, android fd/split | E |

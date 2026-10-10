@@ -2,20 +2,31 @@
 //!
 //! Bring-up policy (`lifecycle::up`) programs against [`Platform`], so the
 //! ordering, rollback and idempotency proofs run without privileges on a
-//! [`FakePlatform`]. [`RealPlatform`] implements what needs no privileges
-//! today (DNS resolution) and fails the rest with an explicit pending error
-//! instead of silently no-op'ing.
+//! [`FakePlatform`]. [`RealPlatform`] is the live backend for the current
+//! OS: Windows (`route`/`netsh`/Wintun) or Linux
+//! (`linux::LinuxPlatform`: `/dev/net/tun` + iproute2 + resolvectl,
+//! DEC-013); every privileged step fails with a named error instead of
+//! silently no-op'ing.
 
 /// Windows capture/apply helpers (pure parsers + thin `route`/`netsh` builders).
 pub mod windows;
 
+/// Linux capture/apply helpers (pure parsers + thin `ip`/`resolvectl`
+/// builders) and the real Linux platform backend.
+pub mod linux;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
 use std::sync::{Arc, Mutex};
 
-use aetherlink_netstack::tun::{previous_gateway, RestoreOp};
-use aetherlink_netstack::tun::{rollback_plan, AppliedChange, Route, Snapshot};
+use aetherlink_netstack::tun::{Route, Snapshot};
+#[cfg(not(target_os = "linux"))]
+use aetherlink_netstack::tun::{previous_gateway, rollback_plan, AppliedChange, RestoreOp};
+
+#[cfg(target_os = "linux")]
+pub use linux::LinuxPlatform as RealPlatform;
 
 use crate::{ClientError, Result};
 
@@ -44,6 +55,7 @@ fn pending(what: &str) -> ClientError {
 ///
 /// Narrow match on purpose: only "already exists" (EN) / "уже существует"
 /// (RU) pass; every other failure still aborts `up`.
+#[cfg(not(target_os = "linux"))]
 fn tolerate_exists<T>(r: Result<T>, what: &str) -> Result<()> {
     match r {
         Ok(_) => Ok(()),
@@ -135,7 +147,10 @@ pub trait Platform: Send {
     }
 }
 
-/// Real platform: genuinely privilege-free operations only.
+/// Real Windows platform: genuinely privilege-free operations only, the
+/// rest through `route`/`netsh`/Wintun (admin required). On Linux this
+/// type is aliased to `linux::LinuxPlatform` instead.
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug, Default)]
 pub struct RealPlatform {
     /// Routes this instance added (for `restore`).
@@ -149,6 +164,7 @@ pub struct RealPlatform {
     tun: Option<Arc<Mutex<aetherlink_netstack::tun::TunInterface>>>,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl RealPlatform {
     /// Fresh real backend.
     #[must_use]
@@ -158,6 +174,7 @@ impl RealPlatform {
 }
 
 /// Run a command, returning stdout or a named error (both streams kept short).
+#[cfg(not(target_os = "linux"))]
 fn run(prog: &str, args: &[String]) -> Result<String> {
     aetherlink_netstack::debug_log(&format!("run: {prog} {}", args.join(" ")));
     let out = std::process::Command::new(prog)
@@ -189,6 +206,7 @@ fn run(prog: &str, args: &[String]) -> Result<String> {
 }
 
 /// Resolve the local interface name owning `iface_ip` via ipconfig.
+#[cfg(not(target_os = "linux"))]
 fn iface_name_for(iface_ip: Ipv4Addr) -> Result<String> {
     let out = windows::read_ipconfig_text()?;
     let (_, ifaces) = windows::parse_ipconfig(&out);
@@ -200,6 +218,7 @@ fn iface_name_for(iface_ip: Ipv4Addr) -> Result<String> {
         .ok_or_else(|| ClientError::PlatformError("interface name not found".to_string()))
 }
 
+#[cfg(not(target_os = "linux"))]
 impl RealPlatform {
     /// Interface name owning the default route (for `netsh` DNS targeting).
     fn default_iface(&self) -> Result<String> {
@@ -254,6 +273,7 @@ impl RealPlatform {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Platform for RealPlatform {
     fn resolve_host(&mut self, host: &str) -> Result<Vec<IpAddr>> {
         // Port is irrelevant; resolution is the goal (also covers IP literals).
@@ -514,6 +534,7 @@ impl Platform for RealPlatform {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl RealPlatform {
     /// Restore captured DNS servers explicitly (covers static origins too).
     /// Best-effort per server; joined failures come back as `Err`.

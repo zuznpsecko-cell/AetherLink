@@ -1,0 +1,34 @@
+# AetherLink Linux client (Ubuntu 24.04): full tunnel + WiFi hotspot sharing.
+# Run:  sudo dist/ubuntu-client/aetherlink-cli configs/client.linux-hotspot.example.yaml up
+# Docs: docs/LINUX_CLIENT.md
+
+client:
+  server_addr: "server.example.com:443"
+  outer_sni: "server.example.com"
+  psk: "change-me-high-entropy"
+  pad_multiple: 128
+  keepalive_s: 15
+
+full_tunnel:
+  enabled: true
+  mtu: 1400
+  kill_switch: false
+  restore_on_exit: true
+  include_private_lan_direct: true
+  # FIXED: only tunnel in v1.5; system DNS is forbidden while up.
+  dns_mode: tunnel
+
+routing:
+  default_action: tunnel
+  rules: []
+
+# Share the tunneled traffic over WiFi: this box becomes a WPA2 AP and
+# joined clients go through the tunnel. Fail-closed: while the tunnel is
+# down, client traffic is blocked instead of leaking direct.
+hotspot:
+  enabled: true
+  interface: wlan0              # omit to autodetect the first WiFi device
+  ssid: AetherLink
+  password: change-me-8-plus    # WPA2-PSK, 8..=63 chars
+  subnet: 192.168.243.0/24      # client pool; keep off your home LAN subnet
+  backend: auto                 # auto | network-manager | hostapd

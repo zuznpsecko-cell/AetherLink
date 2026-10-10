@@ -7,6 +7,15 @@ VPN with userspace netstack. Single Rust core + thin FFI hosts (.NET/Android).
 Windows (client elevated): `.\scripts\run_server_windows.ps1`, `.\scripts\run_client_windows.ps1`
 Ubuntu: `./scripts/run_server_ubuntu.sh`, `sudo ./scripts/run_client_ubuntu.sh`
 
+## Linux client (Ubuntu 24.04)
+
+Native thin client `aetherlink-cli` (Rust core directly, no .NET): full
+tunnel over `/dev/net/tun`, DNS-only-through-tunnel, crash-recovery
+journal — plus sharing the tunneled traffic over a WiFi hotspot
+(`hotspot:` config section or `aetherlink-cli hotspot up|down|status`,
+NetworkManager or hostapd backend, fail-closed when the tunnel is down).
+Docs: `docs/LINUX_CLIENT.md`.
+
 ## GUI client (Windows, Avalonia)
 
 Tray icon + main window (status/egress IP, server config, routing rules,

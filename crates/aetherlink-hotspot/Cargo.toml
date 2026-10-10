@@ -1,0 +1,17 @@
+[package]
+name = "aetherlink-hotspot"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink WiFi hotspot: share the tunnel with WiFi clients (Ubuntu 24.04)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lib]
+name = "aetherlink_hotspot"

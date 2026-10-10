@@ -14,7 +14,14 @@ install -d "$PREFIX/server" "$PREFIX/client" "$STATE_DIR"
 # apphost exe); copying just the exe yields "application does not exist".
 cp -a "$ROOT/dist/ubuntu-server/." "$PREFIX/server/"
 cp -a "$ROOT/dist/ubuntu-client/." "$PREFIX/client/"
-chmod 0755 "$PREFIX/server/AetherLink.Server" "$PREFIX/client/AetherLink.Client"
+chmod 0755 "$PREFIX/server/AetherLink.Server"
+# Client flavor: native thin client (aetherlink-cli, DEC-013) or the legacy
+# .NET host over FFI — whichever the staged dist/ carries.
+if [ -f "$PREFIX/client/aetherlink-cli" ]; then
+  chmod 0755 "$PREFIX/client/aetherlink-cli"
+elif [ -f "$PREFIX/client/AetherLink.Client" ]; then
+  chmod 0755 "$PREFIX/client/AetherLink.Client"
+fi
 for cfg in client.example.yaml server.example.yaml; do
   [ -f "$PREFIX/$cfg" ] || cp -f "$ROOT/configs/$cfg" "$PREFIX/$cfg"
 done
@@ -46,14 +53,26 @@ if [ ! -f "$STATE_DIR/dns.snapshot" ]; then
 fi
 
 # Idempotent cleanup: restores routes + DNS from $STATE_FILE (tolerates absence).
-if [ -x "$PREFIX/client/AetherLink.Client" ]; then
+if [ -x "$PREFIX/client/aetherlink-cli" ]; then
+  "$PREFIX/client/aetherlink-cli" "$PREFIX/client.example.yaml" cleanup || true
+elif [ -x "$PREFIX/client/AetherLink.Client" ]; then
   "$PREFIX/client/AetherLink.Client" "$PREFIX/client.example.yaml" cleanup || true
 fi
+
+# Client systemd unit (not started: review the config first). The unit also
+# covers the WiFi hotspot section of the config (see docs/LINUX_CLIENT.md).
+install -m 0644 "$ROOT/deploy/linux/aetherlink-client.service" /etc/systemd/system/
+systemctl daemon-reload || true
 
 cat <<EOF
 AetherLink installed to $PREFIX (server/ + client/).
 DNS snapshot: $STATE_DIR/dns.snapshot (restored by force_cleanup from $STATE_FILE).
 Next: edit $PREFIX/server.yaml (psk, listen), then:
   sudo systemctl enable --now aetherlink-server
+Linux client: edit $PREFIX/client.example.yaml, then either run it directly
+  sudo $PREFIX/client/aetherlink-cli $PREFIX/client.example.yaml up
+or enable the service:
+  sudo systemctl enable --now aetherlink-client
+WiFi sharing: hotspot: section in the client config (docs/LINUX_CLIENT.md).
 Uninstall: ./deploy/linux/uninstall.sh
 EOF

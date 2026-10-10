@@ -1,0 +1,17 @@
+[package]
+name = "aetherlink-cli"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AetherLink Linux client: thin native host over the Rust core (tunnel + WiFi hotspot)"
+
+[dependencies]
+aetherlink-client = { path = "../aetherlink-client" }
+aetherlink-core = { path = "../aetherlink-core" }
+aetherlink-hotspot = { path = "../aetherlink-hotspot" }
+serde_json = { workspace = true }
+libc = { workspace = true }
+
+[[bin]]
+name = "aetherlink-cli"
+path = "src/main.rs"

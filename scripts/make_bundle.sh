@@ -19,6 +19,8 @@ OUT="aetherlink-ubuntu-$(date +%Y%m%d).tar.gz"
 tar -czf "$OUT" \
   dist/ubuntu-server dist/ubuntu-client \
   configs/server.example.yaml configs/client.example.yaml \
-  deploy/linux scripts/run_server_ubuntu.sh docs/DEPLOY_UBUNTU.md
+  configs/client.linux-hotspot.example.yaml \
+  deploy/linux scripts/run_server_ubuntu.sh scripts/run_client_ubuntu.sh \
+  docs/DEPLOY_UBUNTU.md docs/LINUX_CLIENT.md
 echo "Bundle: $OUT"
 echo "Copy to VPS, unpack, run deploy/linux/install.sh (no git required there)."

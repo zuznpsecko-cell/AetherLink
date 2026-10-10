@@ -1,0 +1,39 @@
+# AetherLink Linux client as a systemd service (Ubuntu 24.04).
+#
+# Install (see docs/LINUX_CLIENT.md):
+#   sudo install -m 0755 dist/ubuntu-client/aetherlink-cli /usr/local/bin/
+#   sudo mkdir -p /etc/aetherlink && sudo cp client.yaml /etc/aetherlink/client.yaml
+#   sudo install -m 0644 deploy/linux/aetherlink-client.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aetherlink-client
+#
+# The client tears the tunnel down on SIGTERM (ExecStop path + journal
+# replay), so `systemctl stop` always restores routes/DNS. If the box dies
+# mid-tunnel, the next boot can run `aetherlink-cli <config> cleanup`.
+
+[Unit]
+Description=AetherLink client tunnel (Linux)
+Documentation=file:///opt/aetherlink/docs/LINUX_CLIENT.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Config path (server address, PSK, routing rules, optional hotspot section).
+Environment=AETHERLINK_CONFIG=/etc/aetherlink/client.yaml
+# Uncomment for verbose core logs in the journal (never contains secrets):
+#Environment=AETHERLINK_DEBUG=1
+ExecStart=/usr/local/bin/aetherlink-cli $AETHERLINK_CONFIG up
+ExecStop=/usr/local/bin/aetherlink-cli $AETHERLINK_CONFIG down
+# Belt and suspenders: journal replay restores routes/DNS even if the
+# process was SIGKILLed between up and down.
+ExecStopPost=-/usr/local/bin/aetherlink-cli $AETHERLINK_CONFIG cleanup
+Restart=on-failure
+RestartSec=5
+# The CLI exits 3 when its pump watchdog detects a dead tunnel: that is a
+# failure, so systemd restarts and re-connects automatically.
+
+# Needs root: /dev/net/tun, ip route, DNS override.
+User=root
+
+[Install]
+WantedBy=multi-user.target
