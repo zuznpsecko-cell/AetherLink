@@ -16,7 +16,7 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | **Phase 2: Frame Protocol** | ✅ Done | 24B header, len-prefix padding, ReplayWindow ≥1024 (19) |
 | **Phase 3: Mux Layer** | ✅ Done | TCP streams + UDP flows, anti-replay, virtual DNS, OPEN frames (6+8) |
 | **Phase 4: Golden spec** | ✅ Done | `protocol/` canonical consts + integration vectors (5+6) |
-| **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, ALPN h2, sync I/O (3) |
+| **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, ALPN http/1.1-only (server), sync I/O (4) |
 | **Phase A: Session handshake** | ✅ Done | PREFACE+AUTH → keys → mux DATA both ways (4) |
 | **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve (8+4+4+1) |
 | **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun open + TunPackets/DataPump + pump threads tested; Windows up/down live cycle green (LIVE_W4); traffic through tunnel pending transport attach |
