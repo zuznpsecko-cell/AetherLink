@@ -1,14 +1,11 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-10-19 (TDD 275/275 green; Phase T TLS-fidelity завершена в коде и гейтах: единый golden TLS-профиль + fallback shape; TUNNEL WORKS live vs VPS: DNS+TCP+HTTP, egress=VPS; speedtest 288 down / 39.94 up / 93 ms — аплоад-фикс подтверждён живьём; заглушка + adblock задеплоены и проверены — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_ISSUES.md)_
 
-> **0l/0m (аплоад): подтверждено live 2026-10-19 — speedtest 288 down / 39.94 up / 93 ms (было 0.00).**
-> **Phase T (DEC-012): T1-T5 закрыты локально — гейты fmt/clippy/tests 275/275 + check_thin_hosts green.**
-> Красный→зелёный TDD: golden TLS-профиль в `protocol`, единый конструктор в `core/tls.rs`
-> (allowlist cipher'ов, resumption tickets, socket-проба через CountingTicketer), fallback shape
-> в `server` (Server/Date/Content-Length/Content-Type/Connection, byte-exact modulo Date).
-> Осталось live-принятие: openssl-дым против VPS (не должен отличаться от reference modulo cert/time) —
-> [docs/LIVE_ISSUES.md](LIVE_ISSUES.md).
+> **0l (upload 0.00): фикс в дереве, гейты НЕ прогонялись.** Причины и список правок — в
+> [docs/LIVE_ISSUES.md](LIVE_ISSUES.md#0l-аплоад-000-байты-терялись-молча-fin-убивал-ответ-id-кончались-в-дереве-гейты-не-прогонялись).
+> В рабочей песочнице нет Rust toolchain, поэтому `cargo fmt --check` / `clippy -D warnings` /
+> `cargo test --workspace` и живой замер спидтеста нужно выполнить локально.
 
 ## Overview
 
@@ -19,21 +16,21 @@ _Last Updated: 2026-10-19 (TDD 275/275 green; Phase T TLS-fidelity заверш�
 | **Phase 2: Frame Protocol** | ✅ Done | 24B header, len-prefix padding, ReplayWindow ≥1024 (19) |
 | **Phase 3: Mux Layer** | ✅ Done | TCP streams + UDP flows, anti-replay, virtual DNS, OPEN frames (6+8) |
 | **Phase 4: Golden spec** | ✅ Done | `protocol/` canonical consts + integration vectors (5+6) |
-| **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, ALPN http/1.1-only (server), sync I/O (4) |
+| **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, ALPN h2, sync I/O (3) |
 | **Phase A: Session handshake** | ✅ Done | PREFACE+AUTH → keys → mux DATA both ways (4) |
 | **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve (8+4+4+1) |
-| **Phase 7: Netstack** | ✅ Done | Pump работает живьём: bulk TCP+UDP через TUN→wire, upload flow-control (0m), speedtest 288/39.94 (LIVE_ISSUES) |
-| **Phase T: TLS fidelity** | ✅ Done (code+gates) | T1-T5 закрыты: golden TLS-профиль (DEC-012), единый конструктор, resumption tickets, fallback shape; гейты 275/275 + check_thin_hosts green; live openssl-дым pending |
+| **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun open + TunPackets/DataPump + pump threads tested; Windows up/down live cycle green (LIVE_W4); traffic through tunnel pending transport attach |
+| **Phase T: TLS fidelity** | ⏳ Next | DEC-012 accepted; golden profile + fallback-shape tests pending (see PLAN_FINAL_TDD.md) |
 | **Phase 8: Full Tunnel + Routing** | ✅ Done | Ruleset/DNS-policy/cleanup + full `up` over fake platform (8+11) |
 | **Phase 9: FFI API** | ✅ Done | C ABI smoke + rules/log-cb/android-fd + JNI symbols (5+5) |
 | **Phase 10: Client Integration** | ✅ Done | Typed config, lifecycle, status JSON |
-| **Phase 11: Testing + Docs** | 🔄 Partial | PLAN_FINAL_TDD.md is the live plan; гейты 275/275 (fmt/clippy/check_thin_hosts green); DoD checklist below |
-| **Phase 12: Windows Wintun** | ✅ Done | Version pinned; live: GUI bring-up/teardown, маршруты, DNS, auto-recovery (ежедневные прогоны) |
+| **Phase 11: Testing + Docs** | 🔄 Partial | PLAN_FINAL_TDD.md is the live plan; DoD checklist below |
+| **Phase 12: Windows Wintun** | 🔄 Partial | Version pinned, host load path + deploy note; session bring-up pending privs |
 | **Phase 13: .NET Hosts** | ✅ Done | Server/Client build 0/0, thin (grep-enforced), status cmd, quickstart scripts |
 | **Phase 14: Android** | ✅ Done (build) | minSdk 26, APK assembles with 3 ABIs + JNI; on-device test pending |
 | **Phase 15: Deploy Scripts** | ✅ Done | install/uninstall from dist + example configs + checks |
-| **Phase 16: Final Integration** | ✅ Done | Live E2E vs VPS green (DNS+TCP+HTTP+adblock+fallback); runbook = DEPLOY_UBUNTU.md |
-| **Phase I: Assembly (VPN works)** | ✅ Done | VPN работает живьём против VPS: egress=VPS, speedtest 288/39.94/93ms |
+| **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live runbook pending privs |
+| **Phase I: Assembly (VPN works)** | ⏳ Next | OPEN frames → bind/serve loop → client up tail → FFI threads → live E2E (see PLAN_FINAL_TDD.md) |
 
 ## Detailed Status
 
@@ -53,50 +50,42 @@ _Last Updated: 2026-10-19 (TDD 275/275 green; Phase T TLS-fidelity заверш�
 | aetherlink-frame | ✅ | ✅ 19 |
 | aetherlink-mux | ✅ | ✅ 6 + 8 |
 | aetherlink-netstack | ✅ | ✅ 1 + 11 + 6 + 4 |
-| aetherlink-core | ✅ | ✅ 3 + 4 + 4 + 3 (TLS profile handshake gates) |
-| aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 + 6 (fallback shape + fallback unit) |
+| aetherlink-core | ✅ | ✅ 3 + 4 + 4 |
+| aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 |
 | aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 6 + 4 + 2 + 13 + 10 |
 | aetherlink-ffi | ✅ | ✅ 3 + 5 + 5 (+cdylib) |
-| aetherlink-protocol | ✅ | ✅ 6 + 5 + 12 (TLS profile: 5 unit + 7 golden) |
+| aetherlink-protocol | ✅ | ✅ 6 + 5 |
 
 ## DoD Checklist (from AGENT_INSTRUCTIONS.md)
 
 | Item | Description | Status |
 |------|-------------|--------|
 | 1 | Single Rust core; no protocol stack in C#/Kotlin | ✅ (`check_thin_hosts.ps1`) |
-| 2 | FFI up/down/server works | ✅ (live: GUI+CLI против VPS ежедневно) |
-| 3 | TCP+UDP through tunnel (netstack) | ✅ (live: speedtest 288 down / 39.94 up / 93 ms) |
-| 4 | DNS when up only through tunnel (no leak test) | ✅ (live: DNS туннеля 10.255.0.1:53, блоклист-проба PASS) |
-| 5 | Domain direct: resolve via tunnel, connect direct | ✅ (round-trip конфигурации правил протестирован реальным ConfigService) |
-| 6 | Wintun path Windows (like v2rayN) | ✅ (live: GUI bring-up/teardown/auto-recovery) |
-| 7 | Linux TUN full tunnel + rollback | 🔄 (сервер на VPS live; Linux-клиент TUN не прогонялся) |
+| 2 | FFI up/down/server works | 🔄 (contract smoke green; live wiring needs privs) |
+| 3 | TCP+UDP through tunnel (netstack) | 🔄 (mux+pump green; socket pump + live need privs) |
+| 4 | DNS when up only through tunnel (no leak test) | 🔄 (policy green; live capture pending privs) |
+| 5 | Domain direct: resolve via tunnel, connect direct | 🔄 (engine green; live pending privs) |
+| 6 | Wintun path Windows (like v2rayN) | 🔄 (crate 0.5.1 open path green; live session pending privs) |
+| 7 | Linux TUN full tunnel + rollback | 🔄 (planner green; live pending privs) |
 | 8 | .NET hosts self-contained win/linux | ✅ (both build 0/0) |
 | 9 | Android+TV split default all | 🔄 (APK builds; on-device pending) |
 | 10 | G2 static fallback | ✅ (decision + accept-loop tested) |
-| 11 | force_cleanup restores network+DNS | ✅ (кнопка «Restore network» live-tested) |
+| 11 | force_cleanup restores network+DNS | 🔄 (idempotent core green; live pending privs) |
 | 12 | DEPLOY_LINUX/WINDOWS (personal, from scratch) | ✅ (install/uninstall + checks green) |
 
 ## Known Issues / Blockers
 
 > Рабочий журнал живых прогонов: [docs/LIVE_ISSUES.md](LIVE_ISSUES.md) — открытые и закрытые проблемы с доказательствами.
 
-1. **On-device Android test** — APK assembles; needs phone/TV for VpnService run
-2. **Gradle JVM** — must run under Java 21 (Rider JBR); Gradle 8.10 refuses
+1. **Live TUN tests** — need Linux root/CAP_NET_ADMIN or Windows admin
+   (run manually per PLAN_FINAL_TDD.md D5/G3)
+2. **On-device Android test** — APK assembles; needs phone/TV for VpnService run
+3. **Gradle JVM** — must run under Java 21 (Rider JBR); Gradle 8.10 refuses
    Java 25 from the new Studio bundle
-3. **Консольные окна (cmd/netsh) при Connect/Disconnect** — попытка скрыть их через
-   CREATE_NO_WINDOW / DETACHED_PROCESS ломала туннель («Tunnel lost»); оба фикс-коммита
-   откачены, main = `9c008e8` (DLL в dist = `94E7F26C…`). Пути решения — LIVE_ISSUES.md.
-4. **Upload HOL** — блокирующая запись в сокет может подтормаживать соседние потоки
-   при полной закачке (остаток 0m, отдельная задача).
-5. **YouTube-реклама не блокируется DNS уровнем** — отдаётся с тех же доменов, что и
-   сами видео (фундаментальное ограничение; пользователь принял).
 
 ## Next Steps
 
-1. Скрыть консольные окна без поломки туннеля (SW_HIDE через собственный CreateProcess
-   без флагов создания, либо `cmd /c start /min`; иначе оставить как есть) — LIVE_ISSUES.md.
-2. Upload HOL: неблокирующая запись/очереди в релее (остаток 0m).
-3. Phase T live-принятие: openssl-дым против VPS (handshake + fallback probe) —
-   респонс байт-в-байт modulo cert/time-полей (PLAN_FINAL_TDD, acceptance Phase T).
-4. Android: on-device VpnService прогон.
-5. Phase I6: полный live E2E чек-лист (большая часть уже покрыта ежедневными GUI-прогонами).
+1. Live traffic proof: сквозной HTTP через туннель против VPS (DNS уже ходит в обе стороны; текущий фронт — задержки серийного event-loop сервера).
+2. Streaming relay (полный дуплекс TCP вместо запрос-ответ) — после пруфа.
+3. Phase T: TLS-fidelity hardening (DEC-012) — после рабочего трафика.
+4. Phase I6: полный live E2E чек-лист (kill -9, DNS no-leak, domain-direct).

@@ -139,5 +139,3 @@ psk: "<тот же PSK, что на сервере>"
 | клиент получает static вместо туннеля | PSK не совпал; `outer_sni` ≠ имени в серте |
 | `cert.pem/key.pem not found` | забыты `TLS_CERT`/`TLS_KEY` при smoke-запуске |
 | renewal не подхватывается | нет deploy-hook → `systemctl restart aetherlink-server` |
-| браузер рвёт `https://selmedia.ru/`, а curl даёт 200 | сервер договаривался о h2, отдавал HTTP/1.1 → ALPN только `http/1.1` (исправлено в main), нужен апдейт VPS |
-| заглушка не меняется после `update-server.sh` | апдейтер не трогает `fallback/`: скопировать `deploy/linux/fallback/index.html` в `/opt/aetherlink/server/fallback/` + `systemctl restart aetherlink-server` (тело читается на старте) |

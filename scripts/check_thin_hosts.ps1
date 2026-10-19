@@ -100,13 +100,6 @@ Check "unit runs published server" (Has-Text $linUnit "AetherLink\.Server")
 Check "unit reads server.yaml" (Has-Text $linUnit "server\.yaml")
 Check "deploy doc covers renewal" (Has-Text $deployDoc "(deploy-hook|renew)")
 
-# --- no-direct-TLS-in-hosts (Phase T, DEC-012): TLS speaks only in the core;
-# thin hosts must never own a TLS stack or direct TLS API usage ---
-Check "gui native has no SslStream" (No-Text $guiNative "SslStream")
-Check "gui native has no HttpClient/TLS" (No-Text $guiNative "(HttpClient|SocketsHttpHandler)")
-Check "vpn service has no direct TLS" (No-Text $vpnService "(SSLSocket|HttpsURLConnection|TrustManager|javax\.net\.ssl)")
-Check "android bridge has no direct TLS" (No-Text $jniBridge "(SSLSocket|HttpsURLConnection|TrustManager|javax\.net\.ssl)")
-
 # --- example configs carry §8 fields ---
 Check "client cfg server_addr" (Has-Text $clientCfg "server_addr")
 Check "client cfg dns_mode tunnel" (Has-Text $clientCfg "dns_mode:\s*tunnel")

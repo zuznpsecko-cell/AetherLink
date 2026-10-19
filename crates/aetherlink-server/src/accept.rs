@@ -503,7 +503,11 @@ fn is_unroutable_target(target: &SocketAddr) -> bool {
 
 /// Serve one static HTTP response over an open TLS stream.
 fn serve_static(stream: &mut tls::ServerTlsStream, body: &[u8]) {
-    let _ = stream.write_all(crate::fallback::static_head(body.len()).as_bytes());
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body);
     close_quietly(stream);
 }
