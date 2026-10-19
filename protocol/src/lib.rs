@@ -7,6 +7,9 @@
 //! Golden vectors live in `tests/golden.rs` (integration) so the spec crate
 //! itself stays dependency-free of implementor crates.
 
+/// Canonical TLS profile (DEC-012, Phase T): single frozen TLS composition.
+pub mod tls_profile;
+
 /// Protocol version
 pub const PROTOCOL_VERSION: u8 = 1;
 

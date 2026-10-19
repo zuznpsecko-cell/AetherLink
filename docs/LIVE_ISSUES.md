@@ -6,6 +6,34 @@
 
 ## Открытые
 
+### Phase T TLS-fidelity (DEC-012): golden профиль закрыт в коде и гейтах — ГЕЙТЫ 275/275; осталось live-принятие (openssl-дым)
+Что сделано:
+1. **Единый frozen TLS-профиль** (`protocol/src/tls_profile.rs` + `tests/tls_profile.rs`, 12 тестов):
+   ALPN-порядок (клиент `[h2, http/1.1]`, сервер `[http/1.1]`), allowlist TLS1.3 cipher'ов
+   (0x1301 / 0x1303 / 0x1302), RESUMPTION_POLICY (`tls13-tickets-in-memory-both-sides`),
+   SNI_SOURCE_RULE. Любое отклонение падает golden-тестами.
+2. **`core/tls.rs` — один профильный конструктор** для всех трёх конфигураций:
+   CryptoProvider фильтруется по allowlist (будущие апгрейды rustls не пронесут лишние
+   cipher'ы на провод), resumption — in-memory tickets, а сервер теперь шлёт NewSessionTicket
+   (rustls-дефолт `NeverProducesTickets` — resumption был выключен молча). Handshake-гейты:
+   ALPN-поля == профиль, каждый разрешённый cipher согласуется ровно в него, resumption
+   доказан на уровне провода (CountingTicketer: `encrypt` — выпуск тикета, `decrypt` —
+   PSK-identity из ClientHello второй коннекции; rustls резюмится только в psk_dhe_ke,
+   поэтому ECDHE остаётся и на resumption — не индикатор).
+3. **Fallback shape приведён к reference static server** (`server`): ответ заглушки —
+   `HTTP/1.1 200 OK / Server: static-httpd/1.0 / Date: IMF-fixdate / Content-Length /
+   Content-Type: text/html / Connection: close` — канонический порядок, байт-в-байт
+   modulo Date (`tests/fallback_shape.rs`: bad AUTH, wrong SNI; plaintext остаётся
+   TLS-тихим). Дата — собственный IMF-fixdate форматтер (без chrono), юнит-тесты:
+   эпоха, Mon 19 Oct 2026, Thu 29 Feb 2024 (високос).
+
+Гейты: fmt 0, clippy 0 по новому коду, `cargo test --workspace` **275/275**
+(было 254, +21 тест Phase T), `check_thin_hosts.ps1` green (+4 no-direct-TLS
+проверки: GUI native, VPN service, android bridge).
+
+Осталось: live-принятие по PLAN Phase T acceptance — пересобрать/задеплоить ядро на VPS и
+прогнать openssl-дым (handshake + fallback probe): ответ байт-в-байт modulo cert/time-полей.
+
 ### GUI (Windows) нестабильность: туннель рвётся и не закрывается — ВСЁ В MAIN, ГЕЙТЫ 254/254, LIVE-ПРОГОН ОК
 Симптомы: туннель обрывается; после этого «Disconnect» не отрабатывает, либо маршруты/DNS
 остаются в TUN и машина без связи. Консольный `AetherLink.Client` при этом работает стабильнее.

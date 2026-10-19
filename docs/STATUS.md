@@ -1,10 +1,14 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-10-19 (TDD 254/254 green; TUNNEL WORKS live vs VPS: DNS+TCP+HTTP, egress=VPS; speedtest 288 down / 39.94 up / 93 ms — аплоад-фикс подтверждён живьём; заглушка + adblock задеплоены и проверены — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-10-19 (TDD 275/275 green; Phase T TLS-fidelity завершена в коде и гейтах: единый golden TLS-профиль + fallback shape; TUNNEL WORKS live vs VPS: DNS+TCP+HTTP, egress=VPS; speedtest 288 down / 39.94 up / 93 ms — аплоад-фикс подтверждён живьём; заглушка + adblock задеплоены и проверены — see docs/LIVE_ISSUES.md)_
 
 > **0l/0m (аплоад): подтверждено live 2026-10-19 — speedtest 288 down / 39.94 up / 93 ms (было 0.00).**
-> Гейты прогнаны локально (fmt/clippy/tests — 254/254), редеплой VPS выполнен. Подробности и
-> оставшийся HOL-хвост — [docs/LIVE_ISSUES.md](LIVE_ISSUES.md).
+> **Phase T (DEC-012): T1-T5 закрыты локально — гейты fmt/clippy/tests 275/275 + check_thin_hosts green.**
+> Красный→зелёный TDD: golden TLS-профиль в `protocol`, единый конструктор в `core/tls.rs`
+> (allowlist cipher'ов, resumption tickets, socket-проба через CountingTicketer), fallback shape
+> в `server` (Server/Date/Content-Length/Content-Type/Connection, byte-exact modulo Date).
+> Осталось live-принятие: openssl-дым против VPS (не должен отличаться от reference modulo cert/time) —
+> [docs/LIVE_ISSUES.md](LIVE_ISSUES.md).
 
 ## Overview
 
@@ -19,11 +23,11 @@ _Last Updated: 2026-10-19 (TDD 254/254 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | **Phase A: Session handshake** | ✅ Done | PREFACE+AUTH → keys → mux DATA both ways (4) |
 | **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve (8+4+4+1) |
 | **Phase 7: Netstack** | ✅ Done | Pump работает живьём: bulk TCP+UDP через TUN→wire, upload flow-control (0m), speedtest 288/39.94 (LIVE_ISSUES) |
-| **Phase T: TLS fidelity** | 🔄 Partial | ALPN fallback-shape сделан (http/1.1-only, 668aaa5); golden profile — по PLAN_FINAL_TDD.md |
+| **Phase T: TLS fidelity** | ✅ Done (code+gates) | T1-T5 закрыты: golden TLS-профиль (DEC-012), единый конструктор, resumption tickets, fallback shape; гейты 275/275 + check_thin_hosts green; live openssl-дым pending |
 | **Phase 8: Full Tunnel + Routing** | ✅ Done | Ruleset/DNS-policy/cleanup + full `up` over fake platform (8+11) |
 | **Phase 9: FFI API** | ✅ Done | C ABI smoke + rules/log-cb/android-fd + JNI symbols (5+5) |
 | **Phase 10: Client Integration** | ✅ Done | Typed config, lifecycle, status JSON |
-| **Phase 11: Testing + Docs** | 🔄 Partial | PLAN_FINAL_TDD.md is the live plan; гейты 254/254; DoD checklist below |
+| **Phase 11: Testing + Docs** | 🔄 Partial | PLAN_FINAL_TDD.md is the live plan; гейты 275/275 (fmt/clippy/check_thin_hosts green); DoD checklist below |
 | **Phase 12: Windows Wintun** | ✅ Done | Version pinned; live: GUI bring-up/teardown, маршруты, DNS, auto-recovery (ежедневные прогоны) |
 | **Phase 13: .NET Hosts** | ✅ Done | Server/Client build 0/0, thin (grep-enforced), status cmd, quickstart scripts |
 | **Phase 14: Android** | ✅ Done (build) | minSdk 26, APK assembles with 3 ABIs + JNI; on-device test pending |
@@ -49,11 +53,11 @@ _Last Updated: 2026-10-19 (TDD 254/254 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | aetherlink-frame | ✅ | ✅ 19 |
 | aetherlink-mux | ✅ | ✅ 6 + 8 |
 | aetherlink-netstack | ✅ | ✅ 1 + 11 + 6 + 4 |
-| aetherlink-core | ✅ | ✅ 3 + 4 + 4 |
-| aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 |
+| aetherlink-core | ✅ | ✅ 3 + 4 + 4 + 3 (TLS profile handshake gates) |
+| aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 + 6 (fallback shape + fallback unit) |
 | aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 6 + 4 + 2 + 13 + 10 |
 | aetherlink-ffi | ✅ | ✅ 3 + 5 + 5 (+cdylib) |
-| aetherlink-protocol | ✅ | ✅ 6 + 5 |
+| aetherlink-protocol | ✅ | ✅ 6 + 5 + 12 (TLS profile: 5 unit + 7 golden) |
 
 ## DoD Checklist (from AGENT_INSTRUCTIONS.md)
 
@@ -92,6 +96,7 @@ _Last Updated: 2026-10-19 (TDD 254/254 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 1. Скрыть консольные окна без поломки туннеля (SW_HIDE через собственный CreateProcess
    без флагов создания, либо `cmd /c start /min`; иначе оставить как есть) — LIVE_ISSUES.md.
 2. Upload HOL: неблокирующая запись/очереди в релее (остаток 0m).
-3. Phase T: golden TLS-fidelity profile (DEC-012).
+3. Phase T live-принятие: openssl-дым против VPS (handshake + fallback probe) —
+   респонс байт-в-байт modulo cert/time-полей (PLAN_FINAL_TDD, acceptance Phase T).
 4. Android: on-device VpnService прогон.
 5. Phase I6: полный live E2E чек-лист (большая часть уже покрыта ежедневными GUI-прогонами).
