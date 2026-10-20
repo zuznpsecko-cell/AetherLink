@@ -1619,3 +1619,112 @@ fn zero_and_padded_ping_keep_tunnel_alive() {
     drop(stream);
     server.join().expect("server thread");
 }
+
+#[test]
+fn concurrent_upload_close_race_and_stream_rst_keep_session_alive() {
+    // Reproduces the exact high-speed Speedtest upload race that caused
+    // intermittent Windows `os error 10054` (TCP RST from server):
+    // 1. Target HTTP server replies `HTTP/1.1 200 OK` and immediately closes
+    //    its socket while the client simultaneously sends stream half-close
+    //    (`DATA([])`) across >5ms `READ_TIMEOUT` gaps.
+    // 2. Client resets an individual stream (`FrameType::Rst` with stream_id != 0).
+    // Neither must abort `tunnel_loop` or tear down sibling streams.
+    let target_listener = TcpListener::bind("127.0.0.1:0").expect("bind target");
+    let target_port = target_listener.local_addr().expect("addr").port();
+    let target_srv = std::thread::spawn(move || {
+        for _ in 0..8 {
+            if let Ok((mut s, _)) = target_listener.accept() {
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+                });
+            }
+        }
+    });
+
+    let echo = tcp_echo();
+    let mut routes = HashMap::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let nonce = [0xF3u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    for round in 0..8 {
+        let id = sess.mux.open_tcp("127.0.0.1", target_port).expect("open");
+        let open = sess
+            .mux
+            .seal_open_tcp(sess.keys.tx_key(), id, 128)
+            .expect("seal open");
+        wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+
+        let body = vec![0x61u8; 8192];
+        let data = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), id, &body, 128)
+            .expect("seal upload");
+        wire_help::write_frame(&mut stream, &data.header, &data.ciphertext);
+
+        // Exceed server's 5ms `READ_TIMEOUT` so server flushes replies while
+        // `SO_RCVTIMEO` would fire if writes touched `read_tls`, then race the
+        // client's half-close / stream RST right against worker exit.
+        std::thread::sleep(Duration::from_millis(12));
+        if round % 2 == 0 {
+            let eof = sess
+                .mux
+                .seal_data(sess.keys.tx_key(), id, &[], 128)
+                .expect("seal eof");
+            wire_help::write_frame(&mut stream, &eof.header, &eof.ciphertext);
+        } else {
+            let rst = FrameHeader {
+                length: 0,
+                frame_type: FrameType::Rst,
+                flags: 0,
+                stream_id: id,
+                sequence: 0,
+            };
+            wire_help::write_frame(&mut stream, &rst, &[]);
+        }
+    }
+
+    // Drain any queued stream replies and verify a brand-new sibling stream
+    // still echoes cleanly over the exact same outer TLS session.
+    let keep = sess.mux.open_tcp("127.0.0.1", echo).expect("open echo");
+    let open_keep = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), keep, 128)
+        .expect("seal open keep");
+    wire_help::write_frame(&mut stream, &open_keep.header, &open_keep.ciphertext);
+    let probe = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), keep, b"still-alive-10054-fixed", 128)
+        .expect("seal probe");
+    wire_help::write_frame(&mut stream, &probe.header, &probe.ciphertext);
+
+    loop {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        if h.stream_id == keep && h.frame_type == FrameType::Data {
+            let plain = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("open keep echo");
+            assert_eq!(plain, b"still-alive-10054-fixed");
+            break;
+        }
+    }
+
+    drop(stream);
+    let _ = target_srv.join();
+    server.join().expect("server thread");
+}

@@ -404,10 +404,17 @@ fn forward_tcp(
             }
             Err(SendHoldFail::Gone) => {
                 debug_log(&format!(
-                    "tunnel: data id={id} worker already exited, closing stream"
+                    "tunnel: data id={id} worker already exited, draining final replies"
                 ));
                 workers.remove(&id);
-                ForwardOutcome::CloseStream
+                if !drain_completions(pool, stream_rx, sess, stream, routes, workers, dead) {
+                    return ForwardOutcome::SessionDead;
+                }
+                if routes.contains_key(&id) {
+                    ForwardOutcome::CloseStream
+                } else {
+                    ForwardOutcome::Delivered
+                }
             }
             Err(SendHoldFail::SessionDead) => ForwardOutcome::SessionDead,
         };
@@ -596,15 +603,15 @@ fn serve_static(stream: &mut tls::ServerTlsStream, body: &[u8]) {
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
+    let _ = write_tls_all(stream, head.as_bytes());
+    let _ = write_tls_all(stream, body);
     close_quietly(stream);
 }
 
 /// TLS close_notify + flush, ignoring errors (peer may be gone).
 fn close_quietly(stream: &mut tls::ServerTlsStream) {
-    let _ = stream.conn.send_close_notify();
-    let _ = stream.flush();
+    stream.conn.send_close_notify();
+    let _ = flush_tls_writes(stream);
 }
 
 /// Best-effort one-shot Linux kernel WAN tuning when `aetherlink-server` runs
@@ -704,7 +711,7 @@ fn tunnel_loop(
     let mut hb_since: Option<Instant> = None;
     loop {
         while hb_filled < FRAME_HEADER_SIZE {
-            match stream.read(&mut hb[hb_filled..]) {
+            match read_tls_step(stream, &mut hb[hb_filled..]) {
                 Ok(0) => {
                     debug_log("tunnel: header eof, closing");
                     return;
@@ -754,18 +761,19 @@ fn tunnel_loop(
         if header.length as usize > 65535 + 1024 {
             break; // Absurd length: fail closed.
         }
-        // Body: tolerate stalls past the read quantum (a big body is many
-        // TCP segments; any gap tripping the 50ms timeout must resume, not
-        // abort the session — seen live: "body eof, closing" killed healthy
-        // sessions mid-frame). Position-tracked; bounded 30s (fail closed).
+        // Body: tolerate stalls past the read quantum and EINTR signals from
+        // the host runtime (e.g. .NET CoreCLR GC suspension on Linux, which
+        // never auto-restarts `recv` when `SO_RCVTIMEO` is set). Drain worker
+        // completions during inter-segment gaps so replies never stall.
         let mut ct = vec![0u8; header.length as usize];
         let body_start = Instant::now();
         let mut filled = 0;
+        let mut session_dead = false;
         let body_ok = loop {
             if filled >= ct.len() {
                 break true;
             }
-            match stream.read(&mut ct[filled..]) {
+            match read_tls_step(stream, &mut ct[filled..]) {
                 Ok(0) => break false,
                 Ok(n) => {
                     filled += n;
@@ -773,6 +781,7 @@ fn tunnel_loop(
                         break true;
                     }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e)
                     if e.kind() == std::io::ErrorKind::TimedOut
                         || e.kind() == std::io::ErrorKind::WouldBlock =>
@@ -780,12 +789,24 @@ fn tunnel_loop(
                     if body_start.elapsed() > BODY_TOTAL_TIMEOUT {
                         break false;
                     }
+                    if !drain_completions(
+                        &pool,
+                        &stream_rx,
+                        &mut sess,
+                        stream,
+                        routes,
+                        &mut workers,
+                        &mut dead,
+                    ) {
+                        session_dead = true;
+                        break false;
+                    }
                 }
                 Err(_) => break false,
             }
         };
-        if !body_ok {
-            debug_log("tunnel: body eof, closing");
+        if session_dead || !body_ok {
+            debug_log("tunnel: body eof or write error, closing");
             break;
         }
         if crate::debug::debug_enabled() {
@@ -998,9 +1019,23 @@ fn tunnel_loop(
                 debug_log("tunnel: ping");
                 continue;
             }
-            FrameType::GoAway | FrameType::Rst => {
-                debug_log("tunnel: goaway/rst, closing");
+            FrameType::GoAway => {
+                debug_log("tunnel: goaway, closing");
                 break;
+            }
+            FrameType::Rst => {
+                if header.stream_id == 0 {
+                    debug_log("tunnel: session rst (id=0), closing");
+                    break;
+                }
+                debug_log(&format!(
+                    "tunnel: stream rst id={}, closing stream",
+                    header.stream_id
+                ));
+                workers.remove(&header.stream_id);
+                routes.remove(&header.stream_id);
+                let _ = sess.mux.close(header.stream_id);
+                continue;
             }
             FrameType::OpenTcp => {
                 let target = match MuxManager::parse_open_tcp(sess.keys.rx_key(), &header, &ct) {
@@ -1150,14 +1185,21 @@ const REPLY_CHUNK: usize = 16_000;
 const UDP_SINGLE_MAX: usize = 65000;
 
 /// Seal + write one reply, chunked to single-TLS-record wire frames and
-/// flushed in one batch; Err carries the first seal or transport failure.
+/// flushed in one batch.
+///
+/// Crucially separates **per-stream mux closure** (`MuxError::StreamClosed` /
+/// `FlowClosed` when a worker delivers a late reply after `close_stream` or id
+/// recycling) from **outer TLS socket `io::Error`**:
+/// - Closed inner stream -> skip that flow cleanly (`Ok(())`), NEVER reset the
+///   outer tunnel TCP connection!
+/// - Outer TLS socket failure -> return `Err(io::Error)` so `tunnel_loop` exits.
 fn send_chunked(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     id: u16,
     payload: &[u8],
     udp: bool,
-) -> Result<(), String> {
+) -> std::io::Result<()> {
     let seal_one = |sess: &mut session::ServerSession, chunk: &[u8]| {
         if udp {
             sess.mux.seal_datagram(sess.keys.tx_key(), id, chunk, 128)
@@ -1173,30 +1215,42 @@ fn send_chunked(
         return Ok(());
     }
     if payload.is_empty() || udp {
-        let sealed = seal_one(sess, payload).map_err(|e| format!("seal: {e}"))?;
-        return write_sealed(stream, &sealed.header, &sealed.ciphertext)
-            .map_err(|e| format!("transport: {e}"));
+        let sealed = match seal_one(sess, payload) {
+            Ok(s) => s,
+            Err(e) => {
+                debug_log(&format!(
+                    "tunnel: skip reply on closed flow id={id}: {e}"
+                ));
+                return Ok(());
+            }
+        };
+        return write_sealed(stream, &sealed.header, &sealed.ciphertext);
     }
     let chunks = payload.chunks(REPLY_CHUNK);
     let mut batch = BytesMut::with_capacity(payload.len() + chunks.len() * 256);
     for chunk in chunks {
-        let sealed = seal_one(sess, chunk).map_err(|e| format!("seal: {e}"))?;
+        let sealed = match seal_one(sess, chunk) {
+            Ok(s) => s,
+            Err(e) => {
+                debug_log(&format!(
+                    "tunnel: skip reply on closed stream id={id}: {e}"
+                ));
+                return Ok(());
+            }
+        };
         sealed.header.encode(&mut batch);
         batch.extend_from_slice(&sealed.ciphertext);
     }
-    stream
-        .write_all(&batch)
-        .and_then(|()| stream.flush())
-        .map_err(|e| format!("transport: {e}"))
+    write_tls_all(stream, &batch)
 }
 
-/// Seal + write one DATA reply; Err carries seal or transport failure.
+/// Seal + write one DATA reply; Err carries outer TLS transport failure only.
 fn send_data(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     id: u16,
     payload: &[u8],
-) -> Result<(), String> {
+) -> std::io::Result<()> {
     send_chunked(sess, stream, id, payload, false)
 }
 
@@ -1209,6 +1263,60 @@ fn write_sealed(
     let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + ct.len());
     header.encode(&mut buf);
     buf.extend_from_slice(ct);
-    stream.write_all(&buf)?;
-    stream.flush()
+    write_tls_all(stream, &buf)
+}
+
+/// Flush all pending encrypted bytes from `stream.conn` into `stream.sock`
+/// without calling `read_tls` (`StreamOwned::write_all`/`flush` call
+/// `complete_prior_io()`, which reads `stream.sock` and spuriously trips the
+/// 5ms `SO_RCVTIMEO` read timeout as `Err(WouldBlock)` during writes!).
+/// Retries `ErrorKind::Interrupted` so host runtime signals (`.NET` GC) never
+/// drop active sessions.
+fn flush_tls_writes(stream: &mut tls::ServerTlsStream) -> std::io::Result<()> {
+    while stream.conn.wants_write() {
+        match stream.conn.write_tls(&mut stream.sock) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "tls socket write returned 0",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt `plain` into `stream.conn.writer()` and flush all resulting TLS
+/// records strictly via `write_tls` (never touching the receive path).
+fn write_tls_all(stream: &mut tls::ServerTlsStream, plain: &[u8]) -> std::io::Result<()> {
+    stream.conn.writer().write_all(plain)?;
+    flush_tls_writes(stream)
+}
+
+/// Read decrypted plaintext bytes from `stream`, advancing TLS deframing on
+/// `stream.sock` when needed while retrying `Interrupted` and preserving the
+/// socket's `SO_RCVTIMEO` (`TimedOut`/`WouldBlock`) exclusively for reads.
+fn read_tls_step(stream: &mut tls::ServerTlsStream, dst: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match stream.conn.reader().read(dst) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+        flush_tls_writes(stream)?;
+        match stream.conn.read_tls(&mut stream.sock) {
+            Ok(0) => return Ok(0),
+            Ok(_) => {
+                stream
+                    .conn
+                    .process_new_packets()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
