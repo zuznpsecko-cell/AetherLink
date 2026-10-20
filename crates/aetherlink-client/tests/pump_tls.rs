@@ -709,7 +709,7 @@ fn multi_record_download_burst_does_not_false_eof() {
 
     let expected = 96 * 1400;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut rx_bytes;
+    let mut rx_bytes: usize;
     loop {
         {
             let guard = tun.lock().expect("lock");

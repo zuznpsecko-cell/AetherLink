@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use aetherlink_crypto::auth::NonceCache;
 
+use aetherlink_frame::codec::FrameHeader;
 use aetherlink_protocol::FrameType;
 
 use aetherlink_server::accept::{serve_connection, Path, ServerCtx};
