@@ -46,9 +46,8 @@ pub fn dial_tcp(addr: &str, port: u16) -> std::result::Result<TcpStream, DialFai
     for sock_addr in addrs {
         match TcpStream::connect_timeout(&sock_addr, TCP_DIAL_TIMEOUT) {
             Ok(stream) => {
-                let sr = socket2::SockRef::from(&stream);
-                let _ = sr.set_send_buffer_size(2 * 1024 * 1024);
-                let _ = sr.set_recv_buffer_size(2 * 1024 * 1024);
+                // Leave SO_SNDBUF/SO_RCVBUF unlocked so Linux tcp_rmem/tcp_wmem
+                // auto-tunes dynamically up to 16 MiB without SOCK_*BUF_LOCK.
                 // Nagle would stall our small per-frame writes behind
                 // delayed ACKs (seen live as a hard ~40pps cap).
                 if stream.set_nodelay(true).is_err() {

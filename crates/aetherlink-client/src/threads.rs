@@ -446,10 +446,12 @@ where
                     Ok(frames) => {
                         if !frames.is_empty() {
                             progressed = true;
-                            aetherlink_netstack::debug_log(&format!(
-                                "pump: tls tun->outbox {} frame(s)",
-                                frames.len()
-                            ));
+                            if aetherlink_netstack::debug::debug_enabled() {
+                                aetherlink_netstack::debug_log(&format!(
+                                    "pump: tls tun->outbox {} frame(s)",
+                                    frames.len()
+                                ));
+                            }
                             outbox.extend(frames);
                         }
                         pump.flush_acks(&mut *guard);
@@ -627,24 +629,29 @@ where
                 break;
             }
 
-            match tun.lock() {
-                Ok(mut guard) => {
-                    for (header, ct) in &decoded {
-                        aetherlink_netstack::debug_log(&format!(
-                            "pump: tls wire {:?} id={} len={}",
-                            header.frame_type, header.stream_id, header.length
-                        ));
-                        if let Err(e) = pump.receive_mux(header, ct, &mut *guard) {
-                            aetherlink_netstack::debug_log(&format!(
-                                "pump: tls frame dropped: {e}"
-                            ));
+            if !decoded.is_empty() {
+                match tun.lock() {
+                    Ok(mut guard) => {
+                        let dbg = aetherlink_netstack::debug::debug_enabled();
+                        for (header, ct) in &decoded {
+                            if dbg {
+                                aetherlink_netstack::debug_log(&format!(
+                                    "pump: tls wire {:?} id={} len={}",
+                                    header.frame_type, header.stream_id, header.length
+                                ));
+                            }
+                            if let Err(e) = pump.receive_mux(header, ct, &mut *guard) {
+                                aetherlink_netstack::debug_log(&format!(
+                                    "pump: tls frame dropped: {e}"
+                                ));
+                            }
                         }
+                        pump.flush_acks(&mut *guard);
                     }
-                    pump.flush_acks(&mut *guard);
-                }
-                Err(_) => {
-                    record_exit("tun mutex poisoned".to_string());
-                    break;
+                    Err(_) => {
+                        record_exit("tun mutex poisoned".to_string());
+                        break;
+                    }
                 }
             }
 

@@ -57,7 +57,18 @@ else
   echo "Blocklist refresh failed (offline?); keeping the old file/seed."
 fi
 
-echo "==> [4/5] Restage $PREFIX/server (stop first: ETXTBSY)..."
+echo "==> [4/5] Restage $PREFIX/server + WAN kernel tuning (stop first: ETXTBSY)..."
+cat >/etc/sysctl.d/99-aetherlink.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+modprobe tcp_bbr >/dev/null 2>&1 || true
+sysctl -p /etc/sysctl.d/99-aetherlink.conf >/dev/null 2>&1 || true
 systemctl stop "$UNIT" 2>/dev/null || true
 cp -a dist/ubuntu-server/. "$PREFIX/server/"
 chmod 0755 "$PREFIX/server/AetherLink.Server"

@@ -275,12 +275,14 @@ pub fn connect_with_timeout(
         }
     }
     let sock = sock.ok_or_else(|| ClientError::PlatformError(last_err))?;
-    // Size OS socket buffers for high-BDP WAN links (e.g. 100+ Mbps at 100+ ms
-    // RTT requires >= 1.5 MiB SO_SNDBUF on non-blocking Windows AFD sockets).
+    // Raise non-blocking AFD send buffer on Windows for high-BDP WAN uploads
+    // (`4 MiB / 115ms ≈ 278 Mbps`). Never set `SO_RCVBUF` on any OS and never
+    // set `SO_SNDBUF`/`SO_RCVBUF` on Linux (`setsockopt` sets `SOCK_*BUF_LOCK`,
+    // disabling kernel auto-tuning and clamping to default 208 KiB `wmem_max`).
+    #[cfg(windows)]
     {
         let sr = socket2::SockRef::from(&sock);
-        let _ = sr.set_send_buffer_size(2 * 1024 * 1024);
-        let _ = sr.set_recv_buffer_size(2 * 1024 * 1024);
+        let _ = sr.set_send_buffer_size(4 * 1024 * 1024);
     }
     // Nagle would stall our small per-frame writes behind delayed ACKs.
     sock.set_nodelay(true)

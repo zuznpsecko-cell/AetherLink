@@ -384,7 +384,9 @@ impl TunPackets for TunInterface {
                 .map(|opt| {
                     opt.map(|p| {
                         let b = p.bytes().to_vec();
-                        crate::debug_log(&format!("tun: recv {}B", b.len()));
+                        if crate::debug::debug_enabled() {
+                            crate::debug_log(&format!("tun: recv {}B", b.len()));
+                        }
                         b
                     })
                 })
@@ -419,7 +421,9 @@ impl TunPackets for TunInterface {
             })?;
             slot.bytes_mut().copy_from_slice(pkt);
             sess.send_packet(slot);
-            crate::debug_log(&format!("tun: sent {}B", pkt.len()));
+            if crate::debug::debug_enabled() {
+                crate::debug_log(&format!("tun: sent {}B", pkt.len()));
+            }
             Ok(())
         }
         #[cfg(not(windows))]
