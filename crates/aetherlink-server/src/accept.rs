@@ -109,8 +109,9 @@ const WORKER_CAP: usize = 512;
 const WORKER_QUEUE: usize = 1024;
 
 /// How long the loop waits for a buried worker before it gives up on the
-/// stream. Bound it so one genuinely wedged target cannot hold up the session.
-const SEND_HOLD: Duration = Duration::from_millis(2500);
+/// stream. Bound it so one genuinely wedged target cannot hold up the session,
+/// while tolerating slow-start / transient congestion on multi-MB uploads.
+const SEND_HOLD: Duration = Duration::from_secs(10);
 /// Poll step inside the bounded wait below.
 const SEND_HOLD_POLL: Duration = Duration::from_millis(2);
 
@@ -618,6 +619,11 @@ pub fn serve_connection(
 ) -> Path {
     // Nagle would stall our small per-frame writes behind delayed ACKs.
     let _ = sock.set_nodelay(true);
+    {
+        let sr = socket2::SockRef::from(&sock);
+        let _ = sr.set_send_buffer_size(2 * 1024 * 1024);
+        let _ = sr.set_recv_buffer_size(2 * 1024 * 1024);
+    }
     let mut stream = match tls::accept_tls(sock, &ctx.tls) {
         Ok(s) => {
             debug_log("accept: tls ok");

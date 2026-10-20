@@ -964,3 +964,225 @@ fn out_of_order_gap_emits_dupacks_and_holds_premature_fin() {
     );
     assert_eq!(recovered.last().expect("close").header.stream_id, id);
 }
+
+#[test]
+fn overlapping_retransmit_trims_prefix_and_advances_cleanly() {
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 88_000);
+
+    // First segment ("abcd", seq = isn+1..isn+5) accepted -> expected = isn+5.
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"abcd",
+    ));
+    let first = pump.poll_once(&mut tun).expect("seg1");
+    assert_eq!(first.len(), 2, "OPEN + first DATA");
+    let id = first[0].header.stream_id;
+    let mut server = MuxManager::new();
+    let open =
+        MuxManager::parse_open_tcp(&KEY, &first[0].header, &first[0].ciphertext).expect("open");
+    server
+        .register_inbound(open.id, &open.addr, open.port, false)
+        .expect("register");
+    assert_eq!(
+        server
+            .open_data(&KEY, &first[1].header, &first[1].ciphertext)
+            .expect("pt1"),
+        b"abcd"
+    );
+
+    // Overlapping coalesced retransmit ("cdEFGH", seq = isn+3..isn+9) spans
+    // `expected = isn+5`: prefix "cd" must be trimmed and suffix "EFGH" emitted.
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(3),
+        iss.wrapping_add(1),
+        b"cdEFGH",
+    ));
+    let second = pump.poll_once(&mut tun).expect("overlap");
+    assert_eq!(second.len(), 1, "trimmed suffix emits exactly one DATA");
+    assert_eq!(second[0].header.stream_id, id);
+    assert_eq!(
+        server
+            .open_data(&KEY, &second[0].header, &second[0].ciphertext)
+            .expect("pt2"),
+        b"EFGH"
+    );
+    pump.frames_written(3);
+    pump.flush_acks(&mut tun);
+    let out = tun.take_outbound();
+    assert_eq!(
+        out.last().expect("ack").tcp().expect("tcp").ack_num,
+        isn.wrapping_add(9)
+    );
+}
+
+#[test]
+fn high_rtt_multi_stream_upload_never_deadlocks_on_retransmits() {
+    // Reproduces the exact `Ping = 114ms / Upload = 0.00 Mbps` Speedtest bug:
+    // 8 parallel streams each push a full 65KB window into DataPump before
+    // `frames_written` drains across the WAN, then fire 10ms local RTO
+    // retransmits at `seq = isn + 1` (and partial mid-window offsets).
+    // Every ACK must advertise true `RCV.NXT` (never stale `acked_bytes < client_bytes`)
+    // so senders immediately advance to the next window instead of livelocking.
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let mut server = MuxManager::new();
+
+    let streams: usize = 8;
+    let mut ports = Vec::with_capacity(streams);
+    let mut isns = Vec::with_capacity(streams);
+    let mut isss = Vec::with_capacity(streams);
+
+    for i in 0..streams {
+        let port = 45_000u16 + (i as u16);
+        let isn = 100_000u32 + (i as u32) * 100_000;
+        tun.inbound.push_back(build_tcp_packet(
+            CLIENT_IP, DST, port, 443, true, false, false, isn, 0, &[],
+        ));
+        assert!(pump.poll_once(&mut tun).expect("syn").is_empty());
+        let synack_out = tun.take_outbound();
+        let iss = synack_out[0].tcp().expect("tcp").seq;
+        tun.inbound.push_back(build_tcp_packet(
+            CLIENT_IP,
+            DST,
+            port,
+            443,
+            false,
+            true,
+            false,
+            isn.wrapping_add(1),
+            iss.wrapping_add(1),
+            &[],
+        ));
+        assert!(pump.poll_once(&mut tun).expect("ack").is_empty());
+        ports.push(port);
+        isns.push(isn);
+        isss.push(iss);
+    }
+
+    let mut wire_queue: VecDeque<aetherlink_mux::manager::SealedFrame> = VecDeque::new();
+    let seg_len: usize = 1360;
+    let window_segs: usize = 48; // 48 * 1360 = 65,280B full unscaled window
+
+    // 1. All 8 streams dump a full 48-segment window before WAN writes drain.
+    for i in 0..streams {
+        let mut seq = isns[i].wrapping_add(1);
+        for s in 0..window_segs {
+            let body = vec![(i as u8) ^ (s as u8); seg_len];
+            tun.inbound.push_back(build_tcp_packet(
+                CLIENT_IP,
+                DST,
+                ports[i],
+                443,
+                false,
+                true,
+                true,
+                seq,
+                isss[i].wrapping_add(1),
+                &body,
+            ));
+            seq = seq.wrapping_add(seg_len as u32);
+        }
+    }
+    let burst1 = pump.poll_once(&mut tun).expect("burst1");
+    wire_queue.extend(burst1);
+    pump.flush_acks(&mut tun);
+    let initial_acks = tun.take_outbound();
+    assert_eq!(initial_acks.len(), streams, "every active stream gets prompt RCV.NXT ACK");
+    for i in 0..streams {
+        let ack_seg = initial_acks[i].tcp().expect("tcp");
+        assert_eq!(
+            ack_seg.ack_num,
+            isns[i].wrapping_add(1 + (window_segs * seg_len) as u32),
+            "stream {i} ACK must match full accepted RCV.NXT even while WAN write is pending"
+        );
+    }
+
+    // 2. Simulate partial WAN drain + premature RTO retransmit on all 8 streams:
+    //    must NEVER regress `ack_num` behind `RCV.NXT`!
+    let drained_half = wire_queue.len() / 2;
+    pump.frames_written(drained_half);
+    for i in 0..streams {
+        let rto_body = vec![0xEEu8; seg_len];
+        tun.inbound.push_back(build_tcp_packet(
+            CLIENT_IP,
+            DST,
+            ports[i],
+            443,
+            false,
+            true,
+            true,
+            isns[i].wrapping_add(1),
+            isss[i].wrapping_add(1),
+            &rto_body,
+        ));
+    }
+    assert!(pump.poll_once(&mut tun).expect("rto dup").is_empty());
+    pump.flush_acks(&mut tun);
+    for pkt in tun.take_outbound() {
+        let seg = pkt.tcp().expect("tcp");
+        let idx = (seg.dst_port - 45_000) as usize;
+        assert_eq!(
+            seg.ack_num,
+            isns[idx].wrapping_add(1 + (window_segs * seg_len) as u32),
+            "retransmit ACK must never regress behind RCV.NXT"
+        );
+    }
+
+    // 3. Drain remaining frames and send a second 48-segment window on all 8 streams
+    //    (total > 1.04 MiB across 8 streams), verifying exact byte-for-byte delivery.
+    pump.frames_written(wire_queue.len() - drained_half);
+    pump.flush_acks(&mut tun);
+    let _ = tun.take_outbound();
+
+    for i in 0..streams {
+        let mut seq = isns[i].wrapping_add(1 + (window_segs * seg_len) as u32);
+        for s in 0..window_segs {
+            let body = vec![0x80u8 | ((i as u8) ^ (s as u8)); seg_len];
+            tun.inbound.push_back(build_tcp_packet(
+                CLIENT_IP,
+                DST,
+                ports[i],
+                443,
+                false,
+                true,
+                true,
+                seq,
+                isss[i].wrapping_add(1),
+                &body,
+            ));
+            seq = seq.wrapping_add(seg_len as u32);
+        }
+    }
+    let burst2 = pump.poll_once(&mut tun).expect("burst2");
+    wire_queue.extend(burst2);
+
+    let mut per_stream_bytes: std::collections::HashMap<u16, usize> =
+        std::collections::HashMap::new();
+    while let Some(f) = wire_queue.pop_front() {
+        if f.header.sequence == 0 {
+            let tcp =
+                MuxManager::parse_open_tcp(&KEY, &f.header, &f.ciphertext).expect("parse open");
+            server
+                .register_inbound(tcp.id, &tcp.addr, tcp.port, false)
+                .expect("register");
+        } else {
+            let pt = server
+                .open_data(&KEY, &f.header, &f.ciphertext)
+                .expect("open data");
+            *per_stream_bytes.entry(f.header.stream_id).or_default() += pt.len();
+        }
+    }
+    assert_eq!(per_stream_bytes.len(), streams);
+    for (&id, &total) in &per_stream_bytes {
+        assert_eq!(
+            total,
+            2 * window_segs * seg_len,
+            "stream id={id} delivered full two-window upload without losing or duplicating a byte"
+        );
+    }
+}

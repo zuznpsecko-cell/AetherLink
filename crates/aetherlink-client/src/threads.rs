@@ -437,39 +437,40 @@ where
                 }
             }
 
-            // 2. Drain inbound TUN packets into `outbox` without doing network I/O
-            //    under `tun.lock()`.
-            if outbox.len() < TLS_OUTBOX_MAX {
-                match tun.lock() {
-                    Ok(mut guard) => match pump.poll_once(&mut *guard) {
-                        Ok(frames) => {
-                            if !frames.is_empty() {
-                                progressed = true;
-                                aetherlink_netstack::debug_log(&format!(
-                                    "pump: tls tun->outbox {} frame(s)",
-                                    frames.len()
-                                ));
-                                outbox.extend(frames);
-                            }
-                        }
-                        Err(e) => {
+            // 2. Always drain inbound TUN packets into `outbox` and flush
+            //    immediate `RCV.NXT + RCV.WND` ACKs so local `tcpip.sys` streams
+            //    pace smoothly on window updates without false 10ms RTO livelocks
+            //    and interactive flows are never head-of-line blocked in Wintun.
+            match tun.lock() {
+                Ok(mut guard) => match pump.poll_once(&mut *guard) {
+                    Ok(frames) => {
+                        if !frames.is_empty() {
+                            progressed = true;
                             aetherlink_netstack::debug_log(&format!(
-                                "pump: tls tun drain error: {e}, continuing"
+                                "pump: tls tun->outbox {} frame(s)",
+                                frames.len()
                             ));
-                            pump.flush_acks(&mut *guard);
+                            outbox.extend(frames);
                         }
-                    },
-                    Err(_) => {
-                        record_exit("tun mutex poisoned".to_string());
-                        break;
+                        pump.flush_acks(&mut *guard);
                     }
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tls tun drain error: {e}, continuing"
+                        ));
+                        pump.flush_acks(&mut *guard);
+                    }
+                },
+                Err(_) => {
+                    record_exit("tun mutex poisoned".to_string());
+                    break;
                 }
             }
 
-            // 3. Coalesce queued frames into full TLS records ONLY while rustls
-            //    has flushed prior records to the socket — tying TCP ACKs and
-            //    window sizing directly to real uplink drain speed.
-            for _ in 0..4 {
+            // 3. Coalesce queued frames into full 16 KiB TLS records while the
+            //    socket send buffer accepts data (up to 1 MiB per turn), issuing
+            //    window-update ACKs as each batch enters the WAN socket.
+            for _ in 0..64 {
                 if stream.conn.wants_write() || outbox.is_empty() {
                     break;
                 }
