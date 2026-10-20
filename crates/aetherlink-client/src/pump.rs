@@ -88,13 +88,14 @@ const REAP_INTERVAL: Duration = Duration::from_secs(1);
 pub const TCP_MSS: usize = 1360;
 
 /// Global safety cap on sealed frames held across all flows in `in_flight`
-/// (`4096 * 1360 ≈ 5.57 MiB`, comfortably supporting >350 Mbps WAN BDP).
-const PENDING_FRAMES_MAX: usize = 4096;
+/// (`2048 * 1360 ≈ 2.78 MiB`, comfortably supporting >220 Mbps WAN BDP
+/// without excessive upload bufferbloat).
+const PENDING_FRAMES_MAX: usize = 2048;
 
-/// Per-TCP-stream cap on queued upload frames (`512 * 1360 ≈ 696 KiB`),
+/// Per-TCP-stream cap on queued upload frames (`256 * 1360 ≈ 348 KiB`),
 /// shrinking that stream's advertised `RCV.WND` smoothly to `0` before loss
 /// while leaving full window open for interactive control streams & DNS.
-const PER_FLOW_FRAMES_MAX: usize = 512;
+const PER_FLOW_FRAMES_MAX: usize = 256;
 
 /// Maximum plaintext per upstream `DATA` frame so even jumbo segments stay
 /// well below wire caps.
@@ -527,12 +528,21 @@ impl DataPump {
             self.by_id.remove(&id);
             self.by_tuple.remove(fk);
             if announce && self.mux.is_open(id) {
-                match self.mux.seal_data(&self.tx, id, &[], self.pad) {
-                    Ok(sealed) => self.push_frame(&mut out, sealed, None),
-                    Err(e) => aetherlink_netstack::debug_log(&format!(
-                        "pump: close-signal id={id} seal failed: {e}"
-                    )),
-                }
+                // Emit a true per-stream `FrameType::Rst` so the server immediately
+                // tears down its upstream relay worker & socket instead of merely
+                // half-closing `Shutdown::Write` (which left aborted 25 MB Speedtest
+                // downloads flooding the outer TLS link throughout the Upload phase).
+                let rst = SealedFrame {
+                    header: FrameHeader {
+                        length: 16,
+                        frame_type: FrameType::Rst,
+                        flags: 0,
+                        stream_id: id,
+                        sequence: 0,
+                    },
+                    ciphertext: vec![0u8; 16],
+                };
+                self.push_frame(&mut out, rst, None);
             }
             let _ = self.mux.close(id);
         }

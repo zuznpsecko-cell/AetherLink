@@ -14,6 +14,7 @@ use aetherlink_netstack::smoltcp_wrapper::{
     build_tcp_packet, build_tcp_packet_full, parse_ipv4_packet, ParsedPacket,
 };
 use aetherlink_netstack::tun::TunPackets;
+use aetherlink_protocol::FrameType;
 
 const KEY: [u8; 32] = [11u8; 32];
 const PAD: usize = 128;
@@ -291,6 +292,42 @@ fn app_rst_forgets_flow_silently() {
     let frames = pump.poll_once(&mut tun).expect("poll");
     assert!(frames.is_empty());
     assert!(tun.take_outbound().is_empty());
+}
+
+#[test]
+fn app_rst_on_active_stream_emits_mux_rst_frame() {
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 6500);
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"GET /download\r\n\r\n",
+    ));
+    let opened = pump.poll_once(&mut tun).expect("open stream");
+    let stream_id = opened[0].header.stream_id;
+    let _ = tun.take_outbound();
+
+    let rst = build_tcp_packet_full(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        false,
+        false,
+        false,
+        true,
+        isn.wrapping_add(18),
+        0,
+        &[],
+    );
+    tun.inbound.push_back(rst);
+    let frames = pump.poll_once(&mut tun).expect("rst frame");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].header.frame_type, FrameType::Rst);
+    assert_eq!(frames[0].header.stream_id, stream_id);
 }
 
 /// TunPackets wrapper failing the next send_packet on demand (wintun ring
