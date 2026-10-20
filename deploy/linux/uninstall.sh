@@ -6,7 +6,7 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-/opt/aetherlink}"
 STATE_DIR="/var/lib/aetherlink"
-CACHE_DIR="${CACHE_DIR:-/var/cache/aetherlink}"  # update-server.sh build cache
+CACHE_DIR="${CACHE_DIR:-/var/cache/aetherlink}"  # update-server-cached.sh build cache
 
 if [ -x "$PREFIX/client/AetherLink.Client" ]; then
   "$PREFIX/client/AetherLink.Client" "$PREFIX/client.example.yaml" cleanup || true
