@@ -139,3 +139,41 @@ psk: "<тот же PSK, что на сервере>"
 | клиент получает static вместо туннеля | PSK не совпал; `outer_sni` ≠ имени в серте |
 | `cert.pem/key.pem not found` | забыты `TLS_CERT`/`TLS_KEY` при smoke-запуске |
 | renewal не подхватывается | нет deploy-hook → `systemctl restart aetherlink-server` |
+
+## 9. Обновление
+
+Два скрипта, оба запускаются на VPS под root: тянут свежий `main`, пересобирают,
+обновляют блоклист и перезапускают сервис; `server.yaml` (PSK), серты, фаервол и
+unit не трогают. Если сборка упала, сервис не останавливается — продолжает
+работать старая версия. Скрипты независимы друг от друга.
+
+| Скрипт | Сборка |
+|---|---|
+| `update-server.sh` | всегда с нуля, в `/tmp/aetherlink-update`: каждый раз заново компилирует все зависимости — долго |
+| `update-server-cached.sh` | инкрементальная, кэш в `/var/cache/aetherlink`: зависимости компилируются один раз |
+
+```bash
+# update-server-cached.sh, первый раз (на VPS его ещё нет):
+curl -fsSL https://raw.githubusercontent.com/zuznpsecko-cell/AetherLink/main/deploy/linux/update-server-cached.sh \
+  -o /tmp/update-server-cached.sh && sudo bash /tmp/update-server-cached.sh
+# Дальше — свежая копия скрипта всегда лежит в кэше:
+sudo bash /var/cache/aetherlink/src/deploy/linux/update-server-cached.sh
+```
+
+Кэш `update-server-cached.sh` переживает перезагрузку (в отличие от `/tmp`):
+
+| Каталог | Что даёт |
+|---|---|
+| `cargo-target/` | собранные сторонние крейты (aws-lc-sys, ring, tokio, rustls…) компилируются один раз и переиспользуются, пока не поменялись `Cargo.lock` или версия Rust |
+| `src/` | чекаут обновляется на месте (`git fetch` + `reset`), а не клонируется заново: у неизменённых файлов сохраняется mtime, и cargo пересобирает только реально изменённые крейты проекта |
+| `out/` + `out.stamp` | последняя удачная сборка (`libaetherlink_core.so` + publish .NET-хоста); тот же коммит и те же версии тулчейнов → cargo и dotnet не запускаются вовсе |
+
+Первый запуск — полная сборка. Дальше: нет новых коммитов — сборка пропускается
+целиком; Rust-код не менялся — cargo ничего не компилирует; менялся —
+пересобираются только свои крейты плюс финальная линковка (LTO).
+
+- `--clean` — сбросить кэш и собрать всё с нуля (если сборка ведёт себя странно).
+- `CACHE_MAX_MB` (по умолчанию 4096) — потолок для `cargo-target/`: старые версии
+  крейтов копятся после обновлений `Cargo.lock`/Rust; при превышении кэш
+  очищается, и следующая сборка полная.
+- Кэш удаляет `deploy/linux/uninstall.sh`.
