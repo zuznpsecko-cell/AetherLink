@@ -1436,7 +1436,10 @@ fn closed_stream_ignores_trailing_frames_without_redial() {
     let mut sess =
         aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
 
-    let s1 = sess.mux.open_tcp("127.0.0.1", target_port).expect("open s1");
+    let s1 = sess
+        .mux
+        .open_tcp("127.0.0.1", target_port)
+        .expect("open s1");
     let open = sess
         .mux
         .seal_open_tcp(sess.keys.tx_key(), s1, 128)
@@ -1451,7 +1454,11 @@ fn closed_stream_ignores_trailing_frames_without_redial() {
     // Wait for server to send the empty-DATA close notification for s1.
     let (h, c) = wire_help::read_frame(&mut stream);
     assert_eq!(h.stream_id, s1);
-    assert!(sess.mux.open_data(sess.keys.rx_key(), &h, &c).expect("open close").is_empty());
+    assert!(sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open close")
+        .is_empty());
 
     // Now send trailing mid-body frames that were already queued in flight for s1!
     for _ in 0..4 {
@@ -1477,10 +1484,16 @@ fn closed_stream_ignores_trailing_frames_without_redial() {
 
     let (h, c) = wire_help::read_frame(&mut stream);
     assert_eq!(h.stream_id, live);
-    assert_eq!(sess.mux.open_data(sess.keys.rx_key(), &h, &c).expect("ok"), b"ok");
-    assert_eq!(accepts.load(Ordering::SeqCst), 1, "closed stream must never redial mid-body");
+    assert_eq!(
+        sess.mux.open_data(sess.keys.rx_key(), &h, &c).expect("ok"),
+        b"ok"
+    );
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "closed stream must never redial mid-body"
+    );
 
     drop(stream);
     server.join().expect("server thread");
 }
-

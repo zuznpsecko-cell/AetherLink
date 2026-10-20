@@ -145,7 +145,11 @@ fn synack_mss_encodes_and_parses_with_valid_checksums() {
         65_535,
         1360,
     );
-    assert_eq!(raw.len(), 44, "20B IPv4 + 24B TCP header with 4B MSS option");
+    assert_eq!(
+        raw.len(),
+        44,
+        "20B IPv4 + 24B TCP header with 4B MSS option"
+    );
     let parsed = parse_ipv4_packet(&raw).expect("valid IPv4 + TCP checksums");
     let seg = parsed.tcp().expect("tcp segment");
     assert!(seg.syn && seg.ack && !seg.fin && !seg.rst);
@@ -153,4 +157,3 @@ fn synack_mss_encodes_and_parses_with_valid_checksums() {
     assert_eq!(seg.mss, Some(1360));
     assert!(seg.payload.is_empty());
 }
-

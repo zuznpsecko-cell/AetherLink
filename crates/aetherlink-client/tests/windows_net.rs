@@ -298,11 +298,16 @@ fn subiface_mtu_args_formats_clean_argv() {
             "store=active",
         ]
     );
-    assert_eq!(subiface_mtu_args("aether0", 65535).expect("clamp high")[5], "mtu=1500");
-    assert_eq!(subiface_mtu_args("aether0", 100).expect("clamp low")[5], "mtu=576");
+    assert_eq!(
+        subiface_mtu_args("aether0", 65535).expect("clamp high")[5],
+        "mtu=1500"
+    );
+    assert_eq!(
+        subiface_mtu_args("aether0", 100).expect("clamp low")[5],
+        "mtu=576"
+    );
     assert!(subiface_mtu_args("", 1420).is_err());
 }
-
 
 #[test]
 #[cfg(windows)]

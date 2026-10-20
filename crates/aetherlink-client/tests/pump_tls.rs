@@ -457,7 +457,18 @@ fn full_duplex_upload_and_download_burst_completes_intact() {
         uploaded.len()
     });
 
-    let syn = build_tcp_packet(CLIENT_IP, DST, 43001, 443, true, false, false, 10_000, 0, &[]);
+    let syn = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        43001,
+        443,
+        true,
+        false,
+        false,
+        10_000,
+        0,
+        &[],
+    );
     let tun = Arc::new(Mutex::new(FakeTun {
         inbound: vec![syn].into(),
         outbound: Vec::new(),
@@ -516,8 +527,9 @@ fn full_duplex_upload_and_download_burst_completes_intact() {
             ));
             seq = seq.wrapping_add(1360);
         }
-        guard.inbound.push_back(
-            aetherlink_netstack::smoltcp_wrapper::build_tcp_packet_full(
+        guard
+            .inbound
+            .push_back(aetherlink_netstack::smoltcp_wrapper::build_tcp_packet_full(
                 CLIENT_IP,
                 DST,
                 43001,
@@ -530,8 +542,7 @@ fn full_duplex_upload_and_download_burst_completes_intact() {
                 seq,
                 iss.wrapping_add(1),
                 &[],
-            ),
-        );
+            ));
     }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -567,4 +578,3 @@ fn full_duplex_upload_and_download_burst_completes_intact() {
     let echoed_len = u64::from_be_bytes(rx_payload[..8].try_into().expect("8B"));
     assert_eq!(echoed_len, (128 * 1360) as u64);
 }
-

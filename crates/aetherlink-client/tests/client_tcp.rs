@@ -848,7 +848,10 @@ fn oversized_server_reply_is_chunked_to_mss_without_exceeding_mtu() {
     pump.receive_mux(&sealed.header, &sealed.ciphertext, &mut tun)
         .expect("chunked inject");
 
-    assert!(tun.outbound.len() >= 12, "16KB must split into <=1360B segments");
+    assert!(
+        tun.outbound.len() >= 12,
+        "16KB must split into <=1360B segments"
+    );
     let mut reassembled = Vec::new();
     let mut next_seq = iss.wrapping_add(1);
     for (idx, raw) in tun.outbound.iter().enumerate() {
@@ -914,7 +917,11 @@ fn out_of_order_gap_emits_dupacks_and_holds_premature_fin() {
         "out-of-order segments AND premature FIN must NOT forward or half-close stream"
     );
     let dupacks = tun.take_outbound();
-    assert_eq!(dupacks.len(), 4, "duplicate ACKs trigger RFC 5681 Fast Retransmit");
+    assert_eq!(
+        dupacks.len(),
+        4,
+        "duplicate ACKs trigger RFC 5681 Fast Retransmit"
+    );
     for pkt in &dupacks {
         let seg = pkt.tcp().expect("tcp");
         assert!(seg.ack && !seg.fin);
@@ -957,4 +964,3 @@ fn out_of_order_gap_emits_dupacks_and_holds_premature_fin() {
     );
     assert_eq!(recovered.last().expect("close").header.stream_id, id);
 }
-
