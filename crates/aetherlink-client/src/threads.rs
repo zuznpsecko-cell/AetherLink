@@ -136,9 +136,9 @@ pub fn read_sealed<R: Read>(r: &mut R) -> std::io::Result<(FrameHeader, Vec<u8>)
 pub struct PumpHandle {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    /// Second handle to the wire socket, used only to unblock the threads
-    /// on `stop()` (a blocked read/write cannot see the stop flag).
-    sock: Option<TcpStream>,
+    /// Second handle to the active wire socket, used only to unblock threads
+    /// on `stop()` (updated across transparent TLS auto-reconnects).
+    sock: Arc<Mutex<Option<TcpStream>>>,
     /// Non-secret diagnostic recorded when a pump thread exits on its own.
     exit_reason: Arc<Mutex<Option<String>>>,
 }
@@ -150,8 +150,10 @@ impl PumpHandle {
         self.stop.store(true, Ordering::SeqCst);
         // Shut the socket first: a thread parked in a read/write on a dead
         // peer wakes up with an error instead of holding the join hostage.
-        if let Some(sock) = self.sock.take() {
-            let _ = sock.shutdown(std::net::Shutdown::Both);
+        if let Ok(mut guard) = self.sock.lock() {
+            if let Some(sock) = guard.take() {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
         }
         while let Some(h) = self.threads.pop() {
             let _ = h.join();
@@ -317,7 +319,7 @@ where
     Ok(PumpHandle {
         stop,
         threads: vec![tun_thread, wire_thread],
-        sock: Some(shutdown_side),
+        sock: Arc::new(Mutex::new(Some(shutdown_side))),
         exit_reason: Arc::new(Mutex::new(None)),
     })
 }
@@ -376,6 +378,22 @@ pub fn spawn_pump_tls<T>(
 where
     T: TunPackets + Send + 'static,
 {
+    spawn_pump_tls_resilient::<T, fn() -> crate::Result<ConnectedTunnel>>(tun, tunnel, pad, None)
+}
+
+/// Spawn the non-blocking full-duplex TLS pump with optional automatic transport
+/// re-dialing (`reconnect`) on unexpected outer TCP/TLS drops (`os error 10054`,
+/// CGNAT timeout, middlebox reset, or transient link loss).
+pub fn spawn_pump_tls_resilient<T, R>(
+    tun: Arc<Mutex<T>>,
+    tunnel: ConnectedTunnel,
+    pad: usize,
+    reconnect: Option<R>,
+) -> std::io::Result<PumpHandle>
+where
+    T: TunPackets + Send + 'static,
+    R: Fn() -> crate::Result<ConnectedTunnel> + Send + 'static,
+{
     use std::io::ErrorKind;
 
     let ConnectedTunnel { mut stream, sess } = tunnel;
@@ -385,12 +403,16 @@ where
     let shutdown_side = stream.sock.try_clone()?;
     stream.sock.set_nonblocking(true)?;
 
+    let sock_slot = Arc::new(Mutex::new(Some(shutdown_side)));
+    let sock_loop = Arc::clone(&sock_slot);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_loop = Arc::clone(&stop);
     let exit_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let exit_loop = Arc::clone(&exit_reason);
     aetherlink_netstack::debug_log("pump: tls nonblocking thread spawned");
     let thread = std::thread::spawn(move || {
+        const RECONNECT_BACKOFF_MS: [u64; 8] = [50, 150, 300, 600, 1000, 1500, 2000, 2500];
+
         let record_exit = |reason: String| {
             aetherlink_netstack::debug_log(&format!("pump: tls exit: {reason}"));
             if let Ok(mut g) = exit_loop.lock() {
@@ -418,24 +440,24 @@ where
             }
         }
 
-        loop {
-            if stop_loop.load(Ordering::SeqCst) {
-                break;
-            }
-            let mut progressed = false;
+        'session: loop {
+            let drop_reason: String = 'pump: loop {
+                if stop_loop.load(Ordering::SeqCst) {
+                    break 'session;
+                }
+                let mut progressed = false;
 
-            // 1. Drain any pending encrypted TLS bytes into the OS TCP socket.
-            match flush_tls_writes(&mut stream, &mut write_stalled_since) {
-                Ok(n) => {
-                    if n > 0 {
-                        progressed = true;
+                // 1. Drain any pending encrypted TLS bytes into the OS TCP socket.
+                match flush_tls_writes(&mut stream, &mut write_stalled_since) {
+                    Ok(n) => {
+                        if n > 0 {
+                            progressed = true;
+                        }
+                    }
+                    Err(e) => {
+                        break 'pump format!("tls socket write failed: {e}");
                     }
                 }
-                Err(e) => {
-                    record_exit(format!("tls socket write failed: {e}"));
-                    break;
-                }
-            }
 
             // 2. Always drain inbound TUN packets into `outbox` and flush
             //    immediate `RCV.NXT + RCV.WND` ACKs so local `tcpip.sys` streams
@@ -465,7 +487,7 @@ where
                 },
                 Err(_) => {
                     record_exit("tun mutex poisoned".to_string());
-                    break;
+                    break 'session;
                 }
             }
 
@@ -497,8 +519,7 @@ where
                     break;
                 }
                 if let Err(e) = stream.conn.writer().write_all(&tx_buf) {
-                    record_exit(format!("tls plaintext writer failed: {e}"));
-                    return;
+                    break 'pump format!("tls plaintext writer failed: {e}");
                 }
                 last_tx = Instant::now();
                 progressed = true;
@@ -511,159 +532,248 @@ where
                     }
                     Err(_) => {
                         record_exit("tun mutex poisoned".to_string());
-                        return;
+                        break 'session;
                     }
                 }
                 if let Err(e) = write_res {
-                    record_exit(format!("tls socket write failed: {e}"));
-                    return;
+                    break 'pump format!("tls socket write failed: {e}");
                 }
             }
 
-            // 4. Periodic idle keepalive so NATs and middleboxes keep state warm.
-            //    Includes a 16-byte zero body so older servers that read non-empty
-            //    frame bodies directly do not misread `read(&mut []) -> Ok(0)` as EOF.
-            if !stream.conn.wants_write()
-                && outbox.is_empty()
-                && last_tx.elapsed() >= TLS_KEEPALIVE_INTERVAL
-            {
-                tx_buf.clear();
-                FrameHeader {
-                    length: 16,
-                    frame_type: FrameType::Ping,
-                    flags: 0,
-                    stream_id: 0,
-                    sequence: 0,
-                }
-                .encode(&mut tx_buf);
-                tx_buf.extend_from_slice(&[0u8; 16]);
-                let _ = stream.conn.writer().write_all(&tx_buf);
-                last_tx = Instant::now();
-                if let Err(e) = flush_tls_writes(&mut stream, &mut write_stalled_since) {
-                    record_exit(format!("tls keepalive write failed: {e}"));
-                    break;
-                }
-            }
-
-            // 5. Non-blocking read of available TLS records + exact buffered plaintext.
-            //    `process_new_packets()` + `read_exact` MUST run inside every `Ok(_)`
-            //    iteration so `rustls`'s ~16.6 KB `DeframerVecBuffer` never fills up
-            //    during a multi-record burst (which otherwise causes `read_tls` to pass
-            //    `&mut []` to `TcpStream::read` and get a false `Ok(0)` EOF!).
-            let mut peer_eof: Option<String> = None;
-            for _ in 0..32 {
-                match stream.conn.read_tls(&mut stream.sock) {
-                    Ok(0) => {
-                        peer_eof = Some("server closed TLS connection (EOF)".to_string());
-                        break;
+                // 4. Periodic idle keepalive so NATs and middleboxes keep state warm.
+                //    Includes a 16-byte zero body so older servers that read non-empty
+                //    frame bodies directly do not misread `read(&mut []) -> Ok(0)` as EOF.
+                if !stream.conn.wants_write()
+                    && outbox.is_empty()
+                    && last_tx.elapsed() >= TLS_KEEPALIVE_INTERVAL
+                {
+                    tx_buf.clear();
+                    FrameHeader {
+                        length: 16,
+                        frame_type: FrameType::Ping,
+                        flags: 0,
+                        stream_id: 0,
+                        sequence: 0,
                     }
-                    Ok(_) => {
-                        progressed = true;
-                        rx_partial_since = None;
-                        match stream.conn.process_new_packets() {
-                            Ok(state) => {
-                                let avail = state.plaintext_bytes_to_read();
-                                if avail > 0 {
-                                    let start = rx_buf.len();
-                                    rx_buf.resize(start + avail, 0);
-                                    if let Err(e) =
-                                        stream.conn.reader().read_exact(&mut rx_buf[start..])
-                                    {
-                                        peer_eof =
-                                            Some(format!("tls plaintext read failed: {e}"));
-                                        break;
+                    .encode(&mut tx_buf);
+                    tx_buf.extend_from_slice(&[0u8; 16]);
+                    let _ = stream.conn.writer().write_all(&tx_buf);
+                    last_tx = Instant::now();
+                    if let Err(e) = flush_tls_writes(&mut stream, &mut write_stalled_since) {
+                        break 'pump format!("tls keepalive write failed: {e}");
+                    }
+                }
+
+                // 5. Non-blocking read of available TLS records + exact buffered plaintext.
+                //    `process_new_packets()` + `read_exact` MUST run inside every `Ok(_)`
+                //    iteration so `rustls`'s ~16.6 KB `DeframerVecBuffer` never fills up
+                //    during a multi-record burst (which otherwise causes `read_tls` to pass
+                //    `&mut []` to `TcpStream::read` and get a false `Ok(0)` EOF!).
+                let mut peer_eof: Option<String> = None;
+                for _ in 0..32 {
+                    match stream.conn.read_tls(&mut stream.sock) {
+                        Ok(0) => {
+                            peer_eof = Some("server closed TLS connection (EOF)".to_string());
+                            break;
+                        }
+                        Ok(_) => {
+                            progressed = true;
+                            rx_partial_since = None;
+                            match stream.conn.process_new_packets() {
+                                Ok(state) => {
+                                    let avail = state.plaintext_bytes_to_read();
+                                    if avail > 0 {
+                                        let start = rx_buf.len();
+                                        rx_buf.resize(start + avail, 0);
+                                        if let Err(e) =
+                                            stream.conn.reader().read_exact(&mut rx_buf[start..])
+                                        {
+                                            peer_eof =
+                                                Some(format!("tls plaintext read failed: {e}"));
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                peer_eof = Some(format!("tls protocol error: {e}"));
-                                break;
+                                Err(e) => {
+                                    peer_eof = Some(format!("tls protocol error: {e}"));
+                                    break;
+                                }
                             }
                         }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e)
+                            if e.kind() == ErrorKind::WouldBlock
+                                || e.kind() == ErrorKind::TimedOut =>
+                        {
+                            break;
+                        }
+                        Err(e) => {
+                            peer_eof = Some(format!("tls socket read failed: {e}"));
+                            break;
+                        }
                     }
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e)
-                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                    {
+                }
+
+                // 6. Decode all complete mux frames from `rx_buf` and inject them.
+                let mut decoded: Vec<(FrameHeader, BytesMut)> = Vec::new();
+                let mut fatal: Option<String> = None;
+                while rx_buf.len() >= FRAME_HEADER_SIZE {
+                    let mut hdr_slice = BytesMut::from(&rx_buf[..FRAME_HEADER_SIZE]);
+                    let header = match FrameHeader::decode(&mut hdr_slice) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            fatal = Some(format!("bad frame header from server: {e}"));
+                            break;
+                        }
+                    };
+                    if header.length as usize > MAX_WIRE_BODY {
+                        fatal = Some(format!("absurd frame length {}", header.length));
+                        break;
+                    }
+                    let total = FRAME_HEADER_SIZE + header.length as usize;
+                    if rx_buf.len() < total {
+                        let since = *rx_partial_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() > BODY_TOTAL_TIMEOUT {
+                            fatal = Some("frame body stalled past 30s".to_string());
+                        }
+                        break;
+                    }
+                    rx_partial_since = None;
+                    let _ = rx_buf.split_to(FRAME_HEADER_SIZE);
+                    let ct = rx_buf.split_to(header.length as usize);
+                    decoded.push((header, ct));
+                }
+
+                if let Some(reason) = fatal {
+                    break 'pump reason;
+                }
+
+                if !decoded.is_empty() {
+                    match tun.lock() {
+                        Ok(mut guard) => {
+                            let dbg = aetherlink_netstack::debug::debug_enabled();
+                            for (header, ct) in &decoded {
+                                if dbg {
+                                    aetherlink_netstack::debug_log(&format!(
+                                        "pump: tls wire {:?} id={} len={}",
+                                        header.frame_type, header.stream_id, header.length
+                                    ));
+                                }
+                                if let Err(e) = pump.receive_mux(header, ct, &mut *guard) {
+                                    aetherlink_netstack::debug_log(&format!(
+                                        "pump: tls frame dropped: {e}"
+                                    ));
+                                }
+                            }
+                            pump.flush_acks(&mut *guard);
+                        }
+                        Err(_) => {
+                            record_exit("tun mutex poisoned".to_string());
+                            break 'session;
+                        }
+                    }
+                }
+
+                if let Some(reason) = peer_eof {
+                    break 'pump reason;
+                }
+
+                if !progressed {
+                    std::thread::sleep(TLS_IDLE_POLL);
+                }
+            };
+
+            if stop_loop.load(Ordering::SeqCst) {
+                break 'session;
+            }
+
+            let Some(ref dial) = reconnect else {
+                record_exit(drop_reason);
+                break 'session;
+            };
+
+            aetherlink_netstack::debug_log(&format!(
+                "pump: transport dropped ({drop_reason}), attempting transparent reconnect"
+            ));
+            let mut last_err = String::new();
+            let mut recovered = false;
+            for (attempt, delay_ms) in RECONNECT_BACKOFF_MS.iter().copied().enumerate() {
+                let deadline = Instant::now() + Duration::from_millis(delay_ms);
+                while Instant::now() < deadline {
+                    if stop_loop.load(Ordering::SeqCst) {
+                        break 'session;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if stop_loop.load(Ordering::SeqCst) {
+                    break 'session;
+                }
+                match dial() {
+                    Ok(ConnectedTunnel {
+                        stream: mut new_stream,
+                        sess: new_sess,
+                    }) => {
+                        let _ = new_stream.sock.set_nodelay(true);
+                        let _ = new_stream.sock.set_read_timeout(None);
+                        let _ = new_stream.sock.set_write_timeout(None);
+                        let Ok(cloned_sock) = new_stream.sock.try_clone() else {
+                            last_err = "try_clone failed on reconnected socket".to_string();
+                            continue;
+                        };
+                        if let Err(e) = new_stream.sock.set_nonblocking(true) {
+                            last_err = format!("set_nonblocking failed: {e}");
+                            continue;
+                        }
+                        if let Ok(mut slot) = sock_loop.lock() {
+                            *slot = Some(cloned_sock);
+                        }
+                        outbox.clear();
+                        tx_buf.clear();
+                        rx_buf.clear();
+                        write_stalled_since = None;
+                        rx_partial_since = None;
+                        last_tx = Instant::now();
+                        if let Ok(state) = new_stream.conn.process_new_packets() {
+                            let avail = state.plaintext_bytes_to_read();
+                            if avail > 0 {
+                                rx_buf.resize(avail, 0);
+                                let _ = new_stream.conn.reader().read_exact(&mut rx_buf[..avail]);
+                            }
+                        }
+                        match tun.lock() {
+                            Ok(mut guard) => {
+                                pump.reset_transport(
+                                    new_sess.mux,
+                                    *new_sess.keys.tx_key(),
+                                    *new_sess.keys.rx_key(),
+                                    &mut *guard,
+                                );
+                            }
+                            Err(_) => {
+                                record_exit("tun mutex poisoned".to_string());
+                                break 'session;
+                            }
+                        }
+                        stream = new_stream;
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: transparent reconnect succeeded on attempt {}",
+                            attempt + 1
+                        ));
+                        recovered = true;
                         break;
                     }
                     Err(e) => {
-                        peer_eof = Some(format!("tls socket read failed: {e}"));
-                        break;
+                        last_err = e.to_string();
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: reconnect attempt {} failed: {last_err}",
+                            attempt + 1
+                        ));
                     }
                 }
             }
-
-            // 6. Decode all complete mux frames from `rx_buf` and inject them.
-            let mut decoded: Vec<(FrameHeader, BytesMut)> = Vec::new();
-            let mut fatal: Option<String> = None;
-            while rx_buf.len() >= FRAME_HEADER_SIZE {
-                let mut hdr_slice = BytesMut::from(&rx_buf[..FRAME_HEADER_SIZE]);
-                let header = match FrameHeader::decode(&mut hdr_slice) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        fatal = Some(format!("bad frame header from server: {e}"));
-                        break;
-                    }
-                };
-                if header.length as usize > MAX_WIRE_BODY {
-                    fatal = Some(format!("absurd frame length {}", header.length));
-                    break;
-                }
-                let total = FRAME_HEADER_SIZE + header.length as usize;
-                if rx_buf.len() < total {
-                    let since = *rx_partial_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() > BODY_TOTAL_TIMEOUT {
-                        fatal = Some("frame body stalled past 30s".to_string());
-                    }
-                    break;
-                }
-                rx_partial_since = None;
-                let _ = rx_buf.split_to(FRAME_HEADER_SIZE);
-                let ct = rx_buf.split_to(header.length as usize);
-                decoded.push((header, ct));
-            }
-
-            if let Some(reason) = fatal {
-                record_exit(reason);
-                break;
-            }
-
-            if !decoded.is_empty() {
-                match tun.lock() {
-                    Ok(mut guard) => {
-                        let dbg = aetherlink_netstack::debug::debug_enabled();
-                        for (header, ct) in &decoded {
-                            if dbg {
-                                aetherlink_netstack::debug_log(&format!(
-                                    "pump: tls wire {:?} id={} len={}",
-                                    header.frame_type, header.stream_id, header.length
-                                ));
-                            }
-                            if let Err(e) = pump.receive_mux(header, ct, &mut *guard) {
-                                aetherlink_netstack::debug_log(&format!(
-                                    "pump: tls frame dropped: {e}"
-                                ));
-                            }
-                        }
-                        pump.flush_acks(&mut *guard);
-                    }
-                    Err(_) => {
-                        record_exit("tun mutex poisoned".to_string());
-                        break;
-                    }
-                }
-            }
-
-            if let Some(reason) = peer_eof {
-                if !stop_loop.load(Ordering::SeqCst) {
-                    record_exit(reason);
-                }
-                break;
-            }
-
-            if !progressed {
-                std::thread::sleep(TLS_IDLE_POLL);
+            if !recovered {
+                record_exit(format!("{drop_reason} (reconnect failed: {last_err})"));
+                break 'session;
             }
         }
         aetherlink_netstack::debug_log("pump: tls thread joined");
@@ -671,7 +781,7 @@ where
     Ok(PumpHandle {
         stop,
         threads: vec![thread],
-        sock: Some(shutdown_side),
+        sock: sock_slot,
         exit_reason,
     })
 }

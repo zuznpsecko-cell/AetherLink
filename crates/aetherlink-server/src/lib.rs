@@ -183,10 +183,17 @@ impl ServerListener {
                         // blocking I/O, the whole serve path depends on it.
                         sock.set_nonblocking(false).ok();
                         let ctx = Arc::clone(&ctx);
-                        std::thread::spawn(move || {
-                            let mut routes = HashMap::new();
-                            accept::serve_connection(sock, &ctx, &mut routes);
-                        });
+                        let _ = std::thread::Builder::new()
+                            .name("tunnel-conn".to_string())
+                            .stack_size(4 * 1024 * 1024)
+                            .spawn(move || {
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    move || {
+                                        let mut routes = HashMap::new();
+                                        accept::serve_connection(sock, &ctx, &mut routes);
+                                    },
+                                ));
+                            });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(25));

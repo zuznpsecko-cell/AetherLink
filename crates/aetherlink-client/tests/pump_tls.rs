@@ -752,3 +752,209 @@ fn multi_record_download_burst_does_not_false_eof() {
     handle.stop();
     server.join().expect("server thread");
 }
+
+#[test]
+fn resilient_tls_pump_reconnects_transparently_after_abrupt_server_drop() {
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        key.cert.der().to_vec(),
+    )];
+    let key_der = key.key_pair.serialize_der();
+    let server_cfg =
+        Arc::new(aetherlink_core::tls::server_config(chain, &key_der).expect("server cfg"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let cache = NonceCache::new();
+    let (drop_tx, drop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+    let server = std::thread::spawn(move || {
+        // Session 1: echo "before-drop", then abruptly drop the raw TCP socket
+        // while the client's inner TCP flow 42100 is still open.
+        {
+            let (sock, _) = listener.accept().expect("accept #1");
+            let mut stream =
+                aetherlink_core::tls::accept_tls(sock, &server_cfg).expect("server tls #1");
+            let mut sess = aetherlink_core::session::handshake_server(&mut stream, PSK, &cache)
+                .expect("server hs #1");
+            let (open_h, open_c) = read_one(&mut stream);
+            let tcp = aetherlink_mux::manager::MuxManager::parse_open_tcp(
+                sess.keys.rx_key(),
+                &open_h,
+                &open_c,
+            )
+            .expect("open #1");
+            sess.mux
+                .register_inbound(tcp.id, &tcp.addr, tcp.port, false)
+                .expect("register #1");
+            let (data_h, data_c) = read_one(&mut stream);
+            let pt = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &data_h, &data_c)
+                .expect("open data #1");
+            assert_eq!(pt, b"before-drop");
+            let sealed = sess
+                .mux
+                .seal_data(sess.keys.tx_key(), tcp.id, &pt, PAD)
+                .expect("seal #1");
+            write_one(&mut stream, &sealed.header, &sealed.ciphertext);
+            let _ = drop_rx.recv();
+            let _ = stream.get_mut().shutdown(std::net::Shutdown::Both);
+        }
+
+        // Session 2: accept transparent auto-reconnect on the same listener
+        // and echo a brand-new flow ("after-drop").
+        let (sock2, _) = listener.accept().expect("accept #2");
+        let mut stream2 =
+            aetherlink_core::tls::accept_tls(sock2, &server_cfg).expect("server tls #2");
+        let mut sess2 = aetherlink_core::session::handshake_server(&mut stream2, PSK, &cache)
+            .expect("server hs #2");
+        let (open_h2, open_c2) = read_one(&mut stream2);
+        let tcp2 = aetherlink_mux::manager::MuxManager::parse_open_tcp(
+            sess2.keys.rx_key(),
+            &open_h2,
+            &open_c2,
+        )
+        .expect("open #2");
+        sess2
+            .mux
+            .register_inbound(tcp2.id, &tcp2.addr, tcp2.port, false)
+            .expect("register #2");
+        let (data_h2, data_c2) = read_one(&mut stream2);
+        let pt2 = sess2
+            .mux
+            .open_data(sess2.keys.rx_key(), &data_h2, &data_c2)
+            .expect("open data #2");
+        assert_eq!(pt2, b"after-drop");
+        let sealed2 = sess2
+            .mux
+            .seal_data(sess2.keys.tx_key(), tcp2.id, &pt2, PAD)
+            .expect("seal #2");
+        write_one(&mut stream2, &sealed2.header, &sealed2.ciphertext);
+        let mut one = [0u8; 1];
+        let _ = stream2.read(&mut one);
+    });
+
+    let cfg = test_config(&format!("127.0.0.1:{port}"));
+    let reconnect_cfg = cfg.clone();
+    let tunnel =
+        aetherlink_client::lifecycle::connect(&cfg, Some(Arc::new(AcceptAll))).expect("connect #1");
+    let syn1 = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        42100,
+        443,
+        true,
+        false,
+        true,
+        7_000,
+        0,
+        b"before-drop",
+    );
+    let tun = Arc::new(Mutex::new(FakeTun {
+        inbound: vec![syn1].into(),
+        outbound: Vec::new(),
+    }));
+    let mut handle = aetherlink_client::threads::spawn_pump_tls_resilient(
+        Arc::clone(&tun),
+        tunnel,
+        PAD,
+        Some(move || {
+            aetherlink_client::lifecycle::connect(&reconnect_cfg, Some(Arc::new(AcceptAll)))
+        }),
+    )
+    .expect("spawn resilient pump");
+
+    // 1. Wait for "before-drop" echo on Session 1.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got_first = tun
+            .lock()
+            .expect("lock")
+            .outbound
+            .iter()
+            .any(|raw| {
+                aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
+                    .ok()
+                    .and_then(|ip| ip.tcp().map(|t| t.payload == b"before-drop"))
+                    .unwrap_or(false)
+            });
+        if got_first {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "session #1 echo timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // 2. Kill Session 1 on the server while idle and wait until the client pump
+    //    emits the local TCP RST for stale flow 42100 upon rebinding Session 2.
+    let _ = drop_tx.send(());
+    loop {
+        assert!(
+            handle.is_alive(),
+            "pump died instead of reconnecting: {:?}",
+            handle.exit_reason()
+        );
+        let got_local_rst = tun
+            .lock()
+            .expect("lock")
+            .outbound
+            .iter()
+            .any(|raw| {
+                aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
+                    .ok()
+                    .and_then(|ip| ip.tcp().map(|t| t.rst && t.dst_port == 42100))
+                    .unwrap_or(false)
+            });
+        if got_local_rst {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "transparent reconnect + stale flow RST timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // 3. Send a new flow on the SAME TUN + PumpHandle and verify "after-drop" echoes.
+    let syn2 = build_tcp_packet(
+        CLIENT_IP,
+        DST,
+        42101,
+        443,
+        true,
+        false,
+        true,
+        9_000,
+        0,
+        b"after-drop",
+    );
+    tun.lock().expect("lock").inbound.push_back(syn2);
+    loop {
+        assert!(
+            handle.is_alive(),
+            "pump died after reconnect: {:?}",
+            handle.exit_reason()
+        );
+        let got_second = tun
+            .lock()
+            .expect("lock")
+            .outbound
+            .iter()
+            .any(|raw| {
+                aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
+                    .ok()
+                    .and_then(|ip| ip.tcp().map(|t| t.payload == b"after-drop"))
+                    .unwrap_or(false)
+            });
+        if got_second {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "session #2 echo timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(handle.is_alive());
+    assert!(handle.exit_reason().is_none());
+    handle.stop();
+    server.join().expect("server thread");
+}

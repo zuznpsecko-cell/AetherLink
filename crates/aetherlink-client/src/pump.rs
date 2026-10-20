@@ -231,6 +231,50 @@ impl DataPump {
         }
     }
 
+    /// Rebind the pump to a freshly handshaked outer TLS session after a
+    /// transport reset (`WSAECONNRESET` / middlebox drop / server restart).
+    ///
+    /// Emits a clean local TCP `RST` toward TUN for each open inner TCP flow
+    /// tied to the dead mux session (so local applications immediately retry
+    /// instead of hanging until timeout) and installs the new session keys/mux
+    /// without tearing down the OS TUN interface, routes, or DNS.
+    pub fn reset_transport(
+        &mut self,
+        mux: MuxManager,
+        tx: [u8; 32],
+        rx: [u8; 32],
+        tun: &mut dyn TunPackets,
+    ) {
+        for flow in self.tcp.values() {
+            let rst = build_tcp_packet_window(
+                flow.server_ip,
+                flow.client_ip,
+                flow.server_port,
+                flow.client_port,
+                false,
+                true,
+                false,
+                false,
+                true,
+                flow.server_next,
+                flow.expected_client_seq(),
+                0,
+                &[],
+            );
+            let _ = tun.send_packet(&rst);
+        }
+        self.mux = mux;
+        self.tx = tx;
+        self.rx = rx;
+        self.by_tuple.clear();
+        self.by_id.clear();
+        self.tcp.clear();
+        self.tcp_by_id.clear();
+        self.in_flight.clear();
+        self.ack_pending.clear();
+        self.throttled.clear();
+    }
+
     /// Record a frame emitted toward the wire so `in_flight` tracks output 1:1.
     fn push_frame(
         &mut self,

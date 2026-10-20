@@ -80,8 +80,12 @@ pub fn empty_response(query: &[u8]) -> Vec<u8> {
             break;
         }
     }
-    let qtype_end = i.checked_add(4).unwrap_or(query.len()).min(query.len());
-    out.extend_from_slice(&query[12..qtype_end]);
+    if query.len() > 12 {
+        let qtype_end = i.checked_add(4).unwrap_or(query.len()).min(query.len());
+        if qtype_end > 12 {
+            out.extend_from_slice(&query[12..qtype_end]);
+        }
+    }
     out
 }
 
@@ -96,4 +100,19 @@ pub fn resolve(query: &[u8], upstream: &str, timeout: Duration) -> Result<Vec<u8
         .map_err(|_| ServerError::DnsError(format!("bad upstream {upstream}")))?;
     relay::relay_udp(host, port, query, timeout)
         .map_err(|e| ServerError::DnsError(format!("resolve via {upstream}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_response_never_panics_on_truncated_or_empty_queries() {
+        for len in 0..=15 {
+            let truncated = vec![0xABu8; len];
+            let resp = empty_response(&truncated);
+            assert!(resp.len() >= 12, "DNS header is always at least 12 bytes");
+            assert_eq!(resp[2] & 0x80, 0x80, "QR response flag must be set");
+        }
+    }
 }
