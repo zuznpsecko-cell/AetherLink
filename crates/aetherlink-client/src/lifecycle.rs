@@ -275,6 +275,13 @@ pub fn connect_with_timeout(
         }
     }
     let sock = sock.ok_or_else(|| ClientError::PlatformError(last_err))?;
+    // Size OS socket buffers for high-BDP WAN links (e.g. 100+ Mbps at 100+ ms
+    // RTT requires >= 1.5 MiB SO_SNDBUF on non-blocking Windows AFD sockets).
+    {
+        let sr = socket2::SockRef::from(&sock);
+        let _ = sr.set_send_buffer_size(2 * 1024 * 1024);
+        let _ = sr.set_recv_buffer_size(2 * 1024 * 1024);
+    }
     // Nagle would stall our small per-frame writes behind delayed ACKs.
     sock.set_nodelay(true)
         .map_err(|e| ClientError::PlatformError(format!("tcp nodelay: {e}")))?;

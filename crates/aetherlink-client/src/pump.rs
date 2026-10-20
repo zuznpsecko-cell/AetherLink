@@ -87,11 +87,18 @@ const REAP_INTERVAL: Duration = Duration::from_secs(1);
 /// fitting safely inside the default `1420B` TUN MTU and PPPoE/LTE links).
 pub const TCP_MSS: usize = 1360;
 
-/// How many sealed frames may be in flight toward the outer TLS writer at once
-/// (`512 * 1360 ≈ 696 KiB` — comfortably fits 8+ concurrent Speedtest TCP
-/// streams at full 64 KiB receive window without burst drops while staying
-/// tightly bounded against bufferbloat).
-const PENDING_FRAMES_MAX: usize = 512;
+/// Global safety cap on sealed frames held across all flows in `in_flight`
+/// (`2048 * 1360 ≈ 2.78 MiB`, comfortably supporting >200 Mbps WAN BDP).
+const PENDING_FRAMES_MAX: usize = 2048;
+
+/// Per-TCP-stream cap on queued upload frames (`256 * 1360 ≈ 348 KiB`),
+/// shrinking that stream's advertised `RCV.WND` smoothly to `0` before loss
+/// while leaving full window open for interactive control streams & DNS.
+const PER_FLOW_FRAMES_MAX: usize = 256;
+
+/// Maximum plaintext per upstream `DATA` frame so even jumbo segments stay
+/// well below wire caps.
+const MAX_DATA_CHUNK: usize = 16_384;
 
 /// Duplicate ACKs emitted per out-of-order burst to trigger RFC 5681 Fast
 /// Retransmit (`DupAckThreshold = 3`) without ACK storms.
@@ -116,11 +123,10 @@ struct TcpFlow {
     server_iss: u32,
     /// Next sequence number we will send.
     server_next: u32,
-    /// In-order payload bytes admitted from the client so far.
+    /// Contiguous in-order payload bytes accepted from the client (`RCV.NXT`).
     client_bytes: u32,
-    /// Cumulative payload bytes confirmed to the client (monotonically
-    /// advances as frames are actually written to the wire).
-    acked_bytes: u32,
+    /// Number of sealed frames belonging to this flow currently in `in_flight`.
+    queued_frames: usize,
     /// Duplicate ACKs emitted for the current sequence gap.
     dupacks: u8,
     state: TcpState,
@@ -129,8 +135,8 @@ struct TcpFlow {
 }
 
 impl TcpFlow {
-    /// Expected next sequence number from the client (including `+1` once
-    /// the client's `FIN` has been accepted).
+    /// Expected next sequence number (`RCV.NXT`) from the client, including `+1`
+    /// once the client's `FIN` has been accepted.
     #[must_use]
     fn expected_client_seq(&self) -> u32 {
         let fin = u32::from(self.state == TcpState::HalfClosed);
@@ -141,13 +147,11 @@ impl TcpFlow {
     }
 
     /// Cumulative `ack_num` to advertise on pure ACKs / window updates.
+    /// Always matches `RCV.NXT` so the OS TCP stack never enters a stale-ACK
+    /// retransmission livelock on high-RTT WAN links.
     #[must_use]
     fn ack_seq(&self) -> u32 {
-        let fin = u32::from(self.state == TcpState::HalfClosed);
-        self.client_isn
-            .wrapping_add(1)
-            .wrapping_add(self.acked_bytes)
-            .wrapping_add(fin)
+        self.expected_client_seq()
     }
 }
 
@@ -167,13 +171,13 @@ pub struct DataPump {
     /// Next sweep for stale flows (half-closed TCP, idle UDP).
     next_reap: Instant,
     /// FIFO metadata for every sealed frame returned by `poll_once` that has
-    /// not yet been passed to `frames_written`. `Some((fk, target_bytes))`
-    /// advances `acked_bytes` as each frame actually enters the TLS socket.
-    in_flight: VecDeque<Option<(FlowKey, u32)>>,
-    /// Flows whose confirmed bytes deserve an ACK on the next `flush_acks`.
+    /// not yet been passed to `frames_written`. `Some(fk)` decrements that
+    /// flow's `queued_frames` and triggers a window-update `ACK` as frames
+    /// drain into the outer TLS socket.
+    in_flight: VecDeque<Option<FlowKey>>,
+    /// Flows whose accepted bytes or reopened window deserve an ACK on `flush_acks`.
     ack_pending: Vec<FlowKey>,
-    /// Flows held back or given a zero window while the upload buffer was full;
-    /// reopened immediately once buffer room returns.
+    /// Flows held back at zero window; reopened as soon as buffer room returns.
     throttled: Vec<FlowKey>,
 }
 
@@ -232,7 +236,7 @@ impl DataPump {
         &mut self,
         frames: &mut Vec<SealedFrame>,
         frame: SealedFrame,
-        meta: Option<(FlowKey, u32)>,
+        meta: Option<FlowKey>,
     ) {
         frames.push(frame);
         self.in_flight.push_back(meta);
@@ -268,11 +272,11 @@ impl DataPump {
     }
 
     /// Forward one in-order payload upstream: OPEN the mux stream on first
-    /// sight, then one DATA frame, recording FIFO completion targets so ACKs
-    /// advance at true wire drain speed.
+    /// sight, then one or more DATA frames (chunked to `MAX_DATA_CHUNK`),
+    /// tracking per-flow queued frames so `RCV.WND` paces `tcpip.sys` smoothly.
     ///
-    /// On any failure the flow is put back before returning `Err`, so the
-    /// caller must insert it only on success.
+    /// On any failure before mutating `flow.client_bytes`, the flow is restored
+    /// before returning `Err`, so the caller inserts it only on success.
     fn seal_payload(
         &mut self,
         fk: &FlowKey,
@@ -321,27 +325,37 @@ impl DataPump {
             open_frame = Some(open);
         }
         let id = flow.id.expect("just opened");
-        let data = match self.mux.seal_data(&self.tx, id, payload, self.pad) {
-            Ok(f) => f,
-            Err(e) => {
-                self.tcp.insert(*fk, *flow);
-                return Err(e.into());
+        let mut data_frames = Vec::with_capacity(payload.chunks(MAX_DATA_CHUNK).len().max(1));
+        for chunk in payload.chunks(MAX_DATA_CHUNK) {
+            match self.mux.seal_data(&self.tx, id, chunk, self.pad) {
+                Ok(f) => data_frames.push(f),
+                Err(e) => {
+                    self.tcp.insert(*fk, *flow);
+                    return Err(e.into());
+                }
             }
-        };
+        }
         flow.client_bytes = flow.client_bytes.wrapping_add(payload.len() as u32);
-        let mut frames = Vec::with_capacity(2);
+        let mut frames = Vec::with_capacity(1 + data_frames.len());
         if let Some(open) = open_frame {
             self.push_frame(&mut frames, open, None);
         }
-        self.push_frame(&mut frames, data, Some((*fk, flow.client_bytes)));
+        for data in data_frames {
+            flow.queued_frames = flow.queued_frames.saturating_add(1);
+            self.push_frame(&mut frames, data, Some(*fk));
+        }
+        self.push_ack(*fk);
         Ok(frames)
     }
 
-    /// Window the app may still fill (bytes), from the upload buffer left.
+    /// Receive window (bytes) offered to a specific TCP stream, bounded by both
+    /// per-flow queued frames (`PER_FLOW_FRAMES_MAX`) and global `PENDING_FRAMES_MAX`.
     #[must_use]
-    fn adv_window(&self) -> u16 {
-        let free = PENDING_FRAMES_MAX.saturating_sub(self.in_flight.len());
-        u16::try_from(free.saturating_mul(TCP_MSS)).unwrap_or(u16::MAX)
+    fn adv_window_for(&self, flow: &TcpFlow) -> u16 {
+        let global_free = PENDING_FRAMES_MAX.saturating_sub(self.in_flight.len());
+        let flow_free = PER_FLOW_FRAMES_MAX.saturating_sub(flow.queued_frames);
+        let slots = global_free.min(flow_free);
+        u16::try_from(slots.saturating_mul(TCP_MSS)).unwrap_or(u16::MAX)
     }
 
     fn push_ack(&mut self, fk: FlowKey) {
@@ -350,32 +364,31 @@ impl DataPump {
         }
     }
 
-    /// Admission control: is there room in the upload buffer for one more
-    /// segment? A refused segment is dropped *without* being confirmed, so
-    /// the app retransmits it later and the in-order check accepts it.
-    fn admit(&mut self, fk: &FlowKey) -> bool {
-        if self.in_flight.len() < PENDING_FRAMES_MAX {
+    /// Admission control: is there room in both the per-flow and global upload
+    /// queues for one more segment? If full, queues a zero-window ACK so
+    /// `tcpip.sys` Zero-Window Probes receive an immediate RFC 9293 reply, and
+    /// marks the flow for window-update ACKs as soon as queued frames drain.
+    fn admit(&mut self, fk: &FlowKey, flow: &TcpFlow) -> bool {
+        if self.in_flight.len() < PENDING_FRAMES_MAX && flow.queued_frames < PER_FLOW_FRAMES_MAX {
             return true;
         }
         if !self.throttled.contains(fk) {
             self.throttled.push(*fk);
         }
+        self.push_ack(*fk);
         false
     }
 
-    /// `n` sealed frames have actually been handed to the outer wire writer:
-    /// advance cumulative ACK counters for those exact frames and free their
-    /// slots in `in_flight`.
+    /// `n` sealed frames have actually entered the outer wire writer:
+    /// release their per-flow queue slots and schedule fresh window-update ACKs.
     pub fn frames_written(&mut self, n: usize) {
         for _ in 0..n {
             let Some(meta) = self.in_flight.pop_front() else {
                 break;
             };
-            if let Some((fk, target)) = meta {
+            if let Some(fk) = meta {
                 if let Some(flow) = self.tcp.get_mut(&fk) {
-                    if (target.wrapping_sub(flow.acked_bytes) as i32) > 0 {
-                        flow.acked_bytes = target;
-                    }
+                    flow.queued_frames = flow.queued_frames.saturating_sub(1);
                     flow.dupacks = 0;
                 }
                 self.push_ack(fk);
@@ -383,16 +396,27 @@ impl DataPump {
         }
     }
 
-    /// Confirm to the app whatever has left for the server, and reopen the
-    /// flows that were held back while the buffer was full.
+    /// Confirm accepted bytes + current receive window to active flows, and
+    /// reopen any throttled flows once their receive window becomes non-zero.
     pub fn flush_acks(&mut self, tun: &mut dyn TunPackets) {
         let mut flows = std::mem::take(&mut self.ack_pending);
-        if !self.throttled.is_empty() && self.adv_window() > 0 {
-            for fk in std::mem::take(&mut self.throttled) {
-                if !flows.contains(&fk) {
-                    flows.push(fk);
+        if !self.throttled.is_empty() {
+            let prev = std::mem::take(&mut self.throttled);
+            let mut still_closed = Vec::new();
+            for fk in prev {
+                let open = self
+                    .tcp
+                    .get(&fk)
+                    .is_some_and(|f| self.adv_window_for(f) > 0);
+                if open {
+                    if !flows.contains(&fk) {
+                        flows.push(fk);
+                    }
+                } else if self.tcp.contains_key(&fk) {
+                    still_closed.push(fk);
                 }
             }
+            self.throttled = still_closed;
         }
         for fk in &flows {
             if let Err(e) = self.emit_ack(fk, tun) {
@@ -401,12 +425,12 @@ impl DataPump {
         }
     }
 
-    /// One cumulative ACK toward the app, carrying the current window.
+    /// One cumulative ACK toward the app carrying `RCV.NXT` and `adv_window_for`.
     fn emit_ack(&mut self, fk: &FlowKey, tun: &mut dyn TunPackets) -> Result<()> {
-        let win = self.adv_window();
         let Some(flow) = self.tcp.get(fk).copied() else {
             return Ok(());
         };
+        let win = self.adv_window_for(&flow);
         if win < TCP_MSS as u16 && !self.throttled.contains(fk) {
             self.throttled.push(*fk);
         }
@@ -437,7 +461,7 @@ impl DataPump {
             flow.client_port,
             flow.server_iss,
             flow.client_isn.wrapping_add(1),
-            self.adv_window(),
+            self.adv_window_for(flow),
             TCP_MSS as u16,
         );
         tun.send_packet(&synack)?;
@@ -593,7 +617,7 @@ impl DataPump {
                             server_iss: iss,
                             server_next: iss.wrapping_add(1),
                             client_bytes: 0,
-                            acked_bytes: 0,
+                            queued_frames: 0,
                             dupacks: 0,
                             state: TcpState::SynReceived,
                             closed_at: None,
@@ -664,7 +688,7 @@ impl DataPump {
                                 false,
                                 flow.server_next,
                                 flow.expected_client_seq(),
-                                self.adv_window(),
+                                self.adv_window_for(&flow),
                                 &[],
                             );
                             if let Err(e) = tun.send_packet(&reack) {
@@ -683,35 +707,43 @@ impl DataPump {
                 }
                 // Strictly validate sequence order BEFORE forwarding payload
                 // or accepting FIN:
-                // - Future seq (> expected): emit up to 4 Duplicate ACKs so
-                //   the OS TCP stack triggers RFC 5681 Fast Retransmit (~1 RTT
-                //   instead of a 300-1000ms RTO freeze), and drop out-of-order
-                //   FINs until the missing bytes arrive.
-                // - Stale seq (< expected): drop without double-counting, and
-                //   queue a cumulative ACK refresh for `flush_acks`.
+                // - Overlapping retransmit (`seg.seq < expected < seg_end`):
+                //   trim the already-accepted prefix and process the new suffix.
+                // - Pure duplicate / keep-alive (`seg_end <= expected`):
+                //   drop duplicate payload and queue a fresh `RCV.NXT` ACK.
+                // - Future seq (`seg.seq > expected`): emit up to 4 Duplicate
+                //   ACKs for RFC 5681 Fast Retransmit and hold premature FINs.
                 let expected = flow
                     .client_isn
                     .wrapping_add(1)
                     .wrapping_add(flow.client_bytes);
-                if seg.seq != expected {
-                    let ahead = seg.seq.wrapping_sub(expected) as i32;
+                let delta = expected.wrapping_sub(seg.seq) as i32;
+                let payload_slice: &[u8] = if delta == 0 {
+                    &seg.payload
+                } else if delta > 0 {
+                    let seen = delta as usize;
+                    if seen < seg.payload.len() {
+                        &seg.payload[seen..]
+                    } else {
+                        self.tcp.insert(fk, flow);
+                        self.push_ack(fk);
+                        return Ok(None);
+                    }
+                } else {
                     aetherlink_netstack::debug_log(&format!(
-                        "pump: tcp id={} out-of-order/drop (seq {} vs expected {expected}), dropped",
+                        "pump: tcp id={} out-of-order (seq {} vs expected {expected}), dupack",
                         flow.id.unwrap_or(u16::MAX),
                         seg.seq
                     ));
-                    if ahead > 0 && flow.dupacks < MAX_DUPACKS_PER_GAP {
+                    if flow.dupacks < MAX_DUPACKS_PER_GAP {
                         flow.dupacks += 1;
                         self.tcp.insert(fk, flow);
                         let _ = self.emit_ack(&fk, tun);
                     } else {
                         self.tcp.insert(fk, flow);
-                        if ahead < 0 {
-                            self.push_ack(fk);
-                        }
                     }
                     return Ok(None);
-                }
+                };
                 flow.dupacks = 0;
                 // FIN (now verified in-order): forward trailing payload if
                 // any, then acknowledge half-close (`ACK` only when an
@@ -720,15 +752,13 @@ impl DataPump {
                 // resetting; `FIN+ACK` when closing an unused bare flow).
                 if seg.fin {
                     let mut frames = Vec::new();
-                    if !seg.payload.is_empty() {
-                        match self.seal_payload(&fk, &mut flow, &seg.payload) {
+                    if !payload_slice.is_empty() {
+                        match self.seal_payload(&fk, &mut flow, payload_slice) {
                             Ok(f) => frames.extend(f),
                             Err(e) => return Err(e),
                         }
                     }
                     let has_upstream = flow.id.is_some();
-                    let prev_acked = flow.acked_bytes;
-                    flow.acked_bytes = flow.client_bytes;
                     flow.state = TcpState::HalfClosed;
                     flow.closed_at = Some(Instant::now());
                     let ack_pkt = build_tcp_packet_window(
@@ -743,13 +773,12 @@ impl DataPump {
                         false,
                         flow.server_next,
                         flow.expected_client_seq(),
-                        self.adv_window(),
+                        self.adv_window_for(&flow),
                         &[],
                     );
                     if let Err(e) = tun.send_packet(&ack_pkt) {
                         flow.state = TcpState::Established;
                         flow.closed_at = None;
-                        flow.acked_bytes = prev_acked;
                         self.tcp.insert(fk, flow);
                         return Err(e.into());
                     }
@@ -761,18 +790,20 @@ impl DataPump {
                     self.tcp.insert(fk, flow);
                     return Ok(Some(frames));
                 }
-                // Upload buffer full: hold back without advancing sequence so
-                // the app cleanly retransmits once room reopens.
-                if !self.admit(&fk) {
+                // Upload buffer full: hold back without advancing sequence and
+                // schedule a zero-window ACK so `tcpip.sys` cleanly waits for
+                // our window-update ACK instead of stalling on unanswered RTOs.
+                if !self.admit(&fk, &flow) {
                     aetherlink_netstack::debug_log(&format!(
-                        "pump: tcp id={} upload buffer full ({} pending), holding",
+                        "pump: tcp id={} upload buffer full ({} flow / {} total), holding",
                         flow.id.unwrap_or(u16::MAX),
+                        flow.queued_frames,
                         self.in_flight.len()
                     ));
                     self.tcp.insert(fk, flow);
                     return Ok(None);
                 }
-                let frames = match self.seal_payload(&fk, &mut flow, &seg.payload) {
+                let frames = match self.seal_payload(&fk, &mut flow, payload_slice) {
                     Ok(frames) => frames,
                     Err(e) => return Err(e),
                 };
@@ -875,9 +906,8 @@ impl DataPump {
                         )));
                     }
                 };
-                flow.acked_bytes = flow.client_bytes;
                 let ack_num = flow.expected_client_seq();
-                let win = self.adv_window();
+                let win = self.adv_window_for(&flow);
                 // Empty DATA = the relay is done with this stream (clean
                 // EOF or a failed relay). Close the app's socket cleanly.
                 if payload.is_empty() {
