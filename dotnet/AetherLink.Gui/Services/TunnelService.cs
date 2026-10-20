@@ -58,6 +58,12 @@ internal sealed class TunnelService : IDisposable
             LastError = "";
             PumpDead = false;
             StaleState = false;
+            // Self-heal before touching the tunnel: a previous run may have
+            // died before teardown and left routes/DNS in tunnel state, or —
+            // with its state file already gone — our virtual resolver on the
+            // physical adapter, which makes up() refuse until someone resets
+            // it by hand. Idempotent and safe while down.
+            HealBeforeUp();
             var handle = Native.aether_client_create(configJson);
             if (handle == nuint.Zero)
             {
@@ -147,6 +153,25 @@ internal sealed class TunnelService : IDisposable
             GuiLog.Error($"force cleanup failed: {err}");
             return err;
         }
+    }
+
+    /// <summary>
+    /// Best-effort cleanup before bring-up. Covers both leftovers: a state
+    /// file from a crashed run (replayed into routes/DNS) and a stale tunnel
+    /// DNS whose state file is gone (the core resets that adapter to DHCP).
+    /// Non-fatal: up() may still succeed, and the StaleState retry stays the
+    /// fallback. Call under <c>_opGate</c> while down.
+    /// </summary>
+    private void HealBeforeUp()
+    {
+        var rc = Native.aether_client_force_cleanup();
+        if (rc == 0)
+        {
+            GuiLog.Info("pre-up self-heal: nothing stale (or cleaned)");
+            return;
+        }
+
+        GuiLog.Warn($"pre-up self-heal failed: {Native.LastError()}");
     }
 
     public static string SummarizeStatus(string statusJson)
