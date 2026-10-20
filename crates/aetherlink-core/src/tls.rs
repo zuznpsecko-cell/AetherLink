@@ -118,8 +118,9 @@ pub fn server_name(host: &str) -> Result<ServerName<'static>> {
 
 /// Accept a TCP socket into a server TLS stream (handshake eager).
 pub fn accept_tls(sock: TcpStream, cfg: &Arc<ServerConfig>) -> Result<ServerTlsStream> {
-    let conn =
+    let mut conn =
         ServerConnection::new(Arc::clone(cfg)).map_err(|e| CoreError::TlsError(e.to_string()))?;
+    conn.set_buffer_limit(Some(256 * 1024));
     let mut stream = StreamOwned::new(conn, sock);
     stream
         .conn
@@ -134,8 +135,9 @@ pub fn connect_tls(
     name: ServerName<'static>,
     cfg: &Arc<ClientConfig>,
 ) -> Result<ClientTlsStream> {
-    let conn = ClientConnection::new(Arc::clone(cfg), name)
+    let mut conn = ClientConnection::new(Arc::clone(cfg), name)
         .map_err(|e| CoreError::TlsError(e.to_string()))?;
+    conn.set_buffer_limit(Some(256 * 1024));
     let mut stream = StreamOwned::new(conn, sock);
     stream
         .conn

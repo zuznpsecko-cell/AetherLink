@@ -1632,12 +1632,18 @@ fn concurrent_upload_close_race_and_stream_rst_keep_session_alive() {
     let target_listener = TcpListener::bind("127.0.0.1:0").expect("bind target");
     let target_port = target_listener.local_addr().expect("addr").port();
     let target_srv = std::thread::spawn(move || {
-        for _ in 0..8 {
+        let big_reply = vec![0x5Au8; 80_000];
+        for _ in 0..4 {
             if let Ok((mut s, _)) = target_listener.accept() {
+                let reply = big_reply.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
                     let _ = s.read(&mut buf);
-                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+                    // Send an 80 KB burst (> 65,536B rustls default
+                    // sendable_tls limit) AND close immediately so every
+                    // `stream_worker` read pushes a 65,535B chunk (`66,255B`
+                    // sealed batch) while racing client half-close/RST.
+                    let _ = s.write_all(&reply);
                 });
             }
         }
@@ -1661,7 +1667,7 @@ fn concurrent_upload_close_race_and_stream_rst_keep_session_alive() {
     let mut sess =
         aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
 
-    for round in 0..8 {
+    for round in 0..4 {
         let id = sess.mux.open_tcp("127.0.0.1", target_port).expect("open");
         let open = sess
             .mux
@@ -1695,6 +1701,31 @@ fn concurrent_upload_close_race_and_stream_rst_keep_session_alive() {
                 sequence: 0,
             };
             wire_help::write_frame(&mut stream, &rst, &[]);
+        }
+
+        // Send a ping/echo sync after every round so localhost CI sockets with
+        // small `rmem_max` never fill their send buffer across rounds.
+        let sync_id = sess.mux.open_tcp("127.0.0.1", echo).expect("open sync");
+        let open_s = sess
+            .mux
+            .seal_open_tcp(sess.keys.tx_key(), sync_id, 128)
+            .expect("seal open sync");
+        wire_help::write_frame(&mut stream, &open_s.header, &open_s.ciphertext);
+        let msg = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), sync_id, b"ok", 128)
+            .expect("seal sync");
+        wire_help::write_frame(&mut stream, &msg.header, &msg.ciphertext);
+        loop {
+            let (h, c) = wire_help::read_frame(&mut stream);
+            if h.stream_id == sync_id && h.frame_type == FrameType::Data {
+                let p = sess
+                    .mux
+                    .open_data(sess.keys.rx_key(), &h, &c)
+                    .expect("open sync");
+                assert_eq!(p, b"ok");
+                break;
+            }
         }
     }
 
