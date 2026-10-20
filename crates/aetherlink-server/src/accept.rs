@@ -62,10 +62,9 @@ pub struct ServerCtx {
 /// Relay read timeout: a silent target burns one worker for this long;
 const UDP_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Wire-read quantum: the loop must keep draining completions even when
-/// the peer sends nothing (a blocking read would wedge replies behind an
-/// idle connection).
-const READ_TIMEOUT: Duration = Duration::from_millis(50);
+/// Wire-read quantum: short 5ms poll so server->client download replies
+/// drain smoothly without 50ms stalls while client->server is quiet.
+const READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// Bound for one frame body across stalls (fail closed eventually).
 const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -608,6 +607,27 @@ fn close_quietly(stream: &mut tls::ServerTlsStream) {
     let _ = stream.flush();
 }
 
+/// Best-effort one-shot Linux kernel WAN tuning when `aetherlink-server` runs
+/// as root (the systemd unit default). Raises auto-tuned TCP buffer ceilings
+/// from Ubuntu's default 208 KiB (`rmem_max`/`wmem_max`) to 16 MiB and enables
+/// `fq` + `bbr` while silently no-oping in unprivileged tests/containers.
+#[cfg(target_os = "linux")]
+fn ensure_linux_wan_tuning() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for (path, val) in [
+            ("/proc/sys/net/core/rmem_max", "16777216\n"),
+            ("/proc/sys/net/core/wmem_max", "16777216\n"),
+            ("/proc/sys/net/ipv4/tcp_rmem", "4096 131072 16777216\n"),
+            ("/proc/sys/net/ipv4/tcp_wmem", "4096 65536 16777216\n"),
+            ("/proc/sys/net/core/default_qdisc", "fq\n"),
+            ("/proc/sys/net/ipv4/tcp_congestion_control", "bbr\n"),
+        ] {
+            let _ = std::fs::write(path, val);
+        }
+    });
+}
+
 /// Serve one accepted TCP connection to a path decision.
 ///
 /// `routes` starts empty on a live listener and is filled from the peer's
@@ -617,13 +637,13 @@ pub fn serve_connection(
     ctx: &ServerCtx,
     routes: &mut HashMap<u16, SocketAddr>,
 ) -> Path {
+    #[cfg(target_os = "linux")]
+    ensure_linux_wan_tuning();
+
     // Nagle would stall our small per-frame writes behind delayed ACKs.
+    // Leave SO_SNDBUF/SO_RCVBUF unlocked so Linux tcp_rmem/tcp_wmem auto-tunes
+    // dynamically up to 16 MiB without triggering SOCK_*BUF_LOCK.
     let _ = sock.set_nodelay(true);
-    {
-        let sr = socket2::SockRef::from(&sock);
-        let _ = sr.set_send_buffer_size(2 * 1024 * 1024);
-        let _ = sr.set_recv_buffer_size(2 * 1024 * 1024);
-    }
     let mut stream = match tls::accept_tls(sock, &ctx.tls) {
         Ok(s) => {
             debug_log("accept: tls ok");
@@ -768,10 +788,12 @@ fn tunnel_loop(
             debug_log("tunnel: body eof, closing");
             break;
         }
-        debug_log(&format!(
-            "tunnel: {:?} id={} seq={} len={}",
-            header.frame_type, header.stream_id, header.sequence, header.length
-        ));
+        if crate::debug::debug_enabled() {
+            debug_log(&format!(
+                "tunnel: {:?} id={} seq={} len={}",
+                header.frame_type, header.stream_id, header.sequence, header.length
+            ));
+        }
         match header.frame_type {
             FrameType::Data => {
                 let Some(&target) = routes.get(&header.stream_id) else {
@@ -1116,20 +1138,19 @@ fn dial_addr(addr: &str, port: u16) -> Option<SocketAddr> {
     format!("{addr}:{port}").to_socket_addrs().ok()?.next()
 }
 
-/// Max plaintext per TCP reply frame. One frame becomes one TCP segment on
-/// the peer, so it must stay IP-carriable (<= 65535 incl. headers): a bigger
-/// frame panics the peer packet builder and kills its pump outright (seen
-/// live: a 189KB reply -> pump dead, tunnel mute). Sealed 16KiB + tag.
-const REPLY_CHUNK: usize = 16384;
+/// Max plaintext per TCP reply frame, sized (`16_000` bytes) so
+/// `24B FrameHeader + 4B len + 16_000B payload + 128B pad + 16B tag <= 16_384B`
+/// fits cleanly inside a single 16 KiB TLS 1.3 record without emitting tiny
+/// trailing micro-records on every chunk.
+const REPLY_CHUNK: usize = 16_000;
 
 /// Max UDP reply payload sent as one datagram. Datagrams have no reassembly:
 /// past IP-carriable size (65507 incl. headers) the reply is undeliverable,
 /// so it is dropped with a log and the loop lives on.
 const UDP_SINGLE_MAX: usize = 65000;
 
-/// Seal + write one reply, chunked to the wire cap; Err carries the first
-/// seal or transport failure. Empty payload keeps the old single empty
-/// frame (some flows rely on the reply existing, not its size).
+/// Seal + write one reply, chunked to single-TLS-record wire frames and
+/// flushed in one batch; Err carries the first seal or transport failure.
 fn send_chunked(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
@@ -1156,12 +1177,17 @@ fn send_chunked(
         return write_sealed(stream, &sealed.header, &sealed.ciphertext)
             .map_err(|e| format!("transport: {e}"));
     }
-    for chunk in payload.chunks(REPLY_CHUNK) {
+    let chunks = payload.chunks(REPLY_CHUNK);
+    let mut batch = BytesMut::with_capacity(payload.len() + chunks.len() * 256);
+    for chunk in chunks {
         let sealed = seal_one(sess, chunk).map_err(|e| format!("seal: {e}"))?;
-        write_sealed(stream, &sealed.header, &sealed.ciphertext)
-            .map_err(|e| format!("transport: {e}"))?;
+        sealed.header.encode(&mut batch);
+        batch.extend_from_slice(&sealed.ciphertext);
     }
-    Ok(())
+    stream
+        .write_all(&batch)
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("transport: {e}"))
 }
 
 /// Seal + write one DATA reply; Err carries seal or transport failure.

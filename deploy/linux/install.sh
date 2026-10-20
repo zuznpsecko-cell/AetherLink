@@ -31,6 +31,19 @@ if [ -n "${TLS_CERT:-}" ] || [ -n "${TLS_KEY:-}" ]; then
     "$PREFIX/server.yaml"
 fi
 
+# High-throughput WAN TCP auto-tuning (16 MiB buffers + fq + BBR).
+cat >/etc/sysctl.d/99-aetherlink.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+modprobe tcp_bbr >/dev/null 2>&1 || true
+sysctl -p /etc/sysctl.d/99-aetherlink.conf >/dev/null 2>&1 || true
+
 # systemd unit (installed + reloaded, not started: review server.yaml first).
 install -m 0644 "$ROOT/deploy/linux/aetherlink-server.service" /etc/systemd/system/
 systemctl daemon-reload || true

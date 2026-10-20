@@ -21,10 +21,12 @@ serde_json = { workspace = true }
 once_cell = "1.19"
 serde_yaml = { workspace = true }
 ipnet = { workspace = true }
-socket2 = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
 encoding_rs = "0.8.41"
+
+[target.'cfg(windows)'.dependencies]
+socket2 = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

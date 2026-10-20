@@ -88,13 +88,13 @@ const REAP_INTERVAL: Duration = Duration::from_secs(1);
 pub const TCP_MSS: usize = 1360;
 
 /// Global safety cap on sealed frames held across all flows in `in_flight`
-/// (`2048 * 1360 ≈ 2.78 MiB`, comfortably supporting >200 Mbps WAN BDP).
-const PENDING_FRAMES_MAX: usize = 2048;
+/// (`4096 * 1360 ≈ 5.57 MiB`, comfortably supporting >350 Mbps WAN BDP).
+const PENDING_FRAMES_MAX: usize = 4096;
 
-/// Per-TCP-stream cap on queued upload frames (`256 * 1360 ≈ 348 KiB`),
+/// Per-TCP-stream cap on queued upload frames (`512 * 1360 ≈ 696 KiB`),
 /// shrinking that stream's advertised `RCV.WND` smoothly to `0` before loss
 /// while leaving full window open for interactive control streams & DNS.
-const PER_FLOW_FRAMES_MAX: usize = 256;
+const PER_FLOW_FRAMES_MAX: usize = 512;
 
 /// Maximum plaintext per upstream `DATA` frame so even jumbo segments stay
 /// well below wire caps.
