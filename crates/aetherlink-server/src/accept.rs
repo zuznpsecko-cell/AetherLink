@@ -704,8 +704,11 @@ fn tunnel_loop(
     let pool: RelayPool<FlowKey, Result<RelayOut, ()>> =
         RelayPool::new(POOL_WORKERS, POOL_WORKERS + POOL_QUEUE);
     // Best-effort: without a timeout an idle peer wedges completion
-    // draining; failure keeps the old blocking behaviour.
+    // draining; failure keeps the old blocking behaviour. Keep writes
+    // unbounded (`set_write_timeout(None)`) so large downstream bursts
+    // block cleanly in the kernel send queue until window opens.
     let _ = stream.get_mut().set_read_timeout(Some(READ_TIMEOUT));
+    let _ = stream.get_mut().set_write_timeout(None);
     let mut hb = [0u8; FRAME_HEADER_SIZE];
     let mut hb_filled = 0usize;
     let mut hb_since: Option<Instant> = None;
@@ -1270,9 +1273,10 @@ fn write_sealed(
 /// without calling `read_tls` (`StreamOwned::write_all`/`flush` call
 /// `complete_prior_io()`, which reads `stream.sock` and spuriously trips the
 /// 5ms `SO_RCVTIMEO` read timeout as `Err(WouldBlock)` during writes!).
-/// Retries `ErrorKind::Interrupted` so host runtime signals (`.NET` GC) never
-/// drop active sessions.
+/// Retries `ErrorKind::Interrupted` and transient `WouldBlock`/`TimedOut`
+/// stalls so active downloads/uploads never drop the session.
 fn flush_tls_writes(stream: &mut tls::ServerTlsStream) -> std::io::Result<()> {
+    let mut stalled_since: Option<Instant> = None;
     while stream.conn.wants_write() {
         match stream.conn.write_tls(&mut stream.sock) {
             Ok(0) => {
@@ -1281,18 +1285,45 @@ fn flush_tls_writes(stream: &mut tls::ServerTlsStream) -> std::io::Result<()> {
                     "tls socket write returned 0",
                 ));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                stalled_since = None;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                let since = *stalled_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > BODY_TOTAL_TIMEOUT {
+                    return Err(e);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Err(e) => return Err(e),
         }
     }
     Ok(())
 }
 
-/// Encrypt `plain` into `stream.conn.writer()` and flush all resulting TLS
-/// records strictly via `write_tls` (never touching the receive path).
-fn write_tls_all(stream: &mut tls::ServerTlsStream, plain: &[u8]) -> std::io::Result<()> {
-    stream.conn.writer().write_all(plain)?;
+/// Encrypt all of `plain` in chunks that respect `rustls`'s internal send
+/// buffer capacity (`sendable_tls` returns short writes + `Ok(0)` once full
+/// until `write_tls` drains ciphertext to the socket!), flushing between
+/// slices and at the end without ever touching the receive path.
+fn write_tls_all(stream: &mut tls::ServerTlsStream, mut plain: &[u8]) -> std::io::Result<()> {
+    while !plain.is_empty() {
+        flush_tls_writes(stream)?;
+        match stream.conn.writer().write(plain) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "tls writer returned 0 after full flush",
+                ));
+            }
+            Ok(n) => plain = &plain[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
     flush_tls_writes(stream)
 }
 
