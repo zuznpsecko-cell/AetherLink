@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  linux-rust-and-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Run full Rust workspace test suite
+        run: cargo test --workspace
+      - name: Build release FFI library & Linux .NET server host
+        run: |
+          cargo build --release -p aetherlink-ffi
+          dotnet publish dotnet/AetherLink.Server/AetherLink.Server.csproj -c Release -r linux-x64
+
+  windows-client-and-gui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Compile full Windows Rust workspace & tests
+        run: |
+          cargo test --workspace --no-run
+          cargo build --release -p aetherlink-ffi
+      - name: Publish Windows Avalonia GUI & CLI client hosts
+        run: |
+          dotnet publish dotnet/AetherLink.Gui/AetherLink.Gui.csproj -c Release -r win-x64
+          dotnet publish dotnet/AetherLink.Client/AetherLink.Client.csproj -c Release -r win-x64

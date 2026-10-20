@@ -54,31 +54,32 @@ where
         let (job_tx, job_rx) = mpsc::channel::<Job<K, R>>();
         let (done_tx, done_rx) = mpsc::channel::<Completion<K, R>>();
         let shared = Arc::new(Mutex::new(job_rx));
-        for _ in 0..workers {
+        for idx in 0..workers {
             let jobs = Arc::clone(&shared);
             let done = done_tx.clone();
-            std::thread::spawn(move || {
-                loop {
-                    let job = match jobs.lock() {
-                        Ok(guard) => guard.recv(),
-                        Err(_) => break,
-                    };
-                    let job = match job {
-                        Ok(job) => job,
-                        Err(_) => break, // Pool dropped: exit.
-                    };
-                    let result = (job.work)();
-                    if done
-                        .send(Completion {
-                            key: job.key,
-                            result,
-                        })
-                        .is_err()
-                    {
-                        break;
+            let _ = std::thread::Builder::new()
+                .name(format!("relay-pool-{idx}"))
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || {
+                    loop {
+                        let job = match jobs.lock() {
+                            Ok(guard) => guard.recv(),
+                            Err(_) => break,
+                        };
+                        let job = match job {
+                            Ok(job) => job,
+                            Err(_) => break, // Pool dropped: exit.
+                        };
+                        let Job { key, work } = job;
+                        if let Ok(result) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        {
+                            if done.send(Completion { key, result }).is_err() {
+                                break;
+                            }
+                        }
                     }
-                }
-            });
+                });
         }
         Self {
             tx: job_tx,

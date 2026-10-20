@@ -165,8 +165,10 @@ fn send_hold(
     }
 }
 
-/// Stack per stream worker: it only dials/reads/writes (no deep frames).
-const WORKER_STACK: usize = 256 * 1024;
+/// Stack per stream worker: 4 MiB so Ubuntu glibc `getaddrinfo` / `libnss_*`
+/// plus `.NET` CoreCLR GC signal handler frames never hit the pthread stack
+/// guard page (`SIGSEGV` seen live when this was only 256 KiB).
+const WORKER_STACK: usize = 4 * 1024 * 1024;
 
 /// Worker -> loop replies, possibly many per stream, in worker order.
 /// Failure kind travels so only definitive refusals cool the target down.
@@ -431,7 +433,11 @@ fn forward_tcp(
     match std::thread::Builder::new()
         .name(format!("relay-{id}"))
         .stack_size(WORKER_STACK)
-        .spawn(move || stream_worker(id, tip, tport, pt, rx, out))
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                stream_worker(id, tip, tport, pt, rx, out);
+            }));
+        })
     {
         Ok(_) => {
             workers.insert(id, tx);
@@ -635,6 +641,49 @@ fn ensure_linux_wan_tuning() {
     });
 }
 
+/// Enable kernel TCP keepalive (`15s` idle, `5s` interval, `6` probes) on
+/// accepted Linux sockets so CGNATs, stateful firewalls, and middleboxes
+/// observe bidirectional packets during idle windows instead of injecting RST.
+#[cfg(target_os = "linux")]
+fn enable_linux_tcp_keepalive(sock: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = sock.as_raw_fd();
+    let on: libc::c_int = 1;
+    let idle: libc::c_int = 15;
+    let intvl: libc::c_int = 5;
+    let cnt: libc::c_int = 6;
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            (&raw const on).cast(),
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            (&raw const idle).cast(),
+            std::mem::size_of_val(&idle) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            (&raw const intvl).cast(),
+            std::mem::size_of_val(&intvl) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            (&raw const cnt).cast(),
+            std::mem::size_of_val(&cnt) as libc::socklen_t,
+        );
+    }
+}
+
 /// Serve one accepted TCP connection to a path decision.
 ///
 /// `routes` starts empty on a live listener and is filled from the peer's
@@ -646,6 +695,13 @@ pub fn serve_connection(
 ) -> Path {
     #[cfg(target_os = "linux")]
     ensure_linux_wan_tuning();
+    #[cfg(target_os = "linux")]
+    enable_linux_tcp_keepalive(&sock);
+
+    let peer = sock
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
 
     // Nagle would stall our small per-frame writes behind delayed ACKs.
     // Leave SO_SNDBUF/SO_RCVBUF unlocked so Linux tcp_rmem/tcp_wmem auto-tunes
@@ -672,7 +728,9 @@ pub fn serve_connection(
             return Path::Static;
         }
     };
-    tunnel_loop(&mut stream, sess, &ctx, routes);
+    eprintln!("[aetherlink] tunnel connected ({peer})");
+    let reason = tunnel_loop(&mut stream, sess, ctx, routes);
+    eprintln!("[aetherlink] tunnel disconnected ({peer}): {reason}");
     close_quietly(&mut stream);
     Path::Tunnel
 }
@@ -694,7 +752,7 @@ fn tunnel_loop(
     mut sess: session::ServerSession,
     ctx: &ServerCtx,
     routes: &mut HashMap<u16, SocketAddr>,
-) {
+) -> String {
     // Live TCP stream workers (one thread+dial per stream, full duplex).
     let mut workers: HashMap<u16, mpsc::SyncSender<WorkerMsg>> = HashMap::new();
     let (stream_tx, stream_rx) = mpsc::channel::<StreamReply>();
@@ -717,7 +775,7 @@ fn tunnel_loop(
             match read_tls_step(stream, &mut hb[hb_filled..]) {
                 Ok(0) => {
                     debug_log("tunnel: header eof, closing");
-                    return;
+                    return "header eof".to_string();
                 }
                 Ok(n) => {
                     hb_filled += n;
@@ -733,7 +791,7 @@ fn tunnel_loop(
                     if let Some(since) = hb_since {
                         if since.elapsed() > BODY_TOTAL_TIMEOUT {
                             debug_log("tunnel: header stall, closing");
-                            return;
+                            return "header stall past 30s".to_string();
                         }
                     }
                     if !drain_completions(
@@ -745,12 +803,12 @@ fn tunnel_loop(
                         &mut workers,
                         &mut dead,
                     ) {
-                        return;
+                        return "reply write failed during idle drain".to_string();
                     }
                 }
-                Err(_) => {
-                    debug_log("tunnel: header read error, closing");
-                    return; // EOF or transport error: fail closed.
+                Err(e) => {
+                    debug_log(&format!("tunnel: header read error ({e}), closing"));
+                    return format!("header read error: {e}");
                 }
             }
         }
@@ -759,10 +817,10 @@ fn tunnel_loop(
         let mut hbuf = BytesMut::from(&hb[..]);
         let header = match FrameHeader::decode(&mut hbuf) {
             Ok(h) => h,
-            Err(_) => break,
+            Err(e) => return format!("bad frame header: {e}"),
         };
         if header.length as usize > 65535 + 1024 {
-            break; // Absurd length: fail closed.
+            return format!("absurd frame length: {}", header.length);
         }
         // Body: tolerate stalls past the read quantum and EINTR signals from
         // the host runtime (e.g. .NET CoreCLR GC suspension on Linux, which
@@ -771,13 +829,16 @@ fn tunnel_loop(
         let mut ct = vec![0u8; header.length as usize];
         let body_start = Instant::now();
         let mut filled = 0;
-        let mut session_dead = false;
+        let mut body_err: Option<String> = None;
         let body_ok = loop {
             if filled >= ct.len() {
                 break true;
             }
             match read_tls_step(stream, &mut ct[filled..]) {
-                Ok(0) => break false,
+                Ok(0) => {
+                    body_err = Some("body eof".to_string());
+                    break false;
+                }
                 Ok(n) => {
                     filled += n;
                     if filled >= ct.len() {
@@ -790,6 +851,7 @@ fn tunnel_loop(
                         || e.kind() == std::io::ErrorKind::WouldBlock =>
                 {
                     if body_start.elapsed() > BODY_TOTAL_TIMEOUT {
+                        body_err = Some("body stall past 30s".to_string());
                         break false;
                     }
                     if !drain_completions(
@@ -801,16 +863,20 @@ fn tunnel_loop(
                         &mut workers,
                         &mut dead,
                     ) {
-                        session_dead = true;
+                        body_err = Some("reply write failed during body wait".to_string());
                         break false;
                     }
                 }
-                Err(_) => break false,
+                Err(e) => {
+                    body_err = Some(format!("body read error: {e}"));
+                    break false;
+                }
             }
         };
-        if session_dead || !body_ok {
-            debug_log("tunnel: body eof or write error, closing");
-            break;
+        if !body_ok {
+            let why = body_err.unwrap_or_else(|| "body error".to_string());
+            debug_log(&format!("tunnel: {why}, closing"));
+            return why;
         }
         if crate::debug::debug_enabled() {
             debug_log(&format!(
@@ -1169,6 +1235,7 @@ fn tunnel_loop(
             }
         }
     }
+    "session ended (goaway, write error, or protocol close)".to_string()
 }
 
 /// Resolve a dial target announced by the peer (server-side system DNS).

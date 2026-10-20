@@ -283,6 +283,10 @@ pub fn connect_with_timeout(
     {
         let sr = socket2::SockRef::from(&sock);
         let _ = sr.set_send_buffer_size(4 * 1024 * 1024);
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(15))
+            .with_interval(Duration::from_secs(5));
+        let _ = sr.set_tcp_keepalive(&ka);
     }
     // Nagle would stall our small per-frame writes behind delayed ACKs.
     sock.set_nodelay(true)

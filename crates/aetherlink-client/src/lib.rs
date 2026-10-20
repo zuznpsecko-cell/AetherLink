@@ -150,16 +150,36 @@ impl Client {
     ///
     /// Requires a prior `up()` holding the TUN handle. Fails closed (no
     /// bytes move) when the server is unreachable or AUTH rejects us.
+    /// Installs transparent transport auto-reconnect pinned to the already
+    /// resolved server `SocketAddr` + `outer_sni` so middlebox/DPI `TCP RST`
+    /// drops (`WSAECONNRESET 10054`) or brief network blips heal in ~150ms
+    /// without dropping Wintun, routes, or DNS or deadlocking on tunnel DNS.
     pub fn attach_transport(
         &mut self,
         verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
     ) -> Result<()> {
+        if self.pump.is_some() {
+            return Ok(());
+        }
         let tun = self
             .platform
             .tun_handle()
             .ok_or_else(|| ClientError::PlatformError("no live TUN (up first)".to_string()))?;
-        let tunnel = lifecycle::connect(&self.config, verifier)?;
-        self.start_pump_tls(tun, tunnel)
+        let tunnel = lifecycle::connect(&self.config, verifier.clone())?;
+        let mut reconnect_cfg = self.config.clone();
+        if let Ok(peer) = tunnel.stream.sock.peer_addr() {
+            reconnect_cfg.server_addr = peer.to_string();
+        }
+        let pad = self.config.pad_multiple;
+        let handle = threads::spawn_pump_tls_resilient(
+            tun,
+            tunnel,
+            pad,
+            Some(move || lifecycle::connect(&reconnect_cfg, verifier.clone())),
+        )
+        .map_err(|e| ClientError::PlatformError(format!("tls pump spawn: {e}")))?;
+        self.pump = Some(handle);
+        Ok(())
     }
 
     /// Full bring-up: platform `up` + transport attach; rolls the platform
