@@ -6,6 +6,7 @@
 //! keys). `stop()` is idempotent and joins; the wire thread's 200ms read
 //! timeout keeps it stoppable, EOF/transport errors end it fail-closed.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{
@@ -13,36 +14,42 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 
 use aetherlink_frame::{codec::FrameHeader, FRAME_HEADER_SIZE};
+use aetherlink_mux::manager::SealedFrame;
 use aetherlink_netstack::tun::TunPackets;
+use aetherlink_protocol::FrameType;
 
 use crate::lifecycle::ConnectedTunnel;
 use crate::pump::DataPump;
 
-/// Read timeout so the wire thread polls the stop flag instead of blocking.
-/// Wire-read quantum: bounds per-turn wait on a silent peer (bulk senders
-/// must not pay 200ms per turn) and stop latency. Replies still arrive
-/// instantly when present; 10ms only prices true idleness.
+/// Read timeout so the plain-TCP wire thread polls the stop flag instead of blocking.
 const READ_TIMEOUT: Duration = Duration::from_millis(10);
-/// Same read while the TUN is actively producing: an app in mid-upload
-/// gets its device drained again at once instead of paying the idle
-/// quantum per turn (the TUN-side and the wire side share one thread).
-const READ_TIMEOUT_BUSY: Duration = Duration::from_millis(1);
+/// Idle poll sleep when neither TUN nor non-blocking TLS socket made progress.
+const TLS_IDLE_POLL: Duration = Duration::from_millis(1);
 /// Bound for one frame body across stalls (fail closed eventually).
 const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Idle sleep in the TUN->wire loop (no busy spin on an empty TUN).
+/// Idle sleep in the plain-TCP TUN->wire loop.
 const TUN_IDLE: Duration = Duration::from_millis(10);
 /// Absurd ciphertext length: fail closed instead of allocating.
 const MAX_WIRE_BODY: usize = 65535 + 1024;
-/// Write stall bound. Without it a write to a silently dead peer blocks
-/// until the kernel gives up on retransmits (minutes), and `stop()` — and
-/// with it `down` — waits on that join while the FFI lock is held.
-/// Progress resets the clock per syscall, so a slow but live link is fine.
+/// Write stall bound on the plain-TCP pump.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard stall bound on the non-blocking TLS socket when zero encrypted bytes
+/// move across the kernel send buffer for an extended period (dead cable/path).
+const TLS_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Soft upper bound on frames held in the client TLS outbox at once so `DataPump`
+/// backpressure (`in_flight` / advertised TCP window) paces local sockets smoothly.
+const TLS_OUTBOX_MAX: usize = 512;
+/// Maximum mux frames coalesced into a single `rustls::Writer` batch (~2 full
+/// 16 KiB TLS 1.3 records per `write_tls` burst).
+const TLS_BATCH_FRAMES: usize = 32;
+const TLS_BATCH_BYTES: usize = 32 * 1024;
+/// Periodic mux `PING` interval when no upload frames have been sent recently.
+const TLS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Write one sealed frame: 24B header + ciphertext.
 ///
@@ -283,12 +290,52 @@ where
     })
 }
 
-/// Spawn the pump inside an established TLS session (production path).
+/// Push queued TLS records from `stream.conn` out to the non-blocking socket.
 ///
-/// Single thread owns the TLS stream (rustls has no split halves): each turn
-/// drains TUN->wire, then reads one wire frame with the 200ms timeout.
-/// Session mux/keys move in (`with_mux`); tamper is dropped, EOF/errors end
-/// fail-closed. `stop()` stays idempotent.
+/// `WouldBlock`/`TimedOut` on a temporarily full kernel send buffer is normal
+/// during upload bursts and NEVER kills the session unless zero bytes move for
+/// longer than `TLS_WRITE_STALL_TIMEOUT`.
+fn flush_tls_writes(
+    stream: &mut aetherlink_core::tls::ClientTlsStream,
+    stalled_since: &mut Option<Instant>,
+) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+    let mut written = 0usize;
+    while stream.conn.wants_write() {
+        match stream.conn.write_tls(&mut stream.sock) {
+            Ok(0) => {
+                return Err(Error::new(ErrorKind::WriteZero, "tls socket write zero"));
+            }
+            Ok(n) => {
+                written += n;
+                *stalled_since = None;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                let since = *stalled_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > TLS_WRITE_STALL_TIMEOUT {
+                    return Err(Error::new(ErrorKind::TimedOut, "tls write stalled"));
+                }
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !stream.conn.wants_write() {
+        *stalled_since = None;
+    }
+    Ok(written)
+}
+
+/// Spawn the non-blocking full-duplex pump inside an established TLS session.
+///
+/// Runs both directions non-blockingly on a single owner thread:
+/// - Upload frames are pulled from TUN without holding `tun.lock()` across
+///   socket syscalls, coalesced into full TLS 1.3 records, and only confirmed
+///   (`frames_written` + `flush_acks`) as ciphertext actually enters the socket.
+/// - Download TLS records are drained continuously even when the upload socket
+///   send buffer is full (`WouldBlock`), decoding multiple frames per turn from
+///   a persistent `BytesMut` buffer without head-of-line stalls.
 pub fn spawn_pump_tls<T>(
     tun: Arc<Mutex<T>>,
     tunnel: ConnectedTunnel,
@@ -297,130 +344,272 @@ pub fn spawn_pump_tls<T>(
 where
     T: TunPackets + Send + 'static,
 {
+    use std::io::ErrorKind;
+
     let ConnectedTunnel { mut stream, sess } = tunnel;
-    stream.get_mut().set_read_timeout(Some(READ_TIMEOUT))?;
-    stream.get_mut().set_write_timeout(Some(WRITE_TIMEOUT))?;
-    let shutdown_side = stream.get_ref().try_clone()?;
+    let _ = stream.sock.set_nodelay(true);
+    let shutdown_side = stream.sock.try_clone()?;
+    stream.sock.set_nonblocking(true)?;
+
     let stop = Arc::new(AtomicBool::new(false));
     let stop_loop = Arc::clone(&stop);
-    aetherlink_netstack::debug_log("pump: tls thread spawned");
+    aetherlink_netstack::debug_log("pump: tls nonblocking thread spawned");
     let thread = std::thread::spawn(move || {
         let mut pump = DataPump::with_mux(sess.mux, *sess.keys.tx_key(), *sess.keys.rx_key(), pad);
-        // Socket read timeout currently installed (switched between the
-        // idle and the busy quantum only when it actually changes).
-        let mut read_quantum = READ_TIMEOUT;
+        let mut outbox: VecDeque<SealedFrame> = VecDeque::with_capacity(TLS_OUTBOX_MAX);
+        let mut tx_buf = BytesMut::with_capacity(TLS_BATCH_BYTES + 2048);
+        let mut rx_buf = BytesMut::with_capacity(65536);
+        let mut plain_buf = [0u8; 32768];
+        let mut write_stalled_since: Option<Instant> = None;
+        let mut rx_partial_since: Option<Instant> = None;
+        let mut last_tx = Instant::now();
+
         loop {
             if stop_loop.load(Ordering::SeqCst) {
                 break;
             }
-            // TUN -> wire: drain all queued packets.
-            let mut busy = false;
-            match tun.lock() {
-                Ok(mut guard) => match pump.poll_once(&mut *guard) {
-                    Ok(frames) => {
-                        busy = !frames.is_empty();
-                        if busy {
-                            aetherlink_netstack::debug_log(&format!(
-                                "pump: tls tun->wire {} frame(s)",
-                                frames.len()
-                            ));
-                        }
-                        let mut written = 0usize;
-                        let mut ok = true;
-                        for f in &frames {
-                            if write_sealed(&mut stream, &f.header, &f.ciphertext).is_err() {
-                                aetherlink_netstack::debug_log(
-                                    "pump: tls write failed, thread ends",
-                                );
-                                ok = false;
-                                break;
+            let mut progressed = false;
+
+            // 1. Drain any pending encrypted TLS bytes into the OS TCP socket.
+            match flush_tls_writes(&mut stream, &mut write_stalled_since) {
+                Ok(n) => {
+                    if n > 0 {
+                        progressed = true;
+                    }
+                }
+                Err(e) => {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tls write failed ({e}), thread ends"
+                    ));
+                    break;
+                }
+            }
+
+            // 2. Drain inbound TUN packets into `outbox` without doing network I/O
+            //    under `tun.lock()`.
+            if outbox.len() < TLS_OUTBOX_MAX {
+                match tun.lock() {
+                    Ok(mut guard) => match pump.poll_once(&mut *guard) {
+                        Ok(frames) => {
+                            if !frames.is_empty() {
+                                progressed = true;
+                                aetherlink_netstack::debug_log(&format!(
+                                    "pump: tls tun->outbox {} frame(s)",
+                                    frames.len()
+                                ));
+                                outbox.extend(frames);
                             }
-                            written += 1;
                         }
-                        // Only now are these bytes really gone: free the
-                        // upload buffer and confirm them to the app. The app
-                        // is throttled by this confirmation, so it paces
-                        // itself to what the tunnel can actually carry
-                        // instead of overrunning it and losing the surplus.
-                        pump.frames_written(written);
+                        Err(e) => {
+                            aetherlink_netstack::debug_log(&format!(
+                                "pump: tls tun drain error: {e}, continuing"
+                            ));
+                            pump.flush_acks(&mut *guard);
+                        }
+                    },
+                    Err(_) => {
+                        aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
+                        break;
+                    }
+                }
+            }
+
+            // 3. Coalesce queued frames into full TLS records ONLY while rustls
+            //    has flushed prior records to the socket — tying TCP ACKs and
+            //    window sizing directly to real uplink drain speed.
+            for _ in 0..4 {
+                if stream.conn.wants_write() || outbox.is_empty() {
+                    break;
+                }
+                tx_buf.clear();
+                let mut batch = 0usize;
+                while batch < TLS_BATCH_FRAMES && tx_buf.len() < TLS_BATCH_BYTES {
+                    let Some(f) = outbox.pop_front() else {
+                        break;
+                    };
+                    f.header.encode(&mut tx_buf);
+                    tx_buf.extend_from_slice(&f.ciphertext);
+                    batch += 1;
+                }
+                if batch == 0 {
+                    break;
+                }
+                if let Err(e) = stream.conn.writer().write_all(&tx_buf) {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tls writer failed ({e}), thread ends"
+                    ));
+                    return;
+                }
+                last_tx = Instant::now();
+                progressed = true;
+
+                let write_res = flush_tls_writes(&mut stream, &mut write_stalled_since);
+                match tun.lock() {
+                    Ok(mut guard) => {
+                        pump.frames_written(batch);
                         pump.flush_acks(&mut *guard);
-                        if !ok {
+                    }
+                    Err(_) => {
+                        aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
+                        return;
+                    }
+                }
+                if let Err(e) = write_res {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tls write failed ({e}), thread ends"
+                    ));
+                    return;
+                }
+            }
+
+            // 4. Periodic idle keepalive so NATs and middleboxes keep state warm.
+            if !stream.conn.wants_write()
+                && outbox.is_empty()
+                && last_tx.elapsed() >= TLS_KEEPALIVE_INTERVAL
+            {
+                tx_buf.clear();
+                FrameHeader {
+                    length: 0,
+                    frame_type: FrameType::Ping,
+                    flags: 0,
+                    stream_id: 0,
+                    sequence: 0,
+                }
+                .encode(&mut tx_buf);
+                let _ = stream.conn.writer().write_all(&tx_buf);
+                last_tx = Instant::now();
+                if let Err(e) = flush_tls_writes(&mut stream, &mut write_stalled_since) {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tls keepalive write failed ({e}), thread ends"
+                    ));
+                    break;
+                }
+            }
+
+            // 5. Non-blocking read of all available TLS records + buffered plaintext.
+            let mut peer_eof = false;
+            for _ in 0..32 {
+                match stream.conn.read_tls(&mut stream.sock) {
+                    Ok(0) => {
+                        peer_eof = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        progressed = true;
+                        rx_partial_since = None;
+                        if let Err(e) = stream.conn.process_new_packets() {
+                            aetherlink_netstack::debug_log(&format!(
+                                "pump: tls protocol error ({e}), thread ends"
+                            ));
+                            peer_eof = true;
                             break;
                         }
                     }
-                    Err(e) => {
-                        // One bad packet (truncated, unsupported, a full
-                        // device on the way back) must never end the
-                        // session: back off and keep pumping.
-                        aetherlink_netstack::debug_log(&format!(
-                            "pump: tls tun drain error: {e}, continuing"
-                        ));
-                        pump.flush_acks(&mut *guard);
-                        std::thread::sleep(TUN_IDLE);
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e)
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        break;
                     }
-                },
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tls read failed ({e}), ends"
+                        ));
+                        peer_eof = true;
+                        break;
+                    }
+                }
+            }
+
+            loop {
+                match stream.conn.reader().read(&mut plain_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        progressed = true;
+                        rx_buf.extend_from_slice(&plain_buf[..n]);
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tls plaintext read failed ({e}), ends"
+                        ));
+                        peer_eof = true;
+                        break;
+                    }
+                }
+            }
+
+            // 6. Decode all complete mux frames from `rx_buf` and inject them.
+            let mut decoded: Vec<(FrameHeader, BytesMut)> = Vec::new();
+            let mut fatal = false;
+            while rx_buf.len() >= FRAME_HEADER_SIZE {
+                let mut hdr_slice = BytesMut::from(&rx_buf[..FRAME_HEADER_SIZE]);
+                let header = match FrameHeader::decode(&mut hdr_slice) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tls bad frame header ({e}), ends"
+                        ));
+                        fatal = true;
+                        break;
+                    }
+                };
+                if header.length as usize > MAX_WIRE_BODY {
+                    aetherlink_netstack::debug_log(&format!(
+                        "pump: tls absurd frame length {}, ends",
+                        header.length
+                    ));
+                    fatal = true;
+                    break;
+                }
+                let total = FRAME_HEADER_SIZE + header.length as usize;
+                if rx_buf.len() < total {
+                    let since = *rx_partial_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > BODY_TOTAL_TIMEOUT {
+                        aetherlink_netstack::debug_log("pump: tls body stalled, ends");
+                        fatal = true;
+                    }
+                    break;
+                }
+                rx_partial_since = None;
+                let _ = rx_buf.split_to(FRAME_HEADER_SIZE);
+                let ct = rx_buf.split_to(header.length as usize);
+                decoded.push((header, ct));
+            }
+
+            if fatal {
+                break;
+            }
+
+            match tun.lock() {
+                Ok(mut guard) => {
+                    for (header, ct) in &decoded {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: tls wire {:?} id={} len={}",
+                            header.frame_type, header.stream_id, header.length
+                        ));
+                        if let Err(e) = pump.receive_mux(header, ct, &mut *guard) {
+                            aetherlink_netstack::debug_log(&format!(
+                                "pump: tls frame dropped: {e}"
+                            ));
+                        }
+                    }
+                    pump.flush_acks(&mut *guard);
+                }
                 Err(_) => {
                     aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
                     break;
                 }
             }
-            // An app mid-upload must not wait out the idle quantum: while
-            // the device is producing, the wire read only peeks.
-            let want = if busy {
-                READ_TIMEOUT_BUSY
-            } else {
-                READ_TIMEOUT
-            };
-            if want != read_quantum {
-                match stream.get_mut().set_read_timeout(Some(want)) {
-                    Ok(()) => read_quantum = want,
-                    Err(e) => {
-                        aetherlink_netstack::debug_log(&format!(
-                            "pump: tls read timeout failed ({e}), thread ends"
-                        ));
-                        break;
-                    }
-                }
+
+            if peer_eof {
+                aetherlink_netstack::debug_log("pump: tls peer closed stream");
+                break;
             }
-            // Inject one received frame; false ends the thread.
-            let mut inject = |header: &FrameHeader, ct: &[u8]| -> bool {
-                match tun.lock() {
-                    Ok(mut guard) => match pump.receive_mux(header, ct, &mut *guard) {
-                        Ok(()) => {
-                            aetherlink_netstack::debug_log("pump: tls injected to tun");
-                            true
-                        }
-                        Err(e) => {
-                            aetherlink_netstack::debug_log(&format!(
-                                "pump: tls frame dropped: {e}"
-                            ));
-                            true
-                        }
-                    },
-                    Err(_) => false,
-                }
-            };
-            // Wire -> TUN: one frame per turn; timeout re-polls stop.
-            match read_sealed(&mut stream) {
-                Ok((header, ct)) => {
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tls wire {:?} id={} len={}",
-                        header.frame_type, header.stream_id, header.length
-                    ));
-                    if !inject(&header, &ct) {
-                        break;
-                    }
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    continue;
-                }
-                Err(e) => {
-                    aetherlink_netstack::debug_log(&format!("pump: tls read failed ({e}), ends"));
-                    break;
-                }
+
+            if !progressed {
+                std::thread::sleep(TLS_IDLE_POLL);
             }
         }
         aetherlink_netstack::debug_log("pump: tls thread joined");

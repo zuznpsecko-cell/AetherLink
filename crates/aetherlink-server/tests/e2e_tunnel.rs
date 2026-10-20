@@ -1344,3 +1344,143 @@ fn failed_relay_closes_the_stream_instead_of_hanging() {
     drop(stream);
     server.join().expect("server thread");
 }
+
+#[test]
+fn stray_udp_datagram_without_route_does_not_kill_session() {
+    let echo = tcp_echo();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("timeout");
+    let nonce = [0xEBu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    // Send a UDP datagram on an un-opened stream ID (e.g. skipped blocked QUIC OPEN).
+    let unrouted = sess.mux.open_udp("127.0.0.1", 9999).expect("open local");
+    let stray = sess
+        .mux
+        .seal_datagram(sess.keys.tx_key(), unrouted, b"quic-chlo", 128)
+        .expect("seal stray");
+    wire_help::write_frame(&mut stream, &stray.header, &stray.ciphertext);
+
+    // Session MUST remain alive for active TCP streams!
+    let live = sess.mux.open_tcp("127.0.0.1", echo).expect("open tcp");
+    let open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), live, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+    let data = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), live, b"still-alive", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &data.header, &data.ciphertext);
+
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.stream_id, live);
+    let reply = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open reply");
+    assert_eq!(reply, b"still-alive");
+
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn closed_stream_ignores_trailing_frames_without_redial() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let target_listener = TcpListener::bind("127.0.0.1:0").expect("target bind");
+    let target_port = target_listener.local_addr().expect("addr").port();
+    {
+        let accepts = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = target_listener.accept() {
+                accepts.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 64];
+                let _ = s.read(&mut buf);
+                // Immediately close target socket (simulating early server response/close).
+                drop(s);
+            }
+        });
+    }
+
+    let echo = tcp_echo();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("timeout");
+    let nonce = [0xEDu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    let s1 = sess.mux.open_tcp("127.0.0.1", target_port).expect("open s1");
+    let open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), s1, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+    let d1 = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s1, b"head", 128)
+        .expect("seal d1");
+    wire_help::write_frame(&mut stream, &d1.header, &d1.ciphertext);
+
+    // Wait for server to send the empty-DATA close notification for s1.
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.stream_id, s1);
+    assert!(sess.mux.open_data(sess.keys.rx_key(), &h, &c).expect("open close").is_empty());
+
+    // Now send trailing mid-body frames that were already queued in flight for s1!
+    for _ in 0..4 {
+        let trailing = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), s1, b"mid-body-tail", 128)
+            .expect("seal trailing");
+        wire_help::write_frame(&mut stream, &trailing.header, &trailing.ciphertext);
+    }
+
+    // Verify healthy traffic completes AND target only saw ONE TCP connection!
+    let live = sess.mux.open_tcp("127.0.0.1", echo).expect("open live");
+    let open_live = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), live, 128)
+        .expect("seal open live");
+    wire_help::write_frame(&mut stream, &open_live.header, &open_live.ciphertext);
+    let data_live = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), live, b"ok", 128)
+        .expect("seal data live");
+    wire_help::write_frame(&mut stream, &data_live.header, &data_live.ciphertext);
+
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.stream_id, live);
+    assert_eq!(sess.mux.open_data(sess.keys.rx_key(), &h, &c).expect("ok"), b"ok");
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "closed stream must never redial mid-body");
+
+    drop(stream);
+    server.join().expect("server thread");
+}
+

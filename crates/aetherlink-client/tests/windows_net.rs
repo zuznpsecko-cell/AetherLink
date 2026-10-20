@@ -282,6 +282,29 @@ fn decode_utf16le_bom_ipconfig() {
 }
 
 #[test]
+fn subiface_mtu_args_formats_clean_argv() {
+    use aetherlink_client::platform::windows::subiface_mtu_args;
+
+    let args = subiface_mtu_args("aether0", 1420).expect("valid mtu args");
+    assert_eq!(
+        args,
+        vec![
+            "interface",
+            "ipv4",
+            "set",
+            "subinterface",
+            "aether0",
+            "mtu=1420",
+            "store=active",
+        ]
+    );
+    assert_eq!(subiface_mtu_args("aether0", 65535).expect("clamp high")[5], "mtu=1500");
+    assert_eq!(subiface_mtu_args("aether0", 100).expect("clamp low")[5], "mtu=576");
+    assert!(subiface_mtu_args("", 1420).is_err());
+}
+
+
+#[test]
 #[cfg(windows)]
 fn live_snapshot_reads_this_machine() {
     // Given: real Windows without privileges (read-only commands need none)

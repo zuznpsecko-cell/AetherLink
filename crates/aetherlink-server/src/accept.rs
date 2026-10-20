@@ -104,36 +104,59 @@ struct FlowKey {
 const WORKER_CAP: usize = 512;
 
 /// Payloads a worker inbox holds: backpressure bound (see forward_tcp).
-const WORKER_QUEUE: usize = 128;
+/// Sized generously (~1.4 MiB at 1360B MSS) so initial dial latency and
+/// transient target jitter never stall the multiplexed tunnel loop.
+const WORKER_QUEUE: usize = 1024;
 
 /// How long the loop waits for a buried worker before it gives up on the
-/// stream. Blocking here is the point: it pushes the target's backpressure
-/// back through the tunnel to the peer's app (which then simply stops
-/// being ACKed) instead of losing bytes. Bound it, because this loop also
-/// carries every other stream of the session.
-const SEND_HOLD: Duration = Duration::from_millis(1000);
+/// stream. Bound it so one genuinely wedged target cannot hold up the session.
+const SEND_HOLD: Duration = Duration::from_millis(2500);
 /// Poll step inside the bounded wait below.
 const SEND_HOLD_POLL: Duration = Duration::from_millis(2);
+
+/// Idle wake interval for a non-blocking stream worker checking target reads
+/// while waiting on new upload messages from `inbox`.
+const WORKER_IDLE_POLL: Duration = Duration::from_millis(1);
+
+/// Maximum bytes buffered inside a worker's non-blocking write buffer before
+/// applying channel backpressure to `inbox`.
+const WORKER_WRITE_BATCH: usize = 256 * 1024;
 
 /// Outcome of pushing one message toward a worker with a bounded wait
 /// (std has no send_timeout on SyncSender; this is its manual equivalent).
 enum SendHoldFail {
     /// Still full after SEND_HOLD: payload dropped, caller closes stream.
-    Stalled(WorkerMsg),
-    /// Worker exited: payload returned for redial.
-    Gone(WorkerMsg),
+    Stalled,
+    /// Worker exited: stream is over, caller closes stream.
+    Gone,
+    /// Session write failed while draining completions during backpressure.
+    SessionDead,
 }
 
-fn send_hold(tx: &mpsc::SyncSender<WorkerMsg>, msg: WorkerMsg) -> Result<(), SendHoldFail> {
+#[allow(clippy::too_many_arguments)]
+fn send_hold(
+    tx: &mpsc::SyncSender<WorkerMsg>,
+    msg: WorkerMsg,
+    pool: &RelayPool<FlowKey, Result<RelayOut, ()>>,
+    stream_rx: &mpsc::Receiver<StreamReply>,
+    sess: &mut session::ServerSession,
+    stream: &mut tls::ServerTlsStream,
+    routes: &mut HashMap<u16, SocketAddr>,
+    workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
+    dead: &mut HashMap<(String, u16), Instant>,
+) -> Result<(), SendHoldFail> {
     let start = Instant::now();
     let mut msg = msg;
     loop {
         match tx.try_send(msg) {
             Ok(()) => return Ok(()),
-            Err(mpsc::TrySendError::Disconnected(m)) => return Err(SendHoldFail::Gone(m)),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(SendHoldFail::Gone),
             Err(mpsc::TrySendError::Full(m)) => {
                 if start.elapsed() >= SEND_HOLD {
-                    return Err(SendHoldFail::Stalled(m));
+                    return Err(SendHoldFail::Stalled);
+                }
+                if !drain_completions(pool, stream_rx, sess, stream, routes, workers, dead) {
+                    return Err(SendHoldFail::SessionDead);
                 }
                 msg = m;
                 std::thread::sleep(SEND_HOLD_POLL);
@@ -141,11 +164,6 @@ fn send_hold(tx: &mpsc::SyncSender<WorkerMsg>, msg: WorkerMsg) -> Result<(), Sen
         }
     }
 }
-
-/// Poll quantum of a stream worker: socket reads stay responsive to newly
-/// arrived payloads and to session end. 10ms keeps added latency far under
-/// a typical RTO (50ms showed up in ping/RTT budgets, seen live).
-const WORKER_POLL: Duration = Duration::from_millis(10);
 
 /// Stack per stream worker: it only dials/reads/writes (no deep frames).
 const WORKER_STACK: usize = 256 * 1024;
@@ -180,8 +198,10 @@ enum WorkerMsg {
 
 /// One thread per TCP stream: owns its relay socket cradle-to-grave.
 /// Payloads are written as they arrive, replies forwarded as they arrive —
-/// full duplex, no request/response pairing, no idle tails. Reports once
-/// on socket error/EOF, then exits; silent exit when the loop is gone.
+/// full duplex, non-blocking I/O so socket backpressure on one direction
+/// never stalls the other direction and upload bursts do not pause 10ms
+/// per read timeout. Reports once on socket error/EOF, then exits; silent
+/// exit when the loop is gone.
 fn stream_worker(
     id: u16,
     ip: String,
@@ -190,7 +210,7 @@ fn stream_worker(
     inbox: mpsc::Receiver<WorkerMsg>,
     out: mpsc::Sender<StreamReply>,
 ) {
-    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
     use std::net::Shutdown;
     let target = (ip.clone(), port);
     let mut sock = match relay::dial_tcp(&ip, port) {
@@ -204,100 +224,165 @@ fn stream_worker(
             return;
         }
     };
-    if sock.set_read_timeout(Some(WORKER_POLL)).is_err() {
+    let _ = sock.set_nodelay(true);
+    if sock.set_nonblocking(true).is_err() {
         worker_fail(&out, id, target, relay::DialFail::Transient);
         return;
     }
-    if !first.is_empty() && sock.write_all(&first).is_err() {
-        debug_log(&format!("tunnel: id={id} first write failed"));
-        worker_fail(&out, id, target, relay::DialFail::Transient);
-        return;
-    }
+    let mut write_buf = first;
+    let mut write_pos: usize = 0;
+    let mut half_close_pending = false;
+    let mut half_closed = false;
+    let mut session_gone = false;
     let mut buf = vec![0u8; 65535];
     loop {
-        // Drain newly arrived payloads (no loss under burst).
-        loop {
+        while write_buf.len().saturating_sub(write_pos) < WORKER_WRITE_BATCH {
             match inbox.try_recv() {
                 Ok(WorkerMsg::Data(payload)) => {
-                    if !payload.is_empty() && sock.write_all(&payload).is_err() {
-                        debug_log(&format!("tunnel: id={id} write failed"));
-                        worker_fail(&out, id, target, relay::DialFail::Transient);
-                        return;
+                    if !payload.is_empty() {
+                        write_buf.extend_from_slice(&payload);
                     }
                 }
                 Ok(WorkerMsg::HalfClose) => {
-                    // The peer is done sending: let the target see EOF so
-                    // it can answer, then keep reading until it closes.
-                    // Without this the relay socket hangs open until the
-                    // target's own keep-alive timeout (leaking threads).
-                    if sock.shutdown(Shutdown::Write).is_err() {
-                        debug_log(&format!("tunnel: id={id} shutdown(write) failed"));
-                        worker_fail(&out, id, target, relay::DialFail::Transient);
-                        return;
-                    }
+                    half_close_pending = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return, // session over
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    session_gone = true;
+                    break;
+                }
             }
         }
-        match sock.read(&mut buf) {
-            Ok(0) => {
-                // Clean EOF: one empty reply (old semantic), then exit;
-                // the loop forgets the worker.
-                debug_log(&format!("tunnel: id={id} relay eof"));
-                let _ = out.send(StreamReply {
-                    id,
-                    target,
-                    result: Ok(Vec::new()),
-                });
-                return;
-            }
-            Ok(n) => {
-                let reply = StreamReply {
-                    id,
-                    target: target.clone(),
-                    result: Ok(buf[..n].to_vec()),
-                };
-                if out.send(reply).is_err() {
+        if session_gone {
+            return;
+        }
+
+        let mut progressed = false;
+        while write_pos < write_buf.len() {
+            match sock.write(&write_buf[write_pos..]) {
+                Ok(0) => {
+                    debug_log(&format!("tunnel: id={id} write returned 0"));
+                    worker_fail(&out, id, target, relay::DialFail::Transient);
+                    return;
+                }
+                Ok(n) => {
+                    write_pos += n;
+                    progressed = true;
+                }
+                Err(e) if e.kind() == Interrupted => continue,
+                Err(e) if e.kind() == WouldBlock || e.kind() == TimedOut => break,
+                Err(_) => {
+                    debug_log(&format!("tunnel: id={id} write failed"));
+                    worker_fail(&out, id, target, relay::DialFail::Transient);
                     return;
                 }
             }
-            Err(e) if e.kind() == TimedOut || e.kind() == WouldBlock => {}
-            Err(_) => {
-                debug_log(&format!("tunnel: id={id} relay read error"));
+        }
+        if write_pos > 0 {
+            if write_pos == write_buf.len() {
+                write_buf.clear();
+                write_pos = 0;
+            } else if write_pos >= 65536 {
+                write_buf.drain(..write_pos);
+                write_pos = 0;
+            }
+        }
+
+        if write_buf.is_empty() && half_close_pending && !half_closed {
+            // The peer is done sending and all queued upload bytes have
+            // entered the socket: signal EOF so the target can respond.
+            if sock.shutdown(Shutdown::Write).is_err() {
+                debug_log(&format!("tunnel: id={id} shutdown(write) failed"));
                 worker_fail(&out, id, target, relay::DialFail::Transient);
                 return;
+            }
+            half_closed = true;
+            progressed = true;
+        }
+
+        for _ in 0..16 {
+            match sock.read(&mut buf) {
+                Ok(0) => {
+                    debug_log(&format!("tunnel: id={id} relay eof"));
+                    let _ = out.send(StreamReply {
+                        id,
+                        target,
+                        result: Ok(Vec::new()),
+                    });
+                    return;
+                }
+                Ok(n) => {
+                    progressed = true;
+                    let reply = StreamReply {
+                        id,
+                        target: target.clone(),
+                        result: Ok(buf[..n].to_vec()),
+                    };
+                    if out.send(reply).is_err() {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == Interrupted => continue,
+                Err(e) if e.kind() == WouldBlock || e.kind() == TimedOut => break,
+                Err(_) => {
+                    debug_log(&format!("tunnel: id={id} relay read error"));
+                    worker_fail(&out, id, target, relay::DialFail::Transient);
+                    return;
+                }
+            }
+        }
+
+        if !progressed {
+            match inbox.recv_timeout(WORKER_IDLE_POLL) {
+                Ok(WorkerMsg::Data(payload)) => {
+                    if !payload.is_empty() {
+                        write_buf.extend_from_slice(&payload);
+                    }
+                }
+                Ok(WorkerMsg::HalfClose) => {
+                    half_close_pending = true;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     }
 }
 
+/// Outcome of `forward_tcp`.
+enum ForwardOutcome {
+    Delivered,
+    CloseStream,
+    SessionDead,
+}
+
 /// Forward one TCP payload to its stream worker, spawning (dialing) on
 /// first sight. An empty payload on a live worker is the peer's half-close
-/// (FIN); with no worker yet it stays the old bare-SYN warm-up.
+/// (FIN); with no worker yet it stays the bare-SYN warm-up.
 ///
-/// Returns `false` when the payload could not be delivered. Dropping TCP
-/// payload silently is never an option here: the peer's stack has already
-/// ACKed those bytes to its app (split-TCP), so a lost chunk holes the
-/// stream with nothing left to retransmit it — the transfer stops dead
-/// and the app measures zero (seen live: 0.00 on speedtest upload). The
-/// caller closes the stream instead, and the app retries on a fresh
-/// connection.
+/// Never re-dials mid-stream if an existing worker exited: opening a fresh
+/// TCP connection to the target with mid-body payload bytes corrupts the
+/// application stream. Instead `CloseStream` notifies the peer cleanly.
 #[allow(clippy::too_many_arguments)]
 fn forward_tcp(
+    pool: &RelayPool<FlowKey, Result<RelayOut, ()>>,
+    stream_rx: &mpsc::Receiver<StreamReply>,
+    sess: &mut session::ServerSession,
+    stream: &mut tls::ServerTlsStream,
+    routes: &mut HashMap<u16, SocketAddr>,
     workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
-    dead: &HashMap<(String, u16), Instant>,
+    dead: &mut HashMap<(String, u16), Instant>,
     stream_tx: &mpsc::Sender<StreamReply>,
     id: u16,
     target: (String, u16),
-    mut pt: Vec<u8>,
-) -> bool {
+    pt: Vec<u8>,
+) -> ForwardOutcome {
     if !pt.is_empty() && relay::is_fresh_dead(dead, &target.0, target.1, Instant::now()) {
         debug_log(&format!(
             "tunnel: data id={id} target {}:{} in dead cooldown, closing stream",
             target.0, target.1
         ));
-        return false;
+        return ForwardOutcome::CloseStream;
     }
     if let Some(tx) = workers.get(&id).cloned() {
         let msg = if pt.is_empty() {
@@ -305,34 +390,33 @@ fn forward_tcp(
         } else {
             WorkerMsg::Data(pt)
         };
-        match send_hold(&tx, msg) {
-            Ok(()) => return true,
-            Err(SendHoldFail::Stalled(_)) => {
-                // Worker buried behind a stalled target: hold the peer's
-                // socket no longer, then let it reset and retry rather
-                // than eating a hole it can never repair.
+        return match send_hold(
+            &tx, msg, pool, stream_rx, sess, stream, routes, workers, dead,
+        ) {
+            Ok(()) => ForwardOutcome::Delivered,
+            Err(SendHoldFail::Stalled) => {
                 debug_log(&format!(
                     "tunnel: data id={id} relay stalled past {:?}, closing stream",
                     SEND_HOLD
                 ));
                 workers.remove(&id);
-                return false;
+                ForwardOutcome::CloseStream
             }
-            Err(SendHoldFail::Gone(m)) => {
-                // Worker gone (previous failure): re-dial below.
+            Err(SendHoldFail::Gone) => {
+                debug_log(&format!(
+                    "tunnel: data id={id} worker already exited, closing stream"
+                ));
                 workers.remove(&id);
-                pt = match m {
-                    WorkerMsg::Data(v) => v,
-                    WorkerMsg::HalfClose => return true,
-                };
+                ForwardOutcome::CloseStream
             }
-        }
+            Err(SendHoldFail::SessionDead) => ForwardOutcome::SessionDead,
+        };
     }
     if workers.len() >= WORKER_CAP {
         debug_log(&format!(
             "tunnel: data id={id} too many streams, closing stream"
         ));
-        return false;
+        return ForwardOutcome::CloseStream;
     }
     let (tx, rx) = mpsc::sync_channel(WORKER_QUEUE);
     let out = stream_tx.clone();
@@ -344,11 +428,11 @@ fn forward_tcp(
     {
         Ok(_) => {
             workers.insert(id, tx);
-            true
+            ForwardOutcome::Delivered
         }
         Err(e) => {
             debug_log(&format!("tunnel: data id={id} worker spawn failed: {e}"));
-            false
+            ForwardOutcome::CloseStream
         }
     }
 }
@@ -394,6 +478,7 @@ fn handle_completion(
 fn close_stream(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
+    routes: &mut HashMap<u16, SocketAddr>,
     id: u16,
 ) -> bool {
     let sealed = match sess.mux.seal_data(sess.keys.tx_key(), id, &[], 128) {
@@ -404,8 +489,10 @@ fn close_stream(
             None
         }
     };
-    // Free the id: the peer recycles them, and a session outlives
-    // thousands of connections.
+    // Free both mux state and route: any queued mid-body frames already in
+    // flight for this closed stream must be skipped cleanly instead of
+    // dialing a brand-new TCP connection with mid-stream payload bytes.
+    routes.remove(&id);
     let _ = sess.mux.close(id);
     match sealed {
         Some(sealed) => match write_sealed(stream, &sealed.header, &sealed.ciphertext) {
@@ -429,6 +516,7 @@ fn close_stream(
 fn handle_stream_reply(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
+    routes: &mut HashMap<u16, SocketAddr>,
     workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
     dead: &mut HashMap<(String, u16), Instant>,
     r: StreamReply,
@@ -437,7 +525,7 @@ fn handle_stream_reply(
         Ok(bytes) => {
             if bytes.is_empty() {
                 workers.remove(&r.id);
-                close_stream(sess, stream, r.id)
+                close_stream(sess, stream, routes, r.id)
             } else {
                 dead.remove(&r.target);
                 match send_data(sess, stream, r.id, &bytes) {
@@ -466,7 +554,7 @@ fn handle_stream_reply(
                     r.id
                 ));
             }
-            close_stream(sess, stream, r.id)
+            close_stream(sess, stream, routes, r.id)
         }
     }
 }
@@ -478,6 +566,7 @@ fn drain_completions(
     stream_rx: &mpsc::Receiver<StreamReply>,
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
+    routes: &mut HashMap<u16, SocketAddr>,
     workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
     dead: &mut HashMap<(String, u16), Instant>,
 ) -> bool {
@@ -487,7 +576,7 @@ fn drain_completions(
         }
     }
     while let Ok(r) = stream_rx.try_recv() {
-        if !handle_stream_reply(sess, stream, workers, dead, r) {
+        if !handle_stream_reply(sess, stream, routes, workers, dead, r) {
             return false;
         }
     }
@@ -597,6 +686,7 @@ fn tunnel_loop(
                     &stream_rx,
                     &mut sess,
                     stream,
+                    routes,
                     &mut workers,
                     &mut dead,
                 ) {
@@ -654,10 +744,10 @@ fn tunnel_loop(
         ));
         match header.frame_type {
             FrameType::Data => {
-                let Some(target) = routes.get(&header.stream_id) else {
-                    // One stray stream (its OPEN was skipped: a failed
-                    // resolve, a full session) must not take the whole
-                    // tunnel down with it — skip the flow instead.
+                let Some(&target) = routes.get(&header.stream_id) else {
+                    // One stray stream (its OPEN was skipped, or the stream
+                    // already closed) must not take the whole tunnel down —
+                    // skip the flow cleanly.
                     debug_log(&format!(
                         "tunnel: data id={} without route, skipping flow",
                         header.stream_id
@@ -701,27 +791,33 @@ fn tunnel_loop(
                 // worker, spawning (dialing) on first sight. Full duplex:
                 // writes and reads interleave with no pairing or tails.
                 let id = header.stream_id;
-                let delivered = forward_tcp(
+                match forward_tcp(
+                    &pool,
+                    &stream_rx,
+                    &mut sess,
+                    stream,
+                    routes,
                     &mut workers,
-                    &dead,
+                    &mut dead,
                     &stream_tx,
                     id,
                     (target.ip().to_string(), target.port()),
                     pt,
-                );
-                if !delivered {
-                    // Undeliverable: the peer's app already counts these
-                    // bytes as sent, so close the stream instead of
-                    // letting it wait on bytes the target never gets.
-                    if !close_stream(&mut sess, stream, id) {
-                        break;
+                ) {
+                    ForwardOutcome::Delivered => {}
+                    ForwardOutcome::CloseStream => {
+                        if !close_stream(&mut sess, stream, routes, id) {
+                            break;
+                        }
                     }
+                    ForwardOutcome::SessionDead => break,
                 }
                 if !drain_completions(
                     &pool,
                     &stream_rx,
                     &mut sess,
                     stream,
+                    routes,
                     &mut workers,
                     &mut dead,
                 ) {
@@ -729,12 +825,16 @@ fn tunnel_loop(
                 }
             }
             FrameType::UdpDatagram => {
-                let Some(target) = routes.get(&header.stream_id) else {
+                let Some(&target) = routes.get(&header.stream_id) else {
+                    // Parity with FrameType::Data: a UDP datagram whose OPEN
+                    // was skipped (blocklist, transient DNS error, QUIC/STUN
+                    // race during upload) must skip the flow, never kill the
+                    // whole tunnel session.
                     debug_log(&format!(
-                        "tunnel: datagram id={} without route",
+                        "tunnel: datagram id={} without route, skipping flow",
                         header.stream_id
                     ));
-                    break;
+                    continue;
                 };
                 if sess
                     .mux
@@ -769,7 +869,7 @@ fn tunnel_loop(
                         continue;
                     }
                 };
-                if is_unroutable_target(target) {
+                if is_unroutable_target(&target) {
                     debug_log(&format!(
                         "tunnel: datagram id={} to {target} unroutable, skipping relay",
                         header.stream_id
@@ -835,6 +935,7 @@ fn tunnel_loop(
                     &stream_rx,
                     &mut sess,
                     stream,
+                    routes,
                     &mut workers,
                     &mut dead,
                 ) {

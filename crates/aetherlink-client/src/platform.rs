@@ -283,19 +283,21 @@ impl Platform for RealPlatform {
             dns_servers: dns,
         })
     }
-    fn tun_up(&mut self, name: &str, addr: Ipv4Addr, _mtu: u32) -> Result<()> {
+    fn tun_up(&mut self, name: &str, addr: Ipv4Addr, mtu: u32) -> Result<()> {
         // Open first: the session must be alive while netsh works below,
         // and the handle is stored (not dropped) so the device stays up.
         let iface = aetherlink_netstack::tun::TunInterface::open(name)
             .map_err(|e| ClientError::PlatformError(format!("tun open: {e}")))?;
-        // A newborn wintun adapter is disabled: enable first, then address
-        // it (/30 so pin/default-via-TUN resolve). A half-addressed adapter
-        // is reused by the next open-or-create, so just report. The OS
+        // A newborn wintun adapter is disabled: enable first, set metric and
+        // MTU (so tcpip.sys does not inherit Wintun's default 65535 MTU), then
+        // address it (/30 so pin/default-via-TUN resolve). A half-addressed
+        // adapter is reused by the next open-or-create, so just report. The OS
         // registers newborn interfaces asynchronously: retry ~5s per step.
         let enable_args = windows::iface_admin_args(name, true)?;
         let metric_args = windows::iface_metric_args(name, windows::TUN_IFACE_METRIC)?;
+        let mtu_args = windows::subiface_mtu_args(name, mtu)?;
         let addr_args = windows::tun_addr_args(name, &addr.to_string(), 30)?;
-        for args in [&enable_args, &metric_args, &addr_args] {
+        for args in [&enable_args, &metric_args, &mtu_args, &addr_args] {
             let mut last_err = ClientError::PlatformError("tun bring-up: no attempts".to_string());
             let mut done = false;
             for _ in 0..10 {

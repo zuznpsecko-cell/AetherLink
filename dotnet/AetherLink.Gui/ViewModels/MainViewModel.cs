@@ -22,6 +22,10 @@ public partial class MainViewModel : ViewModelBase
     // dead pump can race); TunnelService.Down is idempotent under _opGate.
     private int _teardownInFlight;
 
+    // Preserves non-UI transport fields (mtu, pad_multiple, keepalive_s,
+    // wintun_dll_path, include_private_lan_direct, default_action) across Save.
+    private Models.GuiClientConfig _config = new();
+
     [ObservableProperty]
     public partial string StatusText { get; set; } = "Down";
 
@@ -358,6 +362,7 @@ public partial class MainViewModel : ViewModelBase
         try
         {
             var cfg = Services.ConfigService.Load(ConfigPath);
+            _config = cfg;
             ServerAddr = cfg.Client.ServerAddr;
             OuterSni = cfg.Client.OuterSni;
             Psk = cfg.Client.Psk;
@@ -386,22 +391,13 @@ public partial class MainViewModel : ViewModelBase
     {
         try
         {
-            var cfg = new Models.GuiClientConfig
-            {
-                Client = new Models.ClientSection
-                {
-                    ServerAddr = ServerAddr,
-                    OuterSni = OuterSni,
-                    Psk = Psk,
-                },
-                FullTunnel = new Models.FullTunnelSection
-                {
-                    Enabled = FullTunnel,
-                    DnsMode = DnsMode,
-                },
-                Routing = new Models.RoutingSection { Rules = Rules.ToList() },
-            };
-            Services.ConfigService.Save(ConfigPath, cfg);
+            _config.Client.ServerAddr = ServerAddr;
+            _config.Client.OuterSni = OuterSni;
+            _config.Client.Psk = Psk;
+            _config.FullTunnel.Enabled = FullTunnel;
+            _config.FullTunnel.DnsMode = DnsMode;
+            _config.Routing.Rules = Rules.ToList();
+            Services.ConfigService.Save(ConfigPath, _config);
         }
         catch (Exception ex)
         {

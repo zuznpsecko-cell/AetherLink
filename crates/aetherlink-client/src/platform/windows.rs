@@ -316,6 +316,27 @@ pub fn iface_metric_args(name: &str, metric: u32) -> Result<Vec<String>> {
     ])
 }
 
+/// Arg vector for `netsh interface ipv4 set subinterface <name> mtu=<mtu> store=active`.
+///
+/// Wintun adapters default to a 65535-byte interface MTU in Windows unless
+/// clamped explicitly, causing `tcpip.sys` to emit multi-kilobyte segments
+/// that exceed tunnel framing or mis-seed TCP segmentation.
+pub fn subiface_mtu_args(name: &str, mtu: u32) -> Result<Vec<String>> {
+    if name.is_empty() {
+        return Err(ClientError::RoutingError("tun name empty".to_string()));
+    }
+    let clamped = mtu.clamp(576, 1500);
+    Ok(vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "subinterface".to_string(),
+        name.to_string(),
+        format!("mtu={clamped}"),
+        "store=active".to_string(),
+    ])
+}
+
 /// Arg vector for `netsh interface set interface` admin state.
 ///
 /// A newborn wintun adapter is disabled (`netsh` answers "interface may be

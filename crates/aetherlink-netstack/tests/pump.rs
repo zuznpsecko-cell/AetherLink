@@ -130,3 +130,27 @@ fn rejects_tampered_tcp_checksum() {
     // When/Then: checksum verification fails closed.
     assert!(parse_ipv4_packet(&raw).is_err());
 }
+
+#[test]
+fn synack_mss_encodes_and_parses_with_valid_checksums() {
+    use aetherlink_netstack::smoltcp_wrapper::build_tcp_synack_mss;
+
+    let raw = build_tcp_synack_mss(
+        v4(93, 184, 216, 34),
+        v4(10, 255, 0, 2),
+        443,
+        51234,
+        1_000_000,
+        50_001,
+        65_535,
+        1360,
+    );
+    assert_eq!(raw.len(), 44, "20B IPv4 + 24B TCP header with 4B MSS option");
+    let parsed = parse_ipv4_packet(&raw).expect("valid IPv4 + TCP checksums");
+    let seg = parsed.tcp().expect("tcp segment");
+    assert!(seg.syn && seg.ack && !seg.fin && !seg.rst);
+    assert_eq!(seg.window, 65_535);
+    assert_eq!(seg.mss, Some(1360));
+    assert!(seg.payload.is_empty());
+}
+

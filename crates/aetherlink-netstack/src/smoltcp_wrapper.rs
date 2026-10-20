@@ -78,8 +78,40 @@ pub struct TcpSegment {
     pub ack_num: u32,
     /// Receive window the sender advertises (flow control).
     pub window: u16,
+    /// Maximum Segment Size (RFC 9293 option kind 2), when advertised.
+    pub mss: Option<u16>,
     /// Segment payload.
     pub payload: Vec<u8>,
+}
+
+/// Extract RFC 9293 option kind 2 (Maximum Segment Size) from a TCP options slice.
+fn parse_tcp_mss(mut opts: &[u8]) -> Option<u16> {
+    while let Some(&kind) = opts.first() {
+        match kind {
+            // End of Option List.
+            0 => break,
+            // No-Operation (1-byte pad).
+            1 => opts = &opts[1..],
+            // Maximum Segment Size: [2, 4, hi, lo].
+            2 => {
+                if opts.len() >= 4 && opts[1] == 4 {
+                    return Some(u16::from_be_bytes([opts[2], opts[3]]));
+                }
+                break;
+            }
+            _ => {
+                if opts.len() < 2 {
+                    break;
+                }
+                let len = opts[1] as usize;
+                if len < 2 || len > opts.len() {
+                    break;
+                }
+                opts = &opts[len..];
+            }
+        }
+    }
+    None
 }
 
 /// Parsed UDP datagram.
@@ -129,6 +161,11 @@ pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
             if header > body.len() {
                 return Err(NetstackError::InvalidPacket("bad tcp header".to_string()));
             }
+            let mss = if header > 20 {
+                parse_tcp_mss(&body[20..header])
+            } else {
+                None
+            };
             ParsedPayload::Tcp(TcpSegment {
                 src_port: tcp.src_port(),
                 dst_port: tcp.dst_port(),
@@ -140,6 +177,7 @@ pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
                 seq: tcp.seq_number().0 as u32,
                 ack_num: tcp.ack_number().0 as u32,
                 window: tcp.window_len(),
+                mss,
                 payload: body[header..].to_vec(),
             })
         }
@@ -288,6 +326,59 @@ pub fn build_tcp_packet_window(
         tcp.set_fin(fin);
         tcp.set_rst(rst);
         tcp.payload_mut()[..payload.len()].copy_from_slice(payload);
+        tcp.fill_checksum(&ip_addr(src), &ip_addr(dst));
+    }
+    {
+        let mut ip = Ipv4Packet::new_checked(&mut buf[..]).expect("sized ip buffer");
+        ip.set_version(4);
+        ip.set_header_len(IPV4_HEADER as u8);
+        ip.set_total_len(total as u16);
+        ip.set_next_header(IpProtocol::Tcp);
+        ip.set_src_addr(src.into());
+        ip.set_dst_addr(dst.into());
+        ip.fill_checksum();
+    }
+    buf
+}
+
+/// Build an IPv4/TCP `SYN-ACK` advertising an explicit RFC 9293 Maximum
+/// Segment Size (`kind = 2, len = 4`) and receive window.
+///
+/// Without an MSS option on `SYN-ACK`, OS TCP stacks (notably Windows
+/// `tcpip.sys`) fall back to the RFC 9293 conservative default of `536`
+/// bytes on non-local destinations, multiplying packet rate by ~2.5x or
+/// sending oversized segments across the tunnel MTU.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_tcp_synack_mss(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack_num: u32,
+    window: u16,
+    mss: u16,
+) -> Vec<u8> {
+    const IPV4_HEADER: usize = 20;
+    const TCP_HEADER: usize = 24;
+    let total = IPV4_HEADER + TCP_HEADER;
+    let mut buf = vec![0u8; total];
+    // 6 32-bit words (20B fixed TCP header + 4B MSS option).
+    buf[IPV4_HEADER + 12] = 0x60;
+    let [mss_hi, mss_lo] = mss.to_be_bytes();
+    buf[IPV4_HEADER + 20..IPV4_HEADER + 24].copy_from_slice(&[0x02, 0x04, mss_hi, mss_lo]);
+    {
+        let mut tcp = TcpPacket::new_checked(&mut buf[IPV4_HEADER..]).expect("sized tcp buffer");
+        tcp.clear_flags();
+        tcp.set_src_port(src_port);
+        tcp.set_dst_port(dst_port);
+        tcp.set_seq_number(TcpSeqNumber(seq as i32));
+        tcp.set_ack_number(TcpSeqNumber(ack_num as i32));
+        tcp.set_header_len(TCP_HEADER as u8);
+        tcp.set_window_len(window);
+        tcp.set_syn(true);
+        tcp.set_ack(true);
         tcp.fill_checksum(&ip_addr(src), &ip_addr(dst));
     }
     {

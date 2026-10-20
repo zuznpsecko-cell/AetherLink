@@ -399,3 +399,172 @@ fn bulk_send_does_not_wait_for_replies() {
     handle.stop();
     server.join().expect("server thread");
 }
+
+#[test]
+fn full_duplex_upload_and_download_burst_completes_intact() {
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        key.cert.der().to_vec(),
+    )];
+    let key_der = key.key_pair.serialize_der();
+    let server_cfg =
+        Arc::new(aetherlink_core::tls::server_config(chain, &key_der).expect("server cfg"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let cache = NonceCache::new();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut stream = aetherlink_core::tls::accept_tls(sock, &server_cfg).expect("server tls");
+        let mut sess = aetherlink_core::session::handshake_server(&mut stream, PSK, &cache)
+            .expect("server hs");
+        let (open_h, open_c) = read_one(&mut stream);
+        let tcp = aetherlink_mux::manager::MuxManager::parse_open_tcp(
+            sess.keys.rx_key(),
+            &open_h,
+            &open_c,
+        )
+        .expect("open parses");
+        sess.mux
+            .register_inbound(tcp.id, &tcp.addr, tcp.port, false)
+            .expect("register");
+        let mut uploaded = Vec::new();
+        loop {
+            let (h, c) = read_one(&mut stream);
+            let pt = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("open upload chunk");
+            if pt.is_empty() {
+                break;
+            }
+            uploaded.extend_from_slice(&pt);
+        }
+        // Answer with exact byte count + large payload + clean close!
+        let mut reply = (uploaded.len() as u64).to_be_bytes().to_vec();
+        reply.extend_from_slice(&vec![0xA5u8; 8192]);
+        let s1 = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), tcp.id, &reply, PAD)
+            .expect("seal reply");
+        write_one(&mut stream, &s1.header, &s1.ciphertext);
+        let s2 = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), tcp.id, &[], PAD)
+            .expect("seal close");
+        write_one(&mut stream, &s2.header, &s2.ciphertext);
+        let mut one = [0u8; 1];
+        let _ = stream.read(&mut one);
+        uploaded.len()
+    });
+
+    let syn = build_tcp_packet(CLIENT_IP, DST, 43001, 443, true, false, false, 10_000, 0, &[]);
+    let tun = Arc::new(Mutex::new(FakeTun {
+        inbound: vec![syn].into(),
+        outbound: Vec::new(),
+    }));
+    let tunnel = aetherlink_client::lifecycle::connect(
+        &test_config(&format!("127.0.0.1:{port}")),
+        Some(Arc::new(AcceptAll)),
+    )
+    .expect("connect");
+    let mut handle = spawn_pump_tls(Arc::clone(&tun), tunnel, PAD).expect("spawn");
+
+    let iss = loop {
+        {
+            let guard = tun.lock().expect("lock");
+            if let Some(raw) = guard.outbound.first() {
+                let parsed =
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw).expect("valid ip");
+                if parsed.tcp().expect("tcp").syn {
+                    break parsed.tcp().expect("tcp").seq;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    // Push 128 x 1360B upload segments + trailing FIN in a burst.
+    let seg_body = vec![0x3Cu8; 1360];
+    {
+        let mut guard = tun.lock().expect("lock");
+        guard.outbound.clear();
+        guard.inbound.push_back(build_tcp_packet(
+            CLIENT_IP,
+            DST,
+            43001,
+            443,
+            false,
+            true,
+            false,
+            10_001,
+            iss.wrapping_add(1),
+            &[],
+        ));
+        let mut seq = 10_001u32;
+        for _ in 0..128 {
+            guard.inbound.push_back(build_tcp_packet(
+                CLIENT_IP,
+                DST,
+                43001,
+                443,
+                false,
+                true,
+                true,
+                seq,
+                iss.wrapping_add(1),
+                &seg_body,
+            ));
+            seq = seq.wrapping_add(1360);
+        }
+        guard.inbound.push_back(
+            aetherlink_netstack::smoltcp_wrapper::build_tcp_packet_full(
+                CLIENT_IP,
+                DST,
+                43001,
+                443,
+                false,
+                true,
+                false,
+                true,
+                false,
+                seq,
+                iss.wrapping_add(1),
+                &[],
+            ),
+        );
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut rx_payload = Vec::new();
+    loop {
+        {
+            rx_payload.clear();
+            let guard = tun.lock().expect("lock");
+            let mut saw_fin = false;
+            for raw in &guard.outbound {
+                let parsed =
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw).expect("valid ip");
+                let seg = parsed.tcp().expect("tcp");
+                rx_payload.extend_from_slice(&seg.payload);
+                if seg.fin {
+                    saw_fin = true;
+                }
+            }
+            if saw_fin {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "full-duplex response + FIN never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    handle.stop();
+    let total_uploaded = server.join().expect("server thread");
+    assert_eq!(total_uploaded, 128 * 1360);
+    assert_eq!(rx_payload.len(), 8 + 8192);
+    let echoed_len = u64::from_be_bytes(rx_payload[..8].try_into().expect("8B"));
+    assert_eq!(echoed_len, (128 * 1360) as u64);
+}
+

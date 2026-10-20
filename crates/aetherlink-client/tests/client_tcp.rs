@@ -625,10 +625,13 @@ fn app_fin_announces_half_close_and_still_delivers_the_answer() {
     );
     tun.inbound.push_back(fin);
     let frames = pump.poll_once(&mut tun).expect("poll");
-    // Then: the app gets its FIN-ACK ...
+    // Then: the app gets a pure ACK (NOT premature FIN) so its receive half
+    // remains open in FIN_WAIT_2 to accept the HTTP response without RST ...
     let out = tun.take_outbound();
     assert_eq!(out.len(), 1);
-    assert!(out[0].tcp().expect("tcp").fin);
+    let fin_ack = out[0].tcp().expect("tcp");
+    assert!(fin_ack.ack && !fin_ack.fin);
+    assert_eq!(fin_ack.ack_num, isn.wrapping_add(4));
     // ... and the relay hears the half-close (one empty DATA), so the
     // target socket is released instead of hanging to its own timeout.
     assert_eq!(frames.len(), 1, "exactly the close signal");
@@ -638,21 +641,25 @@ fn app_fin_announces_half_close_and_still_delivers_the_answer() {
         .expect("close signal opens");
     assert!(closed.is_empty(), "empty DATA = half-close");
 
-    // And: the answer still reaches the app (half-close is not a teardown).
+    // And: the answer still reaches the app with RFC 9293 SND.NXT ack_num.
     let reply = peer.seal_data(&KEY, id, b"ok", PAD).expect("seal reply");
     pump.receive_mux(&reply.header, &reply.ciphertext, &mut tun)
         .expect("answer injected");
     let out = tun.take_outbound();
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].tcp().expect("tcp").payload, b"ok");
+    let reply_seg = out[0].tcp().expect("tcp");
+    assert_eq!(reply_seg.payload, b"ok");
+    assert_eq!(reply_seg.ack_num, isn.wrapping_add(4));
 
-    // And: the peer's own close ends the flow (FIN to the app, id freed).
+    // And: the peer's own close ends the flow (single FIN to the app, id freed).
     let over = peer.seal_data(&KEY, id, b"", PAD).expect("seal close");
     pump.receive_mux(&over.header, &over.ciphertext, &mut tun)
         .expect("close injected");
     let out = tun.take_outbound();
     assert_eq!(out.len(), 1);
-    assert!(out[0].tcp().expect("tcp").fin);
+    let close_seg = out[0].tcp().expect("tcp");
+    assert!(close_seg.fin && close_seg.ack);
+    assert_eq!(close_seg.ack_num, isn.wrapping_add(4));
     let after = peer.seal_data(&KEY, id, b"late", PAD).expect("seal late");
     assert!(
         pump.receive_mux(&after.header, &after.ciphertext, &mut tun)
@@ -803,3 +810,151 @@ fn finished_flows_free_their_stream_ids() {
     let frames = pump.poll_once(&mut tun).expect("new flow forwards");
     assert_eq!(frames.len(), 2, "OPEN + DATA after {flows} finished flows");
 }
+
+#[test]
+fn synack_advertises_tunnel_mss() {
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    tun.inbound.push_back(syn(42_000));
+    let _ = pump.poll_once(&mut tun).expect("syn poll");
+    let out = tun.take_outbound();
+    assert_eq!(out.len(), 1);
+    let seg = out[0].tcp().expect("tcp");
+    assert!(seg.syn && seg.ack);
+    assert_eq!(seg.mss, Some(aetherlink_client::pump::TCP_MSS as u16));
+}
+
+#[test]
+fn oversized_server_reply_is_chunked_to_mss_without_exceeding_mtu() {
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 55_000);
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"GET /big\r\n\r\n",
+    ));
+    let frames = pump.poll_once(&mut tun).expect("poll");
+    let id = frames[0].header.stream_id;
+    pump.frames_written(frames.len());
+    let _ = tun.take_outbound();
+
+    let mut peer = MuxManager::new();
+    peer.register_inbound(id, &DST.to_string(), 80, false)
+        .expect("register");
+    let large: Vec<u8> = (0..16_384).map(|i| (i & 0xFF) as u8).collect();
+    let sealed = peer.seal_data(&KEY, id, &large, PAD).expect("seal 16KB");
+    pump.receive_mux(&sealed.header, &sealed.ciphertext, &mut tun)
+        .expect("chunked inject");
+
+    assert!(tun.outbound.len() >= 12, "16KB must split into <=1360B segments");
+    let mut reassembled = Vec::new();
+    let mut next_seq = iss.wrapping_add(1);
+    for (idx, raw) in tun.outbound.iter().enumerate() {
+        assert!(
+            raw.len() <= 1400,
+            "packet {idx} len {} must fit comfortably inside 1420B Wintun MTU",
+            raw.len()
+        );
+        let parsed = parse_ipv4_packet(raw).expect("valid ip+tcp");
+        let seg = parsed.tcp().expect("tcp");
+        assert_eq!(seg.seq, next_seq, "contiguous downstream sequence chain");
+        next_seq = next_seq.wrapping_add(seg.payload.len() as u32);
+        reassembled.extend_from_slice(&seg.payload);
+    }
+    assert_eq!(reassembled, large);
+}
+
+#[test]
+fn out_of_order_gap_emits_dupacks_and_holds_premature_fin() {
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    let (isn, iss) = handshake(&mut pump, &mut tun, 77_000);
+
+    // Segment 1 (4 bytes) arrives in order -> expected becomes isn + 5.
+    tun.inbound.push_back(data_at(
+        41000,
+        isn.wrapping_add(1),
+        iss.wrapping_add(1),
+        b"abcd",
+    ));
+    let frames = pump.poll_once(&mut tun).expect("seg1");
+    let id = frames[0].header.stream_id;
+    pump.frames_written(frames.len());
+    pump.flush_acks(&mut tun);
+    let _ = tun.take_outbound();
+
+    // Segment 2 (isn+5..isn+9) is lost; Segments 3, 4, 5 and an out-of-order FIN arrive!
+    for off in [9u32, 13, 17] {
+        tun.inbound.push_back(data_at(
+            41000,
+            isn.wrapping_add(off),
+            iss.wrapping_add(1),
+            b"xxxx",
+        ));
+    }
+    tun.inbound.push_back(build_tcp_packet_full(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        false,
+        true,
+        false,
+        isn.wrapping_add(21),
+        iss.wrapping_add(1),
+        &[],
+    ));
+    let dropped = pump.poll_once(&mut tun).expect("ooo burst");
+    assert!(
+        dropped.is_empty(),
+        "out-of-order segments AND premature FIN must NOT forward or half-close stream"
+    );
+    let dupacks = tun.take_outbound();
+    assert_eq!(dupacks.len(), 4, "duplicate ACKs trigger RFC 5681 Fast Retransmit");
+    for pkt in &dupacks {
+        let seg = pkt.tcp().expect("tcp");
+        assert!(seg.ack && !seg.fin);
+        assert_eq!(seg.ack_num, isn.wrapping_add(5));
+    }
+
+    // Now the fast-retransmitted missing segments + final in-order FIN arrive cleanly!
+    for (off, chunk) in [
+        (5u32, b"efgh".as_slice()),
+        (9, b"xxxx"),
+        (13, b"xxxx"),
+        (17, b"xxxx"),
+    ] {
+        tun.inbound.push_back(data_at(
+            41000,
+            isn.wrapping_add(off),
+            iss.wrapping_add(1),
+            chunk,
+        ));
+    }
+    tun.inbound.push_back(build_tcp_packet_full(
+        CLIENT_IP,
+        DST,
+        41000,
+        80,
+        false,
+        true,
+        false,
+        true,
+        false,
+        isn.wrapping_add(21),
+        iss.wrapping_add(1),
+        &[],
+    ));
+    let recovered = pump.poll_once(&mut tun).expect("in-order recovery");
+    assert_eq!(
+        recovered.len(),
+        5,
+        "4 recovered DATA segments + 1 clean half-close signal"
+    );
+    assert_eq!(recovered.last().expect("close").header.stream_id, id);
+}
+
