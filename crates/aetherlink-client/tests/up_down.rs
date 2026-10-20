@@ -214,16 +214,41 @@ fn up_refuses_when_state_file_exists() {
 }
 
 #[test]
-fn up_refuses_stale_tunnel_dns() {
-    // Given: snapshot DNS already pointing at the virtual resolver
-    // (previous teardown never finished)
+fn up_self_heals_stale_tunnel_dns() {
+    // Given: snapshot DNS already pointing at the virtual resolver and no
+    // state file (the previous teardown died before persisting).
     let path = temp_state("stale-dns");
     let _ = std::fs::remove_file(&path);
     let mut plat = FakePlatform::working(path.clone()).with_dns(vec!["10.255.0.1".to_string()]);
-    // When: up → Then: Err before any mutation.
-    assert!(lifecycle::up(&mut plat, &test_config()).is_err());
-    assert_eq!(plat.applied_count(), 0);
+    // When: up → Then: DNS goes back to DHCP first, then up proceeds.
+    lifecycle::up(&mut plat, &test_config()).expect("up after self-heal");
+    assert!(
+        plat.call_log()
+            .iter()
+            .any(|c| c.starts_with("apply:dns_dhcp")),
+        "self-heal must reset the adapter DNS, log: {:?}",
+        plat.call_log()
+    );
+    // The snapshot persisted for rollback holds the real resolver, not ours
+    // (up itself ends with DNS forced back to the tunnel by design).
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("state")).expect("json");
+    assert_eq!(state["snapshot"]["dns_servers"][0], "192.168.1.1");
+    assert_eq!(plat.dns(), &vec!["10.255.0.1".to_string()]);
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn cleanup_without_state_heals_stale_tunnel_dns() {
+    // Given: no state file to replay, but the adapter still points at us.
+    let path = temp_state("heal-no-state");
+    let _ = std::fs::remove_file(&path);
+    let mut plat = FakePlatform::working(path).with_dns(vec!["10.255.0.1".to_string()]);
+    // When/Then: cleanup's missing-state path repairs the resolver...
+    assert!(cleanup::heal_stale_dns(&mut plat));
+    assert_eq!(plat.dns(), &vec!["192.168.1.1".to_string()]);
+    // ...and a second pass is a no-op (idempotent by contract).
+    assert!(!cleanup::heal_stale_dns(&mut plat));
 }
 
 #[test]

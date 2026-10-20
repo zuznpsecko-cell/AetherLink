@@ -5,9 +5,9 @@
 //! proves parsing against the real machine without privileges.
 
 use aetherlink_client::platform::windows::{
-    dns_set_args, iface_admin_args, iface_metric_args, parse_ipconfig, parse_route_print,
-    prefix_to_mask, route_add_args, route_add_if_args, route_delete_args, route_delete_if_args,
-    tun_addr_args, TUN_IFACE_METRIC,
+    dns_dhcp_args, dns_set_args, iface_admin_args, iface_metric_args, parse_ipconfig,
+    parse_route_print, prefix_to_mask, route_add_args, route_add_if_args, route_delete_args,
+    route_delete_if_args, tun_addr_args, TUN_IFACE_METRIC,
 };
 
 const ROUTE_PRINT: &str = "\
@@ -307,6 +307,24 @@ fn subiface_mtu_args_formats_clean_argv() {
         "mtu=576"
     );
     assert!(subiface_mtu_args("", 1420).is_err());
+}
+
+#[test]
+fn dns_dhcp_args_reset_to_dhcp() {
+    // Given/When: building the self-heal reset for a physical adapter.
+    let args = dns_dhcp_args("Ethernet 3");
+    // Then: `netsh interface ip set dnsservers "Ethernet 3" source=dhcp`.
+    assert_eq!(
+        args,
+        vec![
+            "interface".to_string(),
+            "ip".to_string(),
+            "set".to_string(),
+            "dnsservers".to_string(),
+            "Ethernet 3".to_string(),
+            "source=dhcp".to_string(),
+        ]
+    );
 }
 
 #[test]

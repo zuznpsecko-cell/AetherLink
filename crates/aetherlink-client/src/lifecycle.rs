@@ -19,7 +19,7 @@ use crate::platform::Platform;
 use crate::routing::Matcher;
 use crate::{ClientError, Result};
 use aetherlink_core::{session, tls};
-use aetherlink_netstack::tun::{previous_gateway, AppliedChange, UpState};
+use aetherlink_netstack::tun::{previous_gateway, AppliedChange, Snapshot, UpState};
 
 /// Client TUN address inside `10.255.0.0/30` (DECISIONS D2).
 pub const CLIENT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 0, 2);
@@ -42,6 +42,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reconfiguration mutex: up/down never interleave.
 static RECONFIGURE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// True when a snapshot still carries our virtual resolver.
+fn snapshot_has_tunnel_dns(snap: &Snapshot) -> bool {
+    snap.dns_servers
+        .iter()
+        .any(|s| s == &VIRTUAL_DNS_IP.to_string())
+}
 
 /// Bring the tunnel up against `platform`. Idempotent only via `Client`;
 /// calling `up` twice without `down` re-applies (platforms dedupe).
@@ -70,17 +77,27 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         .ok_or_else(|| ClientError::PlatformError("no server address".to_string()))?;
     aetherlink_netstack::debug_log(&format!("up: server {host} -> {server_ip}"));
     // 2. Snapshot before touching anything.
-    let snap = platform.snapshot()?;
-    // Stale tunnel DNS means a previous teardown never finished: refuse to
-    // stack on it (snapshot would canonize the tunnel address as "previous").
-    if snap
-        .dns_servers
-        .iter()
-        .any(|s| s == &VIRTUAL_DNS_IP.to_string())
-    {
-        return Err(ClientError::StaleState(
-            "stale tunnel DNS in snapshot: run down/cleanup first".to_string(),
+    let mut snap = platform.snapshot()?;
+    // Stale tunnel DNS means a previous teardown never finished: the state
+    // file is gone, so `cleanup` has nothing to replay and would just no-op.
+    // Repair the adapter in place (DHCP) and re-snapshot, never stack on it.
+    if snapshot_has_tunnel_dns(&snap) {
+        let iface = platform.captured_iface().unwrap_or_default();
+        aetherlink_netstack::debug_log(&format!(
+            "up: stale tunnel DNS in snapshot (iface={iface}), resetting to DHCP"
         ));
+        if platform.reset_dns_dhcp(&iface).is_err() {
+            return Err(ClientError::StaleState(
+                "stale tunnel DNS in snapshot: run down/cleanup first".to_string(),
+            ));
+        }
+        snap = platform.snapshot()?;
+        if snapshot_has_tunnel_dns(&snap) {
+            return Err(ClientError::StaleState(
+                "stale tunnel DNS in snapshot: run down/cleanup first".to_string(),
+            ));
+        }
+        aetherlink_netstack::debug_log("up: stale tunnel DNS repaired");
     }
     aetherlink_netstack::debug_log("up: snapshot ok");
     // Applied-change log, persisted after every mutation so a crash mid-up

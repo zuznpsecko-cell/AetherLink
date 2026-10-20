@@ -301,6 +301,23 @@ pub fn dns_set_args(iface: &str, dns: &str) -> Vec<String> {
     ]
 }
 
+/// Arg vector for `netsh interface ip set dnsservers <iface> source=dhcp`.
+///
+/// Self-heal path: a teardown that lost its state file leaves the virtual
+/// resolver (`10.255.0.1`) on the physical adapter; DHCP hands it back to the
+/// network instead of pinning a dead server as "previous".
+#[must_use]
+pub fn dns_dhcp_args(iface: &str) -> Vec<String> {
+    vec![
+        "interface".to_string(),
+        "ip".to_string(),
+        "set".to_string(),
+        "dnsservers".to_string(),
+        iface.to_string(),
+        "source=dhcp".to_string(),
+    ]
+}
+
 /// Arg vector for `netsh interface ipv4 set interface` metric.
 pub fn iface_metric_args(name: &str, metric: u32) -> Result<Vec<String>> {
     if name.is_empty() {

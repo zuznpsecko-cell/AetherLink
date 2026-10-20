@@ -103,6 +103,16 @@ pub trait Platform: Send {
         Err(pending("force_dns"))
     }
 
+    /// Point an interface's DNS back at DHCP (default: pending).
+    ///
+    /// Self-heal for stale tunnel DNS: a teardown that died before writing
+    /// (or after losing) its state file leaves `10.255.0.1` behind, and both
+    /// `up` and `cleanup` would otherwise dead-end with "run cleanup first"
+    /// while cleanup itself has nothing to replay.
+    fn reset_dns_dhcp(&mut self, _iface: &str) -> Result<()> {
+        Err(pending("reset_dns_dhcp"))
+    }
+
     /// Restore a snapshot (default: pending).
     fn restore(&mut self, _snap: &Snapshot) -> Result<()> {
         Err(pending("restore"))
@@ -396,6 +406,17 @@ impl Platform for RealPlatform {
         aetherlink_netstack::debug_log(&format!("force_dns: {dns_ip} on {iface}"));
         let args = windows::dns_set_args(&iface, &dns_ip.to_string());
         run("netsh", &args)?;
+        Ok(())
+    }
+
+    fn reset_dns_dhcp(&mut self, iface: &str) -> Result<()> {
+        let iface = if iface.is_empty() {
+            self.default_iface()?
+        } else {
+            iface.to_string()
+        };
+        aetherlink_netstack::debug_log(&format!("reset_dns_dhcp: {iface} -> dhcp"));
+        run("netsh", &windows::dns_dhcp_args(&iface))?;
         Ok(())
     }
 
@@ -713,6 +734,13 @@ impl Platform for FakePlatform {
         self.fail(Step::DnsForce)?;
         self.dns = vec![dns_ip.to_string()];
         self.log.push(format!("apply:force_dns {dns_ip}"));
+        Ok(())
+    }
+
+    fn reset_dns_dhcp(&mut self, iface: &str) -> Result<()> {
+        self.fail(Step::DnsForce)?;
+        self.dns = vec!["192.168.1.1".to_string()];
+        self.log.push(format!("apply:dns_dhcp {iface}"));
         Ok(())
     }
 
