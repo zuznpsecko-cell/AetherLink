@@ -1759,3 +1759,179 @@ fn concurrent_upload_close_race_and_stream_rst_keep_session_alive() {
     let _ = target_srv.join();
     server.join().expect("server thread");
 }
+
+#[test]
+fn infinite_fast_download_aborted_by_rst_immediately_allows_upload() {
+    // Reproduces the exact live Speedtest `Download fast / Upload = 0` bug:
+    // 1. Multiple upstream servers blast infinite nonstop 64 KiB download chunks
+    //    into `stream_worker`s faster than the outer link drains them.
+    // 2. Client aborts those download streams via per-stream `FrameType::Rst`
+    //    and immediately opens parallel Upload streams (`POST /upload`).
+    // 3. Previously, `drain_completions` never yielded while `stream_rx` stayed
+    //    non-empty, starving `read_tls_step` so Upload = 0 forever. Now both
+    //    the `Rst` aborts and all parallel Upload streams complete promptly.
+    let dl_listener = TcpListener::bind("127.0.0.1:0").expect("bind dl");
+    let dl_port = dl_listener.local_addr().expect("dl addr").port();
+    let stop_dl = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_dl_srv = Arc::clone(&stop_dl);
+    let dl_srv = std::thread::spawn(move || {
+        for _ in 0..4 {
+            if let Ok((mut s, _)) = dl_listener.accept() {
+                let stop_c = Arc::clone(&stop_dl_srv);
+                std::thread::spawn(move || {
+                    let mut req = [0u8; 64];
+                    let _ = s.read(&mut req);
+                    let chunk = vec![0x5Au8; 65535];
+                    while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                        if s.write_all(&chunk).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let ul_listener = TcpListener::bind("127.0.0.1:0").expect("bind ul");
+    let ul_port = ul_listener.local_addr().expect("ul addr").port();
+    let ul_srv = std::thread::spawn(move || {
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let (mut s, _) = ul_listener.accept().expect("accept upload");
+            handles.push(std::thread::spawn(move || {
+                let mut total = 0usize;
+                let mut buf = vec![0u8; 32768];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => total += n,
+                        Err(_) => break,
+                    }
+                }
+                let _ = s.write_all(&total.to_be_bytes());
+                let _ = s.shutdown(std::net::Shutdown::Write);
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+
+    let mut routes = HashMap::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tunnel");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let nonce = [0xF4u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    // 1. Start 4 simultaneous infinite downloads and read >= 512 KiB so all 4
+    //    server workers are actively flooding `stream_rx`.
+    let mut dl_ids = Vec::new();
+    for _ in 0..4 {
+        let id = sess.mux.open_tcp("127.0.0.1", dl_port).expect("open dl");
+        let open = sess
+            .mux
+            .seal_open_tcp(sess.keys.tx_key(), id, 128)
+            .expect("seal open dl");
+        wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+        let req = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), id, b"GET /infinite\r\n\r\n", 128)
+            .expect("seal get");
+        wire_help::write_frame(&mut stream, &req.header, &req.ciphertext);
+        dl_ids.push(id);
+    }
+
+    let mut received_dl = 0usize;
+    while received_dl < 512 * 1024 {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        if h.frame_type == FrameType::Data {
+            let pt = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("open dl data");
+            received_dl += pt.len();
+        }
+    }
+
+    // 2. Abort all 4 active downloads with `FrameType::Rst` and immediately
+    //    launch 4 parallel 128 KiB uploads over the SAME tunnel connection!
+    for &id in &dl_ids {
+        let rst_hdr = FrameHeader {
+            length: 16,
+            frame_type: FrameType::Rst,
+            flags: 0,
+            stream_id: id,
+            sequence: 0,
+        };
+        wire_help::write_frame(&mut stream, &rst_hdr, &[0u8; 16]);
+        let _ = sess.mux.close(id);
+    }
+
+    let mut ul_ids = Vec::new();
+    let chunk = vec![0xA7u8; 16_000];
+    for _ in 0..4 {
+        let id = sess.mux.open_tcp("127.0.0.1", ul_port).expect("open ul");
+        let open = sess
+            .mux
+            .seal_open_tcp(sess.keys.tx_key(), id, 128)
+            .expect("seal open ul");
+        wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+        for _ in 0..8 {
+            let d = sess
+                .mux
+                .seal_data(sess.keys.tx_key(), id, &chunk, 128)
+                .expect("seal ul chunk");
+            wire_help::write_frame(&mut stream, &d.header, &d.ciphertext);
+        }
+        let fin = sess
+            .mux
+            .seal_data(sess.keys.tx_key(), id, &[], 128)
+            .expect("seal ul fin");
+        wire_help::write_frame(&mut stream, &fin.header, &fin.ciphertext);
+        ul_ids.push(id);
+    }
+
+    // 3. Collect all 4 upload byte-count responses promptly!
+    let mut completed_uploads: HashMap<u16, Vec<u8>> = HashMap::new();
+    let mut done_count = 0usize;
+    while done_count < 4 {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        if h.frame_type == FrameType::Data && ul_ids.contains(&h.stream_id) {
+            let pt = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("open ul reply");
+            if pt.is_empty() {
+                done_count += 1;
+            } else {
+                completed_uploads
+                    .entry(h.stream_id)
+                    .or_default()
+                    .extend_from_slice(&pt);
+            }
+        }
+    }
+
+    for &id in &ul_ids {
+        let reply = completed_uploads.get(&id).expect("upload reply present");
+        let echoed = usize::from_be_bytes(reply.as_slice().try_into().expect("usize bytes"));
+        assert_eq!(echoed, 8 * 16_000, "upload stream {id} delivered 100% intact");
+    }
+
+    stop_dl.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(stream);
+    let _ = ul_srv.join();
+    let _ = dl_srv.join();
+    server.join().expect("server thread");
+}

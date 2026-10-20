@@ -13,7 +13,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{mpsc, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use std::time::{Duration, Instant};
 
 use aetherlink_core::{session, tls};
@@ -122,6 +125,56 @@ const WORKER_IDLE_POLL: Duration = Duration::from_millis(1);
 /// applying channel backpressure to `inbox`.
 const WORKER_WRITE_BATCH: usize = 256 * 1024;
 
+/// Bounded downstream TCP reply queue (`64 * 64 KiB = 4 MiB` across active
+/// streams) so multi-Gbps datacenter upstream servers apply clean TCP receive
+/// backpressure instead of buffering hundreds of megabytes of ahead-of-WAN
+/// download data in user-space RAM.
+const STREAM_REPLY_QUEUE: usize = 64;
+
+/// Downstream bytes encrypted per `drain_completions` slice before doing a
+/// non-blocking poll of `stream.sock` for inbound client frames (`OpenTcp`,
+/// `Data`, `Rst`, `OpenUdp`), preventing fast downloads from ever starving
+/// concurrent uploads or stream `RST` aborts while keeping 0ms download pause.
+const DRAIN_BYTES_QUANTUM: usize = 128 * 1024;
+
+/// Active TCP stream worker handle stored in `workers`. Dropping the handle
+/// (on `FrameType::Rst`, stream recycling, stall cleanup, or session exit)
+/// immediately signals `aborted = true` so the worker aborts its upstream
+/// socket (`SO_LINGER = 0` `TCP RST`) and exits without waiting on queue drain.
+struct WorkerHandle {
+    tx: mpsc::SyncSender<WorkerMsg>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.aborted.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+fn abort_tcp_socket(sock: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    unsafe {
+        let _ = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&raw const linger).cast(),
+            std::mem::size_of_val(&linger) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn abort_tcp_socket(sock: &TcpStream) {
+    let _ = sock.shutdown(std::net::Shutdown::Both);
+}
+
 /// Outcome of pushing one message toward a worker with a bounded wait
 /// (std has no send_timeout on SyncSender; this is its manual equivalent).
 enum SendHoldFail {
@@ -142,7 +195,7 @@ fn send_hold(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     routes: &mut HashMap<u16, SocketAddr>,
-    workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
+    workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
 ) -> Result<(), SendHoldFail> {
     let start = Instant::now();
@@ -178,17 +231,42 @@ struct StreamReply {
     result: Result<Vec<u8>, relay::DialFail>,
 }
 
+fn send_reply_bounded(
+    out: &mpsc::SyncSender<StreamReply>,
+    aborted: &AtomicBool,
+    mut reply: StreamReply,
+) -> bool {
+    loop {
+        if aborted.load(Ordering::Relaxed) {
+            return false;
+        }
+        match out.try_send(reply) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(r)) => {
+                reply = r;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 fn worker_fail(
-    out: &mpsc::Sender<StreamReply>,
+    out: &mpsc::SyncSender<StreamReply>,
+    aborted: &AtomicBool,
     id: u16,
     target: (String, u16),
     kind: relay::DialFail,
 ) {
-    let _ = out.send(StreamReply {
-        id,
-        target,
-        result: Err(kind),
-    });
+    let _ = send_reply_bounded(
+        out,
+        aborted,
+        StreamReply {
+            id,
+            target,
+            result: Err(kind),
+        },
+    );
 }
 
 /// One relay hop for a stream worker: bytes to write, or the peer's
@@ -210,7 +288,8 @@ fn stream_worker(
     port: u16,
     first: Vec<u8>,
     inbox: mpsc::Receiver<WorkerMsg>,
-    out: mpsc::Sender<StreamReply>,
+    out: mpsc::SyncSender<StreamReply>,
+    aborted: Arc<AtomicBool>,
 ) {
     use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
     use std::net::Shutdown;
@@ -222,13 +301,13 @@ fn stream_worker(
                 "tunnel: id={id} dial {}:{} failed {kind:?}",
                 target.0, target.1
             ));
-            worker_fail(&out, id, target, kind);
+            worker_fail(&out, &aborted, id, target, kind);
             return;
         }
     };
     let _ = sock.set_nodelay(true);
     if sock.set_nonblocking(true).is_err() {
-        worker_fail(&out, id, target, relay::DialFail::Transient);
+        worker_fail(&out, &aborted, id, target, relay::DialFail::Transient);
         return;
     }
     let mut write_buf = first;
@@ -238,6 +317,10 @@ fn stream_worker(
     let mut session_gone = false;
     let mut buf = vec![0u8; 65535];
     loop {
+        if aborted.load(Ordering::Relaxed) {
+            abort_tcp_socket(&sock);
+            return;
+        }
         while write_buf.len().saturating_sub(write_pos) < WORKER_WRITE_BATCH {
             match inbox.try_recv() {
                 Ok(WorkerMsg::Data(payload)) => {
@@ -255,7 +338,8 @@ fn stream_worker(
                 }
             }
         }
-        if session_gone {
+        if session_gone || aborted.load(Ordering::Relaxed) {
+            abort_tcp_socket(&sock);
             return;
         }
 
@@ -264,7 +348,7 @@ fn stream_worker(
             match sock.write(&write_buf[write_pos..]) {
                 Ok(0) => {
                     debug_log(&format!("tunnel: id={id} write returned 0"));
-                    worker_fail(&out, id, target, relay::DialFail::Transient);
+                    worker_fail(&out, &aborted, id, target, relay::DialFail::Transient);
                     return;
                 }
                 Ok(n) => {
@@ -275,7 +359,7 @@ fn stream_worker(
                 Err(e) if e.kind() == WouldBlock || e.kind() == TimedOut => break,
                 Err(_) => {
                     debug_log(&format!("tunnel: id={id} write failed"));
-                    worker_fail(&out, id, target, relay::DialFail::Transient);
+                    worker_fail(&out, &aborted, id, target, relay::DialFail::Transient);
                     return;
                 }
             }
@@ -295,7 +379,7 @@ fn stream_worker(
             // entered the socket: signal EOF so the target can respond.
             if sock.shutdown(Shutdown::Write).is_err() {
                 debug_log(&format!("tunnel: id={id} shutdown(write) failed"));
-                worker_fail(&out, id, target, relay::DialFail::Transient);
+                worker_fail(&out, &aborted, id, target, relay::DialFail::Transient);
                 return;
             }
             half_closed = true;
@@ -303,14 +387,22 @@ fn stream_worker(
         }
 
         for _ in 0..16 {
+            if aborted.load(Ordering::Relaxed) {
+                abort_tcp_socket(&sock);
+                return;
+            }
             match sock.read(&mut buf) {
                 Ok(0) => {
                     debug_log(&format!("tunnel: id={id} relay eof"));
-                    let _ = out.send(StreamReply {
-                        id,
-                        target,
-                        result: Ok(Vec::new()),
-                    });
+                    let _ = send_reply_bounded(
+                        &out,
+                        &aborted,
+                        StreamReply {
+                            id,
+                            target,
+                            result: Ok(Vec::new()),
+                        },
+                    );
                     return;
                 }
                 Ok(n) => {
@@ -320,7 +412,8 @@ fn stream_worker(
                         target: target.clone(),
                         result: Ok(buf[..n].to_vec()),
                     };
-                    if out.send(reply).is_err() {
+                    if !send_reply_bounded(&out, &aborted, reply) {
+                        abort_tcp_socket(&sock);
                         return;
                     }
                 }
@@ -328,7 +421,7 @@ fn stream_worker(
                 Err(e) if e.kind() == WouldBlock || e.kind() == TimedOut => break,
                 Err(_) => {
                     debug_log(&format!("tunnel: id={id} relay read error"));
-                    worker_fail(&out, id, target, relay::DialFail::Transient);
+                    worker_fail(&out, &aborted, id, target, relay::DialFail::Transient);
                     return;
                 }
             }
@@ -345,7 +438,10 @@ fn stream_worker(
                     half_close_pending = true;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    abort_tcp_socket(&sock);
+                    return;
+                }
             }
         }
     }
@@ -372,9 +468,9 @@ fn forward_tcp(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     routes: &mut HashMap<u16, SocketAddr>,
-    workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
+    workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
-    stream_tx: &mpsc::Sender<StreamReply>,
+    stream_tx: &mpsc::SyncSender<StreamReply>,
     id: u16,
     target: (String, u16),
     pt: Vec<u8>,
@@ -386,7 +482,7 @@ fn forward_tcp(
         ));
         return ForwardOutcome::CloseStream;
     }
-    if let Some(tx) = workers.get(&id).cloned() {
+    if let Some(tx) = workers.get(&id).map(|h| h.tx.clone()) {
         let msg = if pt.is_empty() {
             WorkerMsg::HalfClose
         } else {
@@ -428,6 +524,8 @@ fn forward_tcp(
         return ForwardOutcome::CloseStream;
     }
     let (tx, rx) = mpsc::sync_channel(WORKER_QUEUE);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let aborted_worker = Arc::clone(&aborted);
     let out = stream_tx.clone();
     let (tip, tport) = target;
     match std::thread::Builder::new()
@@ -435,12 +533,12 @@ fn forward_tcp(
         .stack_size(WORKER_STACK)
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                stream_worker(id, tip, tport, pt, rx, out);
+                stream_worker(id, tip, tport, pt, rx, out, aborted_worker);
             }));
         })
     {
         Ok(_) => {
-            workers.insert(id, tx);
+            workers.insert(id, WorkerHandle { tx, aborted });
             ForwardOutcome::Delivered
         }
         Err(e) => {
@@ -521,7 +619,8 @@ fn close_stream(
     }
 }
 
-/// Seal + write one stream-worker reply; false ends the session.
+/// Seal + write one stream-worker reply; returns `Some(wire_bytes)` on success
+/// or `None` when the outer TLS socket failed (ending the session).
 /// Empty reply = target closed cleanly: forget the worker, close the stream.
 /// Error = relay died: forget the worker, close the stream, cool the target
 /// down when the refusal was definitive.
@@ -530,25 +629,30 @@ fn handle_stream_reply(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     routes: &mut HashMap<u16, SocketAddr>,
-    workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
+    workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
     r: StreamReply,
-) -> bool {
+) -> Option<usize> {
     match r.result {
         Ok(bytes) => {
             if bytes.is_empty() {
                 workers.remove(&r.id);
-                close_stream(sess, stream, routes, r.id)
+                close_stream(sess, stream, routes, r.id).then_some(0)
             } else {
                 dead.remove(&r.target);
+                let counted = if sess.mux.is_open(r.id) {
+                    bytes.len()
+                } else {
+                    0
+                };
                 match send_data(sess, stream, r.id, &bytes) {
-                    Ok(()) => true,
+                    Ok(()) => Some(counted),
                     Err(e) => {
                         debug_log(&format!(
                             "tunnel: data id={} reply write failed ({e}), closing",
                             r.id
                         ));
-                        false
+                        None
                     }
                 }
             }
@@ -567,12 +671,61 @@ fn handle_stream_reply(
                     r.id
                 ));
             }
-            close_stream(sess, stream, routes, r.id)
+            close_stream(sess, stream, routes, r.id).then_some(0)
         }
     }
 }
 
+/// Non-blockingly poll whether the client sent any TLS bytes while the server
+/// is streaming downstream replies:
+/// - `Ok(true)`: decrypted plaintext is already buffered in `stream.conn`, OR
+///   at least one new TLS byte / EOF arrived on `stream.sock` (left decrypted
+///   inside `stream.conn` for `tunnel_loop`'s next `read_tls_step`).
+/// - `Ok(false)`: `WouldBlock` — zero client bytes waiting, so downstream
+///   streaming can continue immediately without incurring `READ_TIMEOUT`.
+fn poll_client_inbound(stream: &mut tls::ServerTlsStream) -> std::io::Result<bool> {
+    if stream
+        .conn
+        .process_new_packets()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        .plaintext_bytes_to_read()
+        > 0
+    {
+        return Ok(true);
+    }
+    if stream.get_ref().set_nonblocking(true).is_err() {
+        return Ok(false);
+    }
+    let res = loop {
+        match stream.conn.read_tls(&mut stream.sock) {
+            Ok(0) => break Ok(true),
+            Ok(_) => {
+                stream
+                    .conn
+                    .process_new_packets()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                break Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break Ok(false);
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = stream.get_ref().set_nonblocking(false);
+    res
+}
+
 /// Drain pool (UDP) + stream (TCP) completions; false ends the session.
+///
+/// Interleaves non-blocking client socket checks every `DRAIN_BYTES_QUANTUM`
+/// so multi-Gbps datacenter downloads NEVER starve client `FrameType::Rst`
+/// aborts or concurrent `OpenTcp`/`Data` upload streams while maintaining
+/// continuous zero-pause download throughput when the client is silent.
 #[allow(clippy::too_many_arguments)]
 fn drain_completions(
     pool: &RelayPool<FlowKey, Result<RelayOut, ()>>,
@@ -580,7 +733,7 @@ fn drain_completions(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
     routes: &mut HashMap<u16, SocketAddr>,
-    workers: &mut HashMap<u16, mpsc::SyncSender<WorkerMsg>>,
+    workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
 ) -> bool {
     while let Some(c) = pool.try_recv() {
@@ -588,9 +741,24 @@ fn drain_completions(
             return false;
         }
     }
+    let mut drained_bytes: usize = 0;
     while let Ok(r) = stream_rx.try_recv() {
-        if !handle_stream_reply(sess, stream, routes, workers, dead, r) {
-            return false;
+        match handle_stream_reply(sess, stream, routes, workers, dead, r) {
+            Some(written) => drained_bytes += written,
+            None => return false,
+        }
+        if drained_bytes >= DRAIN_BYTES_QUANTUM {
+            drained_bytes = 0;
+            match poll_client_inbound(stream) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) => {
+                    debug_log(&format!(
+                        "tunnel: client socket poll failed during drain ({e}), closing"
+                    ));
+                    return false;
+                }
+            }
         }
     }
     true
@@ -754,8 +922,8 @@ fn tunnel_loop(
     routes: &mut HashMap<u16, SocketAddr>,
 ) -> String {
     // Live TCP stream workers (one thread+dial per stream, full duplex).
-    let mut workers: HashMap<u16, mpsc::SyncSender<WorkerMsg>> = HashMap::new();
-    let (stream_tx, stream_rx) = mpsc::channel::<StreamReply>();
+    let mut workers: HashMap<u16, WorkerHandle> = HashMap::new();
+    let (stream_tx, stream_rx) = mpsc::sync_channel::<StreamReply>(STREAM_REPLY_QUEUE);
     // Targets whose dial recently failed: fail fast for the cooldown
     // instead of spawning another doomed worker.
     let mut dead: HashMap<(String, u16), Instant> = HashMap::new();
