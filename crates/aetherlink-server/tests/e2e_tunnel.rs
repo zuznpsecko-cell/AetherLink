@@ -1497,3 +1497,124 @@ fn closed_stream_ignores_trailing_frames_without_redial() {
     drop(stream);
     server.join().expect("server thread");
 }
+
+#[test]
+fn dribbled_frame_header_still_processed() {
+    let echo = tcp_echo();
+    let mut routes = HashMap::new();
+    routes.insert(1u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let nonce = [0xF1u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let s1 = sess.mux.open_tcp("127.0.0.1", echo).expect("open");
+    let sealed_open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), s1, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+
+    // Split the 24-byte FrameHeader across two separate TLS records separated
+    // by 200ms (4x past the server's 50ms READ_TIMEOUT).
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s1, b"split-header", 128)
+        .expect("seal");
+    let mut hb = bytes::BytesMut::new();
+    sealed.header.encode(&mut hb);
+    stream.write_all(&hb[..7]).expect("header part 1");
+    stream.flush().expect("flush part 1");
+    std::thread::sleep(Duration::from_millis(200));
+    stream.write_all(&hb[7..]).expect("header part 2");
+    stream.write_all(&sealed.ciphertext).expect("body");
+    stream.flush().expect("flush part 2");
+
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.frame_type, FrameType::Data);
+    let back = sess
+        .mux
+        .open_data(sess.keys.rx_key(), &h, &c)
+        .expect("open echo");
+    assert_eq!(back, b"split-header");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn zero_and_padded_ping_keep_tunnel_alive() {
+    let echo = tcp_echo();
+    let mut routes = HashMap::new();
+    routes.insert(1u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let nonce = [0xF2u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    // 1. Zero-length Ping must NOT be treated as EOF (`read(&mut []) -> Ok(0)`).
+    let ping0 = FrameHeader {
+        length: 0,
+        frame_type: FrameType::Ping,
+        flags: 0,
+        stream_id: 0,
+        sequence: 0,
+    };
+    wire_help::write_frame(&mut stream, &ping0, &[]);
+
+    // 2. 16-byte padded Ping (sent by non-blocking TLS keepalive) also succeeds.
+    let ping16 = FrameHeader {
+        length: 16,
+        frame_type: FrameType::Ping,
+        flags: 0,
+        stream_id: 0,
+        sequence: 0,
+    };
+    wire_help::write_frame(&mut stream, &ping16, &[0u8; 16]);
+
+    // 3. Subsequent stream open + data still succeeds on the same tunnel session.
+    let s1 = sess.mux.open_tcp("127.0.0.1", echo).expect("open");
+    let sealed_open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), s1, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed_open.header, &sealed_open.ciphertext);
+    let sealed_data = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), s1, b"alive-after-pings", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed_data.header, &sealed_data.ciphertext);
+
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.frame_type, FrameType::Data);
+    assert_eq!(
+        sess.mux
+            .open_data(sess.keys.rx_key(), &h, &c)
+            .expect("open echo"),
+        b"alive-after-pings"
+    );
+    drop(stream);
+    server.join().expect("server thread");
+}

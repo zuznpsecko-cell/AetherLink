@@ -100,7 +100,11 @@ public partial class MainViewModel : ViewModelBase
         // user offline behind a green "Up".
         if (_tunnel.PumpDead && !_busy)
         {
-            LastError = "Tunnel lost: the link to the server died. Network restored; press Connect to retry.";
+            if (string.IsNullOrEmpty(LastError))
+            {
+                LastError = "Tunnel lost: the link to the server died. Network restored; press Connect to retry.";
+            }
+
             _ = TeardownAsync();
         }
     }

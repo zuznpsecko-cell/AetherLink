@@ -213,6 +213,26 @@ internal sealed class TunnelService : IDisposable
         }
     }
 
+    private static string? ReadPumpError(string statusJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(statusJson);
+            if (doc.RootElement.TryGetProperty("pump_error", out var p)
+                && p.ValueKind == JsonValueKind.String)
+            {
+                var s = p.GetString();
+                return string.IsNullOrWhiteSpace(s) ? null : s;
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private void StartPolling(nuint handle)
     {
         StopPolling();
@@ -238,9 +258,15 @@ internal sealed class TunnelService : IDisposable
                         if (ReadPumpAlive(json) == false)
                         {
                             // Stop polling: the UI takes it from here (teardown).
+                            var reason = ReadPumpError(json);
                             PumpDead = true;
+                            LastError = reason is null
+                                ? "Tunnel lost: the link to the server died. Network restored; press Connect to retry."
+                                : $"Tunnel lost ({reason}). Network restored; press Connect to retry.";
                             StatusText = "Lost";
-                            GuiLog.Error("tunnel lost: pump stopped (link to server died)");
+                            GuiLog.Error(reason is null
+                                ? "tunnel lost: pump stopped (link to server died)"
+                                : $"tunnel lost: pump stopped ({reason})");
                             Changed?.Invoke();
                             break;
                         }
