@@ -257,10 +257,12 @@ pub fn connect_with_timeout(
     // Resolve once, then race each address against the connect deadline:
     // plain TcpStream::connect has no timeout and would hold the FFI lock
     // for the OS SYN-retry budget (~2min on Windows) on a black-holed peer.
-    let addrs: Vec<SocketAddr> = (host, port)
+    let mut addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| ClientError::PlatformError(format!("resolve {host}: {e}")))?
         .collect();
+    // Prefer IPv4 first to match `up()`'s pinned route selection.
+    addrs.sort_by_key(|a| !a.is_ipv4());
     let mut last_err = "no server address".to_string();
     let mut sock = None;
     for addr in &addrs {

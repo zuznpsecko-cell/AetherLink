@@ -44,10 +44,11 @@ const TLS_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Soft upper bound on frames held in the client TLS outbox at once so `DataPump`
 /// backpressure (`in_flight` / advertised TCP window) paces local sockets smoothly.
 const TLS_OUTBOX_MAX: usize = 512;
-/// Maximum mux frames coalesced into a single `rustls::Writer` batch (~2 full
-/// 16 KiB TLS 1.3 records per `write_tls` burst).
+/// Maximum mux bytes coalesced into a single `rustls::Writer` batch so normal
+/// MTU frames pack cleanly into one 16 KiB TLS 1.3 record without splitting
+/// a 24-byte `FrameHeader` across two TLS records.
 const TLS_BATCH_FRAMES: usize = 32;
-const TLS_BATCH_BYTES: usize = 32 * 1024;
+const TLS_BATCH_BYTES: usize = 16 * 1024;
 /// Periodic mux `PING` interval when no upload frames have been sent recently.
 const TLS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -60,10 +61,10 @@ pub fn write_sealed<W: Write>(
     header: &FrameHeader,
     ciphertext: &[u8],
 ) -> std::io::Result<()> {
-    let mut hb = BytesMut::new();
+    let mut hb = BytesMut::with_capacity(FRAME_HEADER_SIZE + ciphertext.len());
     header.encode(&mut hb);
+    hb.extend_from_slice(ciphertext);
     w.write_all(&hb)?;
-    w.write_all(ciphertext)?;
     w.flush()
 }
 
@@ -74,7 +75,29 @@ pub fn write_sealed<W: Write>(
 pub fn read_sealed<R: Read>(r: &mut R) -> std::io::Result<(FrameHeader, Vec<u8>)> {
     use std::io::{Error, ErrorKind};
     let mut hb = [0u8; FRAME_HEADER_SIZE];
-    r.read_exact(&mut hb)?;
+    let hdr_start = std::time::Instant::now();
+    let mut hb_filled = 0usize;
+    while hb_filled < FRAME_HEADER_SIZE {
+        match r.read(&mut hb[hb_filled..]) {
+            Ok(0) => {
+                if hb_filled == 0 {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "header eof"));
+                }
+                return Err(Error::new(ErrorKind::UnexpectedEof, "truncated header"));
+            }
+            Ok(n) => hb_filled += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => {
+                if hb_filled == 0 {
+                    return Err(e);
+                }
+                if hdr_start.elapsed() > BODY_TOTAL_TIMEOUT {
+                    return Err(Error::new(ErrorKind::TimedOut, "header stall"));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let mut hbuf = BytesMut::from(&hb[..]);
     let header = FrameHeader::decode(&mut hbuf)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("bad frame header: {e}")))?;
@@ -116,6 +139,8 @@ pub struct PumpHandle {
     /// Second handle to the wire socket, used only to unblock the threads
     /// on `stop()` (a blocked read/write cannot see the stop flag).
     sock: Option<TcpStream>,
+    /// Non-secret diagnostic recorded when a pump thread exits on its own.
+    exit_reason: Arc<Mutex<Option<String>>>,
 }
 
 impl PumpHandle {
@@ -140,6 +165,12 @@ impl PumpHandle {
     #[must_use]
     pub fn is_alive(&self) -> bool {
         !self.threads.is_empty() && self.threads.iter().all(|h| !h.is_finished())
+    }
+
+    /// Non-secret diagnostic explaining why the pump exited, if known.
+    #[must_use]
+    pub fn exit_reason(&self) -> Option<String> {
+        self.exit_reason.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -287,6 +318,7 @@ where
         stop,
         threads: vec![tun_thread, wire_thread],
         sock: Some(shutdown_side),
+        exit_reason: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -348,21 +380,43 @@ where
 
     let ConnectedTunnel { mut stream, sess } = tunnel;
     let _ = stream.sock.set_nodelay(true);
+    let _ = stream.sock.set_read_timeout(None);
+    let _ = stream.sock.set_write_timeout(None);
     let shutdown_side = stream.sock.try_clone()?;
     stream.sock.set_nonblocking(true)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_loop = Arc::clone(&stop);
+    let exit_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let exit_loop = Arc::clone(&exit_reason);
     aetherlink_netstack::debug_log("pump: tls nonblocking thread spawned");
     let thread = std::thread::spawn(move || {
+        let record_exit = |reason: String| {
+            aetherlink_netstack::debug_log(&format!("pump: tls exit: {reason}"));
+            if let Ok(mut g) = exit_loop.lock() {
+                if g.is_none() {
+                    *g = Some(reason);
+                }
+            }
+        };
+
         let mut pump = DataPump::with_mux(sess.mux, *sess.keys.tx_key(), *sess.keys.rx_key(), pad);
         let mut outbox: VecDeque<SealedFrame> = VecDeque::with_capacity(TLS_OUTBOX_MAX);
         let mut tx_buf = BytesMut::with_capacity(TLS_BATCH_BYTES + 2048);
         let mut rx_buf = BytesMut::with_capacity(65536);
-        let mut plain_buf = [0u8; 32768];
         let mut write_stalled_since: Option<Instant> = None;
         let mut rx_partial_since: Option<Instant> = None;
         let mut last_tx = Instant::now();
+
+        // Drain any post-handshake plaintext bytes buffered alongside ServerAuthOk.
+        if let Ok(state) = stream.conn.process_new_packets() {
+            let avail = state.plaintext_bytes_to_read();
+            if avail > 0 {
+                let start = rx_buf.len();
+                rx_buf.resize(start + avail, 0);
+                let _ = stream.conn.reader().read_exact(&mut rx_buf[start..]);
+            }
+        }
 
         loop {
             if stop_loop.load(Ordering::SeqCst) {
@@ -378,9 +432,7 @@ where
                     }
                 }
                 Err(e) => {
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tls write failed ({e}), thread ends"
-                    ));
+                    record_exit(format!("tls socket write failed: {e}"));
                     break;
                 }
             }
@@ -408,7 +460,7 @@ where
                         }
                     },
                     Err(_) => {
-                        aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
+                        record_exit("tun mutex poisoned".to_string());
                         break;
                     }
                 }
@@ -423,7 +475,14 @@ where
                 }
                 tx_buf.clear();
                 let mut batch = 0usize;
-                while batch < TLS_BATCH_FRAMES && tx_buf.len() < TLS_BATCH_BYTES {
+                while batch < TLS_BATCH_FRAMES {
+                    let Some(front) = outbox.front() else {
+                        break;
+                    };
+                    let wire_len = FRAME_HEADER_SIZE + front.ciphertext.len();
+                    if batch > 0 && tx_buf.len() + wire_len > TLS_BATCH_BYTES {
+                        break;
+                    }
                     let Some(f) = outbox.pop_front() else {
                         break;
                     };
@@ -435,9 +494,7 @@ where
                     break;
                 }
                 if let Err(e) = stream.conn.writer().write_all(&tx_buf) {
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tls writer failed ({e}), thread ends"
-                    ));
+                    record_exit(format!("tls plaintext writer failed: {e}"));
                     return;
                 }
                 last_tx = Instant::now();
@@ -450,59 +507,75 @@ where
                         pump.flush_acks(&mut *guard);
                     }
                     Err(_) => {
-                        aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
+                        record_exit("tun mutex poisoned".to_string());
                         return;
                     }
                 }
                 if let Err(e) = write_res {
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tls write failed ({e}), thread ends"
-                    ));
+                    record_exit(format!("tls socket write failed: {e}"));
                     return;
                 }
             }
 
             // 4. Periodic idle keepalive so NATs and middleboxes keep state warm.
+            //    Includes a 16-byte zero body so older servers that read non-empty
+            //    frame bodies directly do not misread `read(&mut []) -> Ok(0)` as EOF.
             if !stream.conn.wants_write()
                 && outbox.is_empty()
                 && last_tx.elapsed() >= TLS_KEEPALIVE_INTERVAL
             {
                 tx_buf.clear();
                 FrameHeader {
-                    length: 0,
+                    length: 16,
                     frame_type: FrameType::Ping,
                     flags: 0,
                     stream_id: 0,
                     sequence: 0,
                 }
                 .encode(&mut tx_buf);
+                tx_buf.extend_from_slice(&[0u8; 16]);
                 let _ = stream.conn.writer().write_all(&tx_buf);
                 last_tx = Instant::now();
                 if let Err(e) = flush_tls_writes(&mut stream, &mut write_stalled_since) {
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tls keepalive write failed ({e}), thread ends"
-                    ));
+                    record_exit(format!("tls keepalive write failed: {e}"));
                     break;
                 }
             }
 
-            // 5. Non-blocking read of all available TLS records + buffered plaintext.
-            let mut peer_eof = false;
+            // 5. Non-blocking read of available TLS records + exact buffered plaintext.
+            //    `process_new_packets()` + `read_exact` MUST run inside every `Ok(_)`
+            //    iteration so `rustls`'s ~16.6 KB `DeframerVecBuffer` never fills up
+            //    during a multi-record burst (which otherwise causes `read_tls` to pass
+            //    `&mut []` to `TcpStream::read` and get a false `Ok(0)` EOF!).
+            let mut peer_eof: Option<String> = None;
             for _ in 0..32 {
                 match stream.conn.read_tls(&mut stream.sock) {
                     Ok(0) => {
-                        peer_eof = true;
+                        peer_eof = Some("server closed TLS connection (EOF)".to_string());
                         break;
                     }
                     Ok(_) => {
                         progressed = true;
                         rx_partial_since = None;
-                        if let Err(e) = stream.conn.process_new_packets() {
-                            aetherlink_netstack::debug_log(&format!(
-                                "pump: tls protocol error ({e}), thread ends"
-                            ));
-                            peer_eof = true;
-                            break;
+                        match stream.conn.process_new_packets() {
+                            Ok(state) => {
+                                let avail = state.plaintext_bytes_to_read();
+                                if avail > 0 {
+                                    let start = rx_buf.len();
+                                    rx_buf.resize(start + avail, 0);
+                                    if let Err(e) =
+                                        stream.conn.reader().read_exact(&mut rx_buf[start..])
+                                    {
+                                        peer_eof =
+                                            Some(format!("tls plaintext read failed: {e}"));
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                peer_eof = Some(format!("tls protocol error: {e}"));
+                                break;
+                            }
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -512,29 +585,7 @@ where
                         break;
                     }
                     Err(e) => {
-                        aetherlink_netstack::debug_log(&format!(
-                            "pump: tls read failed ({e}), ends"
-                        ));
-                        peer_eof = true;
-                        break;
-                    }
-                }
-            }
-
-            loop {
-                match stream.conn.reader().read(&mut plain_buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        progressed = true;
-                        rx_buf.extend_from_slice(&plain_buf[..n]);
-                    }
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        aetherlink_netstack::debug_log(&format!(
-                            "pump: tls plaintext read failed ({e}), ends"
-                        ));
-                        peer_eof = true;
+                        peer_eof = Some(format!("tls socket read failed: {e}"));
                         break;
                     }
                 }
@@ -542,33 +593,25 @@ where
 
             // 6. Decode all complete mux frames from `rx_buf` and inject them.
             let mut decoded: Vec<(FrameHeader, BytesMut)> = Vec::new();
-            let mut fatal = false;
+            let mut fatal: Option<String> = None;
             while rx_buf.len() >= FRAME_HEADER_SIZE {
                 let mut hdr_slice = BytesMut::from(&rx_buf[..FRAME_HEADER_SIZE]);
                 let header = match FrameHeader::decode(&mut hdr_slice) {
                     Ok(h) => h,
                     Err(e) => {
-                        aetherlink_netstack::debug_log(&format!(
-                            "pump: tls bad frame header ({e}), ends"
-                        ));
-                        fatal = true;
+                        fatal = Some(format!("bad frame header from server: {e}"));
                         break;
                     }
                 };
                 if header.length as usize > MAX_WIRE_BODY {
-                    aetherlink_netstack::debug_log(&format!(
-                        "pump: tls absurd frame length {}, ends",
-                        header.length
-                    ));
-                    fatal = true;
+                    fatal = Some(format!("absurd frame length {}", header.length));
                     break;
                 }
                 let total = FRAME_HEADER_SIZE + header.length as usize;
                 if rx_buf.len() < total {
                     let since = *rx_partial_since.get_or_insert_with(Instant::now);
                     if since.elapsed() > BODY_TOTAL_TIMEOUT {
-                        aetherlink_netstack::debug_log("pump: tls body stalled, ends");
-                        fatal = true;
+                        fatal = Some("frame body stalled past 30s".to_string());
                     }
                     break;
                 }
@@ -578,7 +621,8 @@ where
                 decoded.push((header, ct));
             }
 
-            if fatal {
+            if let Some(reason) = fatal {
+                record_exit(reason);
                 break;
             }
 
@@ -598,13 +642,15 @@ where
                     pump.flush_acks(&mut *guard);
                 }
                 Err(_) => {
-                    aetherlink_netstack::debug_log("pump: tls lock failed, thread ends");
+                    record_exit("tun mutex poisoned".to_string());
                     break;
                 }
             }
 
-            if peer_eof {
-                aetherlink_netstack::debug_log("pump: tls peer closed stream");
+            if let Some(reason) = peer_eof {
+                if !stop_loop.load(Ordering::SeqCst) {
+                    record_exit(reason);
+                }
                 break;
             }
 
@@ -618,6 +664,7 @@ where
         stop,
         threads: vec![thread],
         sock: Some(shutdown_side),
+        exit_reason,
     })
 }
 

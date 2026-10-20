@@ -215,9 +215,11 @@ impl Client {
     /// (wire or TUN thread ended). Routes and DNS still point into the TUN
     /// in that state, so the host must tear it down rather than show "Up".
     pub fn status(&self) -> Result<String> {
+        let pump_error = self.pump.as_ref().and_then(|p| p.exit_reason());
         serde_json::to_string(&serde_json::json!({
             "up": self.up,
             "pump_alive": self.pump.as_ref().is_some_and(|p| p.is_alive()),
+            "pump_error": pump_error,
             "server": self.config.server_addr,
             "dns_mode": self.config.dns_mode,
         }))

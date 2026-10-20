@@ -305,9 +305,8 @@ impl Platform for RealPlatform {
         // registers newborn interfaces asynchronously: retry ~5s per step.
         let enable_args = windows::iface_admin_args(name, true)?;
         let metric_args = windows::iface_metric_args(name, windows::TUN_IFACE_METRIC)?;
-        let mtu_args = windows::subiface_mtu_args(name, mtu)?;
         let addr_args = windows::tun_addr_args(name, &addr.to_string(), 30)?;
-        for args in [&enable_args, &metric_args, &mtu_args, &addr_args] {
+        for args in [&enable_args, &metric_args, &addr_args] {
             let mut last_err = ClientError::PlatformError("tun bring-up: no attempts".to_string());
             let mut done = false;
             for _ in 0..10 {
@@ -326,6 +325,13 @@ impl Platform for RealPlatform {
                 return Err(ClientError::PlatformError(format!(
                     "tun {name}: {last_err}"
                 )));
+            }
+        }
+        // Best-effort clamp of Wintun's default 65535 MTU (TCP SYN-ACK MSS=1360
+        // already bounds TCP segments even on policies blocking `subinterface`).
+        if let Ok(mtu_args) = windows::subiface_mtu_args(name, mtu) {
+            if let Err(e) = run("netsh", &mtu_args) {
+                aetherlink_netstack::debug_log(&format!("tun_up: best-effort mtu skipped: {e}"));
             }
         }
         self.tun = Some(Arc::new(Mutex::new(iface)));

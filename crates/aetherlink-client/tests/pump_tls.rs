@@ -578,3 +578,177 @@ fn full_duplex_upload_and_download_burst_completes_intact() {
     let echoed_len = u64::from_be_bytes(rx_payload[..8].try_into().expect("8B"));
     assert_eq!(echoed_len, (128 * 1360) as u64);
 }
+
+#[test]
+fn multi_record_download_burst_does_not_false_eof() {
+    // Regression test: previously `spawn_pump_tls` called `read_tls` up to 32
+    // times before draining `reader()`, overflowing rustls's ~16.6 KB
+    // `DeframerVecBuffer` on record #5 so `TcpStream::read(&mut [])` returned
+    // `Ok(0)` and falsely killed the tunnel with `peer_eof = true`.
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        key.cert.der().to_vec(),
+    )];
+    let key_der = key.key_pair.serialize_der();
+    let server_cfg =
+        Arc::new(aetherlink_core::tls::server_config(chain, &key_der).expect("server cfg"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let cache = NonceCache::new();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let _ = sock.set_nodelay(true);
+        let mut stream = aetherlink_core::tls::accept_tls(sock, &server_cfg).expect("server tls");
+        let mut sess = aetherlink_core::session::handshake_server(&mut stream, PSK, &cache)
+            .expect("server hs");
+        let (open_h, open_c) = read_one(&mut stream);
+        let tcp = aetherlink_mux::manager::MuxManager::parse_open_tcp(
+            sess.keys.rx_key(),
+            &open_h,
+            &open_c,
+        )
+        .expect("open parses");
+        sess.mux
+            .register_inbound(tcp.id, &tcp.addr, tcp.port, false)
+            .expect("register");
+        let (req_h, req_c) = read_one(&mut stream);
+        let req = sess
+            .mux
+            .open_data(sess.keys.rx_key(), &req_h, &req_c)
+            .expect("req");
+        assert_eq!(req, b"GET /big\r\n\r\n");
+
+        // Blast 96 separate DATA frames (96 * 1400B = 134.4 KB across >96 TLS
+        // records) without pausing, then keep the TLS connection open until
+        // the client verifies `handle.is_alive()`!
+        let chunk = vec![0xA5u8; 1400];
+        for _ in 0..96 {
+            let sealed = sess
+                .mux
+                .seal_data(sess.keys.tx_key(), tcp.id, &chunk, PAD)
+                .expect("seal");
+            write_one(&mut stream, &sealed.header, &sealed.ciphertext);
+        }
+        let _ = done_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let tun = Arc::new(Mutex::new(FakeTun {
+        inbound: VecDeque::new(),
+        outbound: Vec::new(),
+    }));
+    let config = test_config(&format!("127.0.0.1:{port}"));
+    let mut handle = aetherlink_client::lifecycle::attach_pump(
+        Arc::clone(&tun),
+        &config,
+        Some(Arc::new(AcceptAll)),
+    )
+    .expect("attach");
+
+    // Local 3-way handshake + GET request
+    {
+        let mut guard = tun.lock().expect("lock");
+        guard.inbound.push_back(build_tcp_packet(
+            CLIENT_IP,
+            DST,
+            44001,
+            443,
+            true,
+            false,
+            false,
+            5_000_000,
+            0,
+            &[],
+        ));
+    }
+    let syn_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let iss = loop {
+        {
+            let guard = tun.lock().expect("lock");
+            if let Some(raw) = guard.outbound.first() {
+                let parsed =
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw).expect("ip");
+                let seg = parsed.tcp().expect("tcp");
+                if seg.syn && seg.ack {
+                    break seg.seq;
+                }
+            }
+        }
+        assert!(std::time::Instant::now() < syn_deadline, "no SYN-ACK");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    {
+        let mut guard = tun.lock().expect("lock");
+        guard.outbound.clear();
+        guard.inbound.push_back(build_tcp_packet(
+            CLIENT_IP,
+            DST,
+            44001,
+            443,
+            false,
+            true,
+            false,
+            5_000_001,
+            iss.wrapping_add(1),
+            &[],
+        ));
+        guard.inbound.push_back(build_tcp_packet(
+            CLIENT_IP,
+            DST,
+            44001,
+            443,
+            false,
+            true,
+            true,
+            5_000_001,
+            iss.wrapping_add(1),
+            b"GET /big\r\n\r\n",
+        ));
+    }
+
+    let expected = 96 * 1400;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut rx_bytes;
+    loop {
+        {
+            let guard = tun.lock().expect("lock");
+            rx_bytes = guard
+                .outbound
+                .iter()
+                .map(|raw| {
+                    aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
+                        .expect("valid ip")
+                        .tcp()
+                        .expect("tcp")
+                        .payload
+                        .len()
+                })
+                .sum();
+        }
+        if rx_bytes >= expected {
+            break;
+        }
+        assert!(
+            handle.is_alive(),
+            "pump died prematurely with {:?} after {rx_bytes}/{expected} bytes",
+            handle.exit_reason()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "download burst timed out at {rx_bytes}/{expected} bytes"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(rx_bytes, expected);
+    assert!(
+        handle.is_alive(),
+        "pump must still be alive after multi-record burst: {:?}",
+        handle.exit_reason()
+    );
+    assert!(handle.exit_reason().is_none());
+
+    let _ = done_tx.send(());
+    handle.stop();
+    server.join().expect("server thread");
+}

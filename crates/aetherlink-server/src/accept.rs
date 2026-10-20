@@ -673,32 +673,53 @@ fn tunnel_loop(
     // Best-effort: without a timeout an idle peer wedges completion
     // draining; failure keeps the old blocking behaviour.
     let _ = stream.get_mut().set_read_timeout(Some(READ_TIMEOUT));
+    let mut hb = [0u8; FRAME_HEADER_SIZE];
+    let mut hb_filled = 0usize;
+    let mut hb_since: Option<Instant> = None;
     loop {
-        let mut hb = [0u8; FRAME_HEADER_SIZE];
-        match stream.read_exact(&mut hb) {
-            Ok(()) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                if !drain_completions(
-                    &pool,
-                    &stream_rx,
-                    &mut sess,
-                    stream,
-                    routes,
-                    &mut workers,
-                    &mut dead,
-                ) {
-                    break;
+        while hb_filled < FRAME_HEADER_SIZE {
+            match stream.read(&mut hb[hb_filled..]) {
+                Ok(0) => {
+                    debug_log("tunnel: header eof, closing");
+                    return;
                 }
-                continue;
-            }
-            Err(_) => {
-                debug_log("tunnel: header eof, closing");
-                break; // EOF or transport error: fail closed.
+                Ok(n) => {
+                    hb_filled += n;
+                    if hb_filled < FRAME_HEADER_SIZE {
+                        hb_since.get_or_insert_with(Instant::now);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    if let Some(since) = hb_since {
+                        if since.elapsed() > BODY_TOTAL_TIMEOUT {
+                            debug_log("tunnel: header stall, closing");
+                            return;
+                        }
+                    }
+                    if !drain_completions(
+                        &pool,
+                        &stream_rx,
+                        &mut sess,
+                        stream,
+                        routes,
+                        &mut workers,
+                        &mut dead,
+                    ) {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    debug_log("tunnel: header read error, closing");
+                    return; // EOF or transport error: fail closed.
+                }
             }
         }
+        hb_filled = 0;
+        hb_since = None;
         let mut hbuf = BytesMut::from(&hb[..]);
         let header = match FrameHeader::decode(&mut hbuf) {
             Ok(h) => h,
@@ -715,6 +736,9 @@ fn tunnel_loop(
         let body_start = Instant::now();
         let mut filled = 0;
         let body_ok = loop {
+            if filled >= ct.len() {
+                break true;
+            }
             match stream.read(&mut ct[filled..]) {
                 Ok(0) => break false,
                 Ok(n) => {
@@ -1144,15 +1168,15 @@ fn send_data(
     send_chunked(sess, stream, id, payload, false)
 }
 
-/// Write one sealed frame; Err on transport failure.
+/// Write one sealed frame in a single TLS record write; Err on transport failure.
 fn write_sealed(
     stream: &mut tls::ServerTlsStream,
     header: &FrameHeader,
     ct: &[u8],
 ) -> std::io::Result<()> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + ct.len());
     header.encode(&mut buf);
+    buf.extend_from_slice(ct);
     stream.write_all(&buf)?;
-    stream.write_all(ct)?;
     stream.flush()
 }
