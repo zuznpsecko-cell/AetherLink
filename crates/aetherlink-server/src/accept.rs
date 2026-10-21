@@ -175,6 +175,60 @@ fn abort_tcp_socket(sock: &TcpStream) {
     let _ = sock.shutdown(std::net::Shutdown::Both);
 }
 
+thread_local! {
+    /// First precise reason a tunnel session failed on this thread (helpers
+    /// deep inside drain/close only return `bool`). Cleared per session.
+    static SESSION_END: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Remember why the session is about to end (first reason wins).
+fn note_end(why: String) {
+    SESSION_END.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.is_none() {
+            *c = Some(why);
+        }
+    });
+}
+
+thread_local! {
+    /// (client->target upload bytes, target->client download bytes) of the
+    /// current session, reported on disconnect so one journal line shows
+    /// whether a Speedtest upload ever reached the server.
+    static TRAFFIC: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn count_up(n: usize) {
+    TRAFFIC.with(|t| {
+        let (u, d) = t.get();
+        t.set((u.saturating_add(n as u64), d));
+    });
+}
+
+fn count_down(n: usize) {
+    TRAFFIC.with(|t| {
+        let (u, d) = t.get();
+        t.set((u, d.saturating_add(n as u64)));
+    });
+}
+
+fn mib(n: u64) -> String {
+    format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
+}
+
+fn take_end() -> Option<String> {
+    SESSION_END.with(|c| c.borrow_mut().take())
+}
+
+/// Return `prefix: <noted reason>` (or just `prefix`) for the journal.
+fn end_reason(prefix: &str) -> String {
+    match take_end() {
+        Some(why) => format!("{prefix}: {why}"),
+        None => prefix.to_string(),
+    }
+}
+
 /// Outcome of pushing one message toward a worker with a bounded wait
 /// (std has no send_timeout on SyncSender; this is its manual equivalent).
 enum SendHoldFail {
@@ -566,6 +620,7 @@ fn handle_completion(
                     debug_log(&format!(
                         "tunnel: datagram id={id} reply failed ({e}), closing"
                     ));
+                    note_end(format!("udp reply write to client failed: {e}"));
                     false
                 }
             }
@@ -612,6 +667,7 @@ fn close_stream(
                 debug_log(&format!(
                     "tunnel: close id={id} write failed ({e}), closing"
                 ));
+                note_end(format!("stream close write to client failed: {e}"));
                 false
             }
         },
@@ -646,12 +702,16 @@ fn handle_stream_reply(
                     0
                 };
                 match send_data(sess, stream, r.id, &bytes) {
-                    Ok(()) => Some(counted),
+                    Ok(()) => {
+                        count_down(counted);
+                        Some(counted)
+                    }
                     Err(e) => {
                         debug_log(&format!(
                             "tunnel: data id={} reply write failed ({e}), closing",
                             r.id
                         ));
+                        note_end(format!("tcp reply write to client failed: {e}"));
                         None
                     }
                 }
@@ -756,6 +816,7 @@ fn drain_completions(
                     debug_log(&format!(
                         "tunnel: client socket poll failed during drain ({e}), closing"
                     ));
+                    note_end(format!("client socket poll failed: {e}"));
                     return false;
                 }
             }
@@ -897,8 +958,15 @@ pub fn serve_connection(
         }
     };
     eprintln!("[aetherlink] tunnel connected ({peer})");
+    let started = Instant::now();
     let reason = tunnel_loop(&mut stream, sess, ctx, routes);
-    eprintln!("[aetherlink] tunnel disconnected ({peer}): {reason}");
+    let (up, down) = TRAFFIC.with(std::cell::Cell::get);
+    eprintln!(
+        "[aetherlink] tunnel disconnected ({peer}): {reason} [up {}, down {}, {}s]",
+        mib(up),
+        mib(down),
+        started.elapsed().as_secs()
+    );
     close_quietly(&mut stream);
     Path::Tunnel
 }
@@ -921,6 +989,8 @@ fn tunnel_loop(
     ctx: &ServerCtx,
     routes: &mut HashMap<u16, SocketAddr>,
 ) -> String {
+    let _ = take_end();
+    TRAFFIC.with(|t| t.set((0, 0)));
     // Live TCP stream workers (one thread+dial per stream, full duplex).
     let mut workers: HashMap<u16, WorkerHandle> = HashMap::new();
     let (stream_tx, stream_rx) = mpsc::sync_channel::<StreamReply>(STREAM_REPLY_QUEUE);
@@ -971,7 +1041,7 @@ fn tunnel_loop(
                         &mut workers,
                         &mut dead,
                     ) {
-                        return "reply write failed during idle drain".to_string();
+                        return end_reason("reply write failed during idle drain");
                     }
                 }
                 Err(e) => {
@@ -1031,7 +1101,7 @@ fn tunnel_loop(
                         &mut workers,
                         &mut dead,
                     ) {
-                        body_err = Some("reply write failed during body wait".to_string());
+                        body_err = Some(end_reason("reply write failed during body wait"));
                         break false;
                     }
                 }
@@ -1097,6 +1167,7 @@ fn tunnel_loop(
                         continue;
                     }
                 };
+                count_up(pt.len());
                 // TCP payload (possibly empty): forward to the stream
                 // worker, spawning (dialing) on first sight. Full duplex:
                 // writes and reads interleave with no pairing or tails.
@@ -1117,10 +1188,12 @@ fn tunnel_loop(
                     ForwardOutcome::Delivered => {}
                     ForwardOutcome::CloseStream => {
                         if !close_stream(&mut sess, stream, routes, id) {
-                            break;
+                            return end_reason("stream close failed after data frame");
                         }
                     }
-                    ForwardOutcome::SessionDead => break,
+                    ForwardOutcome::SessionDead => {
+                        return end_reason("reply write failed while forwarding upload");
+                    }
                 }
                 if !drain_completions(
                     &pool,
@@ -1131,7 +1204,7 @@ fn tunnel_loop(
                     &mut workers,
                     &mut dead,
                 ) {
-                    break;
+                    return end_reason("reply write failed after data frame");
                 }
             }
             FrameType::UdpDatagram => {
@@ -1212,7 +1285,7 @@ fn tunnel_loop(
                                         "tunnel: datagram id={} blocked-reply write failed ({e}), closing",
                                         header.stream_id
                                     ));
-                                    break;
+                                    return format!("blocked dns reply write failed: {e}");
                                 }
                             }
                             continue;
@@ -1249,7 +1322,7 @@ fn tunnel_loop(
                     &mut workers,
                     &mut dead,
                 ) {
-                    break;
+                    return end_reason("reply write failed after udp datagram");
                 }
             }
             FrameType::Ping => {
@@ -1258,12 +1331,12 @@ fn tunnel_loop(
             }
             FrameType::GoAway => {
                 debug_log("tunnel: goaway, closing");
-                break;
+                return "client sent goaway".to_string();
             }
             FrameType::Rst => {
                 if header.stream_id == 0 {
                     debug_log("tunnel: session rst (id=0), closing");
-                    break;
+                    return "client sent session rst (id=0)".to_string();
                 }
                 debug_log(&format!(
                     "tunnel: stream rst id={}, closing stream",
@@ -1279,7 +1352,7 @@ fn tunnel_loop(
                     Ok(target) => target,
                     Err(e) => {
                         debug_log(&format!("tunnel: open_tcp parse failed: {e}"));
-                        break;
+                        return format!("open_tcp id={} auth/parse failed: {e}", header.stream_id);
                     }
                 };
                 if ctx.blocklist.is_blocked(&target.addr) {
@@ -1337,7 +1410,7 @@ fn tunnel_loop(
                     Ok(flow) => flow,
                     Err(e) => {
                         debug_log(&format!("tunnel: open_udp parse failed: {e}"));
-                        break;
+                        return format!("open_udp id={} auth/parse failed: {e}", header.stream_id);
                     }
                 };
                 if ctx.blocklist.is_blocked(&flow.addr) {
@@ -1361,9 +1434,9 @@ fn tunnel_loop(
                     match primary.rsplit_once(':') {
                         Some((host, port)) => match port.parse::<u16>() {
                             Ok(port) => (host.to_string(), port),
-                            Err(_) => break,
+                            Err(_) => return format!("bad dns upstream port: {primary}"),
                         },
-                        None => break,
+                        None => return format!("bad dns upstream: {primary}"),
                     }
                 } else {
                     debug_log(&format!(
@@ -1397,13 +1470,16 @@ fn tunnel_loop(
                 }
                 routes.insert(header.stream_id, sock);
             }
-            _ => {
+            other => {
                 debug_log("tunnel: unsupported frame type, closing");
-                break; // WINDOW/AUTH post-handshake: unsupported yet.
+                // WINDOW/AUTH post-handshake: unsupported yet.
+                return format!(
+                    "unsupported frame type {other:?} id={} len={}",
+                    header.stream_id, header.length
+                );
             }
         }
     }
-    "session ended (goaway, write error, or protocol close)".to_string()
 }
 
 /// Resolve a dial target announced by the peer (server-side system DNS).
