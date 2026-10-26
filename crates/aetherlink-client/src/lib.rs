@@ -3,6 +3,7 @@
 //! Provides client-side functionality: full tunnel lifecycle, routing rules,
 //! DNS override, crash recovery, and platform-specific implementations.
 
+pub mod android_plan;
 pub mod cleanup;
 pub mod config;
 pub mod dns;
