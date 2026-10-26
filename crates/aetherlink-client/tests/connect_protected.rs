@@ -73,7 +73,8 @@ fn refused_protection_aborts_before_connect() {
             }
         },
     )
-    .expect_err("a refused protect() must fail the connect");
+    .err()
+    .expect("a refused protect() must fail the connect");
 
     assert!(
         matches!(err, ClientError::PermissionDenied(_)),
@@ -134,7 +135,8 @@ fn protected_connect_honours_the_deadline() {
         Duration::from_millis(300),
         |_| true,
     )
-    .expect_err("TEST-NET-1 must not accept");
+    .err()
+    .expect("TEST-NET-1 must not accept");
 
     assert!(
         matches!(err, ClientError::PlatformError(_)),

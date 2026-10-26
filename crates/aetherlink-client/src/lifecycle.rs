@@ -40,6 +40,18 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// the socket is established.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Raw socket handle offered to an Android `VpnService.protect()`.
+///
+/// Unix: the file descriptor; Windows: the `SOCKET`. Using the platform type
+/// keeps the protector closure honest on both sides without a `cfg` fork in
+/// the caller.
+#[cfg(unix)]
+pub type SocketHandle = std::os::fd::RawFd;
+
+/// Raw socket handle offered to an Android `VpnService.protect()`.
+#[cfg(windows)]
+pub type SocketHandle = std::os::windows::io::RawSocket;
+
 /// Reconfiguration mutex: up/down never interleave.
 static RECONFIGURE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -247,6 +259,39 @@ pub fn connect_with_timeout(
     verifier: Option<Arc<dyn ServerCertVerifier>>,
     connect_timeout: Duration,
 ) -> Result<ConnectedTunnel> {
+    connect_inner(config, verifier, connect_timeout, None)
+}
+
+/// Android transport: run `protector` on the socket *before* `connect()`.
+///
+/// `VpnService.protect(fd)` must happen while the socket still has no route,
+/// otherwise the SYN to the server follows the default route into our own TUN
+/// and the tunnel dials itself. A protector that returns `false` aborts with
+/// [`ClientError::PermissionDenied`] before a packet is sent. Desktop callers
+/// keep [`connect`] and pass no protector at all.
+pub fn connect_protected<P>(
+    config: &ClientConfig,
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
+    connect_timeout: Duration,
+    protector: P,
+) -> Result<ConnectedTunnel>
+where
+    P: Fn(SocketHandle) -> bool,
+{
+    connect_inner(
+        config,
+        verifier,
+        connect_timeout,
+        Some(&protector as &dyn Fn(SocketHandle) -> bool),
+    )
+}
+
+fn connect_inner(
+    config: &ClientConfig,
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
+    connect_timeout: Duration,
+    protector: Option<&dyn Fn(SocketHandle) -> bool>,
+) -> Result<ConnectedTunnel> {
     let (host, port) = config
         .server_addr
         .rsplit_once(':')
@@ -266,15 +311,21 @@ pub fn connect_with_timeout(
     let mut last_err = "no server address".to_string();
     let mut sock = None;
     for addr in &addrs {
-        match TcpStream::connect_timeout(addr, connect_timeout) {
-            Ok(s) => {
-                sock = Some(s);
+        match open_socket(addr, connect_timeout, protector) {
+            Ok(stream) => {
+                sock = Some(stream);
                 break;
             }
-            Err(e) => last_err = format!("tcp connect {addr}: {e}"),
+            // A refused protect() is final: the next address would need the
+            // same protection, and the decision is the user's, not the DNS's.
+            Err(ClientError::PermissionDenied(msg)) => {
+                return Err(ClientError::PermissionDenied(msg))
+            }
+            Err(ClientError::PlatformError(msg)) => last_err = msg,
+            Err(other) => return Err(other),
         }
     }
-    let sock = sock.ok_or_else(|| ClientError::PlatformError(last_err))?;
+    let sock = sock.ok_or(ClientError::PlatformError(last_err))?;
     // Raise non-blocking AFD send buffer on Windows for high-BDP WAN uploads
     // (`4 MiB / 115ms ≈ 278 Mbps`). Never set `SO_RCVBUF` on any OS and never
     // set `SO_SNDBUF`/`SO_RCVBUF` on Linux (`setsockopt` sets `SOCK_*BUF_LOCK`,
@@ -309,6 +360,48 @@ pub fn connect_with_timeout(
         .map_err(ClientError::Core)?;
     aetherlink_netstack::debug_log("connect: auth ok");
     Ok(ConnectedTunnel { stream, sess })
+}
+
+/// Create the transport socket, protect it if asked, then connect.
+///
+/// `socket2` is used instead of `TcpStream::connect_timeout` solely because
+/// the protect callback needs the socket *before* it is connected.
+fn open_socket(
+    addr: &SocketAddr,
+    connect_timeout: Duration,
+    protector: Option<&dyn Fn(SocketHandle) -> bool>,
+) -> Result<TcpStream> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .map_err(|e| ClientError::PlatformError(format!("socket: {e}")))?;
+    if let Some(protector) = protector {
+        // Before connect(): once the SYN is out, protect() cannot save it.
+        if !protector(raw_handle(&socket)) {
+            return Err(ClientError::PermissionDenied(
+                "VpnService.protect() refused the transport socket".to_string(),
+            ));
+        }
+    }
+    socket
+        .connect_timeout(&(*addr).into(), connect_timeout)
+        .map_err(|e| ClientError::PlatformError(format!("tcp connect {addr}: {e}")))?;
+    Ok(socket.into())
+}
+
+#[cfg(unix)]
+fn raw_handle(socket: &socket2::Socket) -> SocketHandle {
+    use std::os::fd::AsRawFd;
+    socket.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn raw_handle(socket: &socket2::Socket) -> SocketHandle {
+    use std::os::windows::io::AsRawSocket;
+    socket.as_raw_socket()
 }
 
 /// Attach the pump: connect the transport, then bridge TUN<->TLS session.

@@ -53,6 +53,11 @@ pub enum ClientError {
     /// auto-recover (force_cleanup + retry) instead of just reporting.
     #[error("Stale tunnel state: {0}")]
     StaleState(String),
+
+    /// Android refused `VpnService.protect()` for the transport socket.
+    /// Connecting anyway would route the server connection into our own TUN.
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
