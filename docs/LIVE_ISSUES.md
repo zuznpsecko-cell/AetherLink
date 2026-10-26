@@ -302,3 +302,44 @@ cert.pem читались partial. Фикс: pid+thread+counter в имени (�
 - Сервер и клиент перезапускать из свежих DLL каждый раз.
 - `state.json` + таблица маршрутов проверяются до и после.
 - Никогда не убивать окно A без последующего `down`/`cleanup`.
+
+## Android TDD baseline (Phase 0, P0-R3)
+
+Зафиксировано 26.10.2026 на коммите `0cfba1b` (Android-каркас), Rust-код не менялся.
+Эти три гейта были красными **до** начала работ и к Android-фазе отношения не имеют;
+чинить их нужно отдельно, не смешивая с Android-фичами.
+
+### `cargo test --workspace` — один вечный тест
+
+- `aetherlink-server/tests/e2e_tunnel.rs::infinite_fast_download_aborted_by_rst_immediately_allows_upload`
+  не завершается (ждали > 50 минут; остальные 21 тест этого файла зелёные, все
+  остальные бинарники зелёные).
+- Воспроизведение:
+  `cargo test -p aetherlink-server --test e2e_tunnel infinite_fast_download_aborted_by_rst_immediately_allows_upload -- --nocapture`.
+- Baseline-прогон без него:
+  `cargo test --workspace --no-fail-fast -- --skip infinite_fast_download_aborted_by_rst_immediately_allows_upload`
+  → `0 failed` во всех бинарниках.
+- Статус: **открыт**. В §2.4 `cargo test --workspace` входит в финальные ворота, поэтому
+  до G6 тест либо чинится, либо получает явный `#[ignore = "..."]` с issue-ссылкой
+  (решение принимать отдельно: это desktop-путь).
+
+### `cargo clippy --workspace --all-targets -- -D warnings` — красный
+
+Останавливается на первом крейте:
+- `crates/aetherlink-crypto/src/auth.rs:8` — unused imports `Zeroize`, `ZeroizeOnDrop`;
+- `crates/aetherlink-crypto/src/keys.rs:10` — unused `CryptoError`, `Result`;
+- `aetherlink-crypto` — `next` может быть спутан с `Iterator::next`.
+
+Без `-D warnings` по workspace: **88 предупреждений**, основные группы:
+- 14 × unnecessary `unsafe` block (ffi/netstack);
+- 12 × отсутствует `# Safety` в docs у `unsafe fn`;
+- 3 × unused import `bytes::BufMut`, 3 × `match` → `?`;
+- единичные: unused imports, needless borrow, `chunks_exact`, drain-collect, unused doc comment.
+
+Статус: **открыт**. Чистка — отдельный коммит перед G6.
+
+### `cargo fmt --check` — красный
+
+- `crates/aetherlink-client/src/threads.rs` (отступы в блоке pump), возможны другие файлы.
+
+Статус: **открыт**. `cargo fmt` одним коммитом перед G6, отдельно от логики.

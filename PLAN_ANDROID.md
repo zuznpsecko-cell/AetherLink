@@ -360,7 +360,7 @@ android:
 | **P0-G1** | Green: `apps/android/build.gradle`, Gradle wrapper 8.10.2, `scripts/build_android.ps1`, `scripts/build_android.sh`; `check_android_build.ps1` → PASS (3 ABI в APK, JNI-символы), `check_android_host.ps1` остаётся красным до Phase 3 (это ожидаемо) | `apps/android/build.gradle`, `apps/android/gradle/wrapper/*`, `gradlew*`, `scripts/build_android.*` |
 | **P0-R2** | Red: `HarnessSmokeTest` — JUnit + Robolectric context (`RuntimeEnvironment.getApplication() != null`), падает, пока нет тестовых зависимостей/`includeAndroidResources` | `apps/android/app/src/test/.../HarnessSmokeTest.kt` |
 | **P0-G2** | Green: тестовые зависимости (`junit:junit:4.13.2`, `org.robolectric:robolectric:4.14.1`, `androidx.test:core:1.6.1`, `androidx.test.ext:junit:1.2.1`), `testOptions.unitTests.includeAndroidResources = true`; Robolectric `@Config(sdk=[34])`; smoke зелёный | `app/build.gradle` |
-| **P0-R3** | Baseline: зафиксировать текущие `cargo test/clippy/fmt`; известные падения — в `docs/LIVE_ISSUES.md` | `docs/LIVE_ISSUES.md` |
+| **P0-R3** | Baseline: зафиксировать текущие `cargo test/clippy/fmt` на HEAD до изменений Rust. Результат: `test --workspace` — один вечный тест (`infinite_fast_download_aborted_by_rst_immediately_allows_upload`), остальное зелёное; `clippy -D warnings` — красный (88 warnings); `fmt --check` — красный (`threads.rs`). Всё — в `docs/LIVE_ISSUES.md`, чистится в P6-R0 | `docs/LIVE_ISSUES.md` |
 | **P0-G3** | Обновить `.gitignore`/`README` (сборка через скрипт, `.so` не коммитится) | `.gitignore`, `README.md` |
 
 **Предпосылки P0** (проверяются скриптом): `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`, `cargo-ndk`, Android SDK + NDK (`ANDROID_NDK_HOME`), JDK 17–23 (проверено на 21). Без них G0 не закрывается.
@@ -510,6 +510,8 @@ android:
 
 | Шаг | Действие | Файлы |
 |---|---|---|
+| **P6-R0** | Red: §2.4-ворота красные по baseline P0-R3 — `cargo fmt --check` (`threads.rs`), `cargo clippy -- -D warnings` (88 warnings, первый стоп в `aetherlink-crypto`), вечный тест в `e2e_tunnel`. Зафиксировать повторным прогоном, чтобы отличить долг от регрессий Android-работ | `docs/LIVE_ISSUES.md` |
+| **P6-G0** | Green: `cargo fmt` одним коммитом; clippy-чистка (unsafe-блоки, `# Safety`, unused imports, `match` → `?`); решение по вечному тесту (fix или `#[ignore = "…"]` с issue); `cargo test --workspace` завершается | Rust |
 | **P6-R1** | Проверка: `check_thin_hosts.ps1` (реальные проверки написаны ещё в P0-R1) — финальный прогон; red на старом скелете зафиксирован в журнале | `scripts/check_thin_hosts.ps1` |
 | **P6-G1** | Green: скрипт проходит на новом коде | `scripts/check_thin_hosts.ps1` |
 | **P6-R2** | Red: `scripts/check_tdd_log.ps1` — у каждого `P*-R*` есть запись в `docs/ANDROID.md` (сам P6-R2 и шаги `BLOCKED(device)` исключаются); сейчас FAIL | `scripts/check_tdd_log.ps1` (new) |
@@ -521,7 +523,7 @@ android:
 | **P6-R5** | Red: `scripts/android_smoke.ps1` — adb install + запуск + сброс логов; проверяется на устройстве | `scripts/android_smoke.ps1` (new) |
 | **P6-G5** | Green: скрипт работает | `scripts/android_smoke.ps1` |
 
-**Гейт G6:** документация соответствует поведению; `check_thin_hosts.ps1` (red на старом скелете зафиксирован в P0) проходит на новом коде; `check_tdd_log.ps1` PASS; тест-матрица заполнена; финальные ворота §2.4 зелёные.
+**Гейт G6:** документация соответствует поведению; `check_thin_hosts.ps1` (red на старом скелете зафиксирован в P0) проходит на новом коде; `check_tdd_log.ps1` PASS; тест-матрица заполнена; финальные ворота §2.4 зелёные (baseline-долг из P0-R3 закрыт в P6-G0).
 
 ---
 

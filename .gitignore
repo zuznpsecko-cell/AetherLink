@@ -22,6 +22,12 @@ local.properties
 .gradle/
 **/build/
 apps/android/app/src/main/jniLibs/*/*.so
+.kotlin/
+*.apk
+*.aab
+captures/
+# The wrapper is source: gradle-wrapper.jar and gradlew* ARE committed.
+!apps/android/gradle/wrapper/gradle-wrapper.jar
 
 # --- Secrets: keys, certs, credentials (NEVER commit) ---
 *.pem
