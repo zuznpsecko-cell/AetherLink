@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use aetherlink_client::android_plan::{
-    plan_json, plan_json_for, AndroidPlan, AndroidSplit, SplitMode,
+    plan_json, plan_json_for, subtract_prefixes, AndroidPlan, AndroidSplit, IpPrefix, SplitMode,
 };
 use aetherlink_client::config::ClientConfig;
 use aetherlink_client::ClientError;
@@ -266,5 +266,156 @@ fn inconsistent_split_selections_are_rejected() {
             text.contains(needle),
             "error for {split:?} must mention {needle:?}, got: {err}"
         );
+    }
+}
+
+// --- P1-R3: LAN-direct subtraction ---------------------------------------
+
+fn lan_direct_config() -> ClientConfig {
+    config(json!({
+        "client": {
+            "server_addr": "31.57.158.233:443",
+            "psk": "test-psk",
+            "full_tunnel": {
+                "mtu": 1400,
+                "include_private_lan_direct": true
+            }
+        }
+    }))
+}
+
+fn covers(routes: &BTreeSet<(String, u8)>, ip: &str) -> bool {
+    let addr: u32 = u32::from(ip.parse::<std::net::Ipv4Addr>().expect("test ip"));
+    routes.iter().any(|(net, prefix)| {
+        let net: u32 = u32::from(net.parse::<std::net::Ipv4Addr>().expect("route ip"));
+        let mask = if *prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - u32::from(*prefix))
+        };
+        addr & mask == net
+    })
+}
+
+#[test]
+fn lan_direct_keeps_public_traffic_and_the_tunnel_routes() {
+    let text = plan_json(&lan_direct_config()).expect("plan must build");
+    let plan: Value = serde_json::from_str(&text).expect("valid JSON");
+    let routes = routes_of(&plan);
+
+    for public in [
+        "8.8.8.8",
+        "1.1.1.1",
+        "203.0.113.5",
+        "172.32.0.1",
+        "192.169.1.1",
+    ] {
+        assert!(
+            covers(&routes, public),
+            "{public} must stay in the tunnel: {routes:?}"
+        );
+    }
+    for lan in ["10.1.2.3", "172.16.5.4", "172.31.255.254", "192.168.1.1"] {
+        assert!(
+            !covers(&routes, lan),
+            "{lan} must bypass the tunnel (LAN direct)"
+        );
+    }
+    for tunnel in ["10.255.0.1", "10.255.0.2"] {
+        assert!(
+            covers(&routes, tunnel),
+            "{tunnel} is part of the tunnel: {routes:?}"
+        );
+    }
+    assert!(
+        routes.contains(&("10.255.0.1".to_string(), 32)),
+        "the DNS route is always explicit: {routes:?}"
+    );
+    assert!(
+        routes.contains(&("10.255.0.0".to_string(), 30)),
+        "the tunnel network is never subtracted: {routes:?}"
+    );
+}
+
+fn prefixes(list: &[(&str, u8)]) -> Vec<IpPrefix> {
+    list.iter()
+        .map(|(ip, prefix)| IpPrefix::new(ip, *prefix))
+        .collect()
+}
+
+fn as_set(list: &[IpPrefix]) -> BTreeSet<(String, u8)> {
+    list.iter().map(|p| (p.ip.clone(), p.prefix)).collect()
+}
+
+#[test]
+fn subtract_prefixes_handles_the_edge_cases() {
+    // Nothing excluded -> unchanged (normalized).
+    assert_eq!(
+        as_set(&subtract_prefixes(&prefixes(&[("0.0.0.0", 0)]), &[])),
+        as_set(&prefixes(&[("0.0.0.0", 0)]))
+    );
+
+    // Excluding the whole range leaves nothing.
+    assert!(
+        subtract_prefixes(&prefixes(&[("10.0.0.0", 8)]), &prefixes(&[("10.0.0.0", 8)])).is_empty()
+    );
+    assert!(
+        subtract_prefixes(&prefixes(&[("10.0.0.0", 8)]), &prefixes(&[("0.0.0.0", 0)])).is_empty()
+    );
+
+    // Excluding the lower half leaves the upper half.
+    assert_eq!(
+        as_set(&subtract_prefixes(
+            &prefixes(&[("10.0.0.0", 24)]),
+            &prefixes(&[("10.0.0.0", 25)])
+        )),
+        as_set(&prefixes(&[("10.0.0.128", 25)]))
+    );
+
+    // A /32 inside an excluded block disappears.
+    assert!(subtract_prefixes(
+        &prefixes(&[("10.0.0.1", 32)]),
+        &prefixes(&[("10.0.0.0", 24)])
+    )
+    .is_empty());
+
+    // A /32 outside the excluded block survives.
+    assert_eq!(
+        as_set(&subtract_prefixes(
+            &prefixes(&[("10.0.1.1", 32)]),
+            &prefixes(&[("10.0.0.0", 24)])
+        )),
+        as_set(&prefixes(&[("10.0.1.1", 32)]))
+    );
+
+    // Neighbours split by an excluded block stay separate.
+    assert_eq!(
+        as_set(&subtract_prefixes(
+            &prefixes(&[("192.168.0.0", 22)]),
+            &prefixes(&[("192.168.1.0", 24)])
+        )),
+        as_set(&prefixes(&[("192.168.0.0", 24), ("192.168.2.0", 23)]))
+    );
+}
+
+#[test]
+fn subtract_prefixes_normalizes_and_merges_siblings() {
+    let merged = subtract_prefixes(&prefixes(&[("10.0.0.0", 25), ("10.0.0.128", 25)]), &[]);
+    assert_eq!(as_set(&merged), as_set(&prefixes(&[("10.0.0.0", 24)])));
+
+    // Sorted by network address, and no route overlaps another.
+    let list = subtract_prefixes(
+        &prefixes(&[("0.0.0.0", 0)]),
+        &prefixes(&[("192.168.0.0", 16)]),
+    );
+    let mut previous_end: Option<u32> = None;
+    for entry in &list {
+        let net: u32 = u32::from(entry.ip.parse::<std::net::Ipv4Addr>().expect("ip"));
+        let size = 1u64 << (32 - u32::from(entry.prefix));
+        assert!(
+            previous_end.is_none_or(|end| u64::from(end) < u64::from(net)),
+            "routes overlap or are unsorted: {list:?}"
+        );
+        previous_end = Some(u32::try_from(u64::from(net) + size - 1).expect("fits"));
     }
 }
