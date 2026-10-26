@@ -9,6 +9,11 @@ pub mod smoltcp_wrapper;
 pub mod sockets;
 pub mod tun;
 
+/// Android TUN over a detached `VpnService` fd. Host tests exercise it
+/// through a fake `FdOps`; the real `libc` path exists only for Android.
+#[cfg(any(target_os = "android", test))]
+pub mod android_tun;
+
 pub use debug::{debug_enabled, debug_log};
 
 use thiserror::Error;
