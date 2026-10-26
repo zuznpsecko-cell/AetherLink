@@ -68,6 +68,9 @@ pub struct Client {
     up: bool,
     pump: Option<threads::PumpHandle>,
     platform: platform::RealPlatform,
+    /// Android: transport connected by `android_connect`, parked until the
+    /// host detaches the `establish()` fd and calls `android_attach_tun_with`.
+    pending: Option<lifecycle::ConnectedTunnel>,
 }
 
 impl Client {
@@ -78,6 +81,7 @@ impl Client {
             up: false,
             pump: None,
             platform: platform::RealPlatform::new(),
+            pending: None,
         })
     }
 
@@ -89,6 +93,7 @@ impl Client {
             up: false,
             pump: None,
             platform: platform::RealPlatform::new(),
+            pending: None,
         }
     }
 
@@ -233,6 +238,78 @@ impl Client {
     #[must_use]
     pub fn is_up(&self) -> bool {
         self.up
+    }
+
+    /// Android step 1: connect the transport, protecting the socket first.
+    ///
+    /// `VpnService.protect()` must run on the socket before it connects, so
+    /// the server address does not take the tunnel route. The connected
+    /// transport stays parked (no pump, `up == false`) until the host detaches
+    /// the `establish()` fd and calls [`Client::android_attach_tun_with`].
+    pub fn android_connect<P>(
+        &mut self,
+        verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+        protector: P,
+    ) -> Result<()>
+    where
+        P: Fn(lifecycle::SocketHandle) -> bool,
+    {
+        if self.pump.is_some() || self.pending.is_some() {
+            return Ok(());
+        }
+        let tunnel = lifecycle::connect_protected(
+            &self.config,
+            verifier,
+            lifecycle::CONNECT_TIMEOUT,
+            protector,
+        )?;
+        self.pending = Some(tunnel);
+        Ok(())
+    }
+
+    /// Android step 2: bridge the parked transport with the detached TUN fd.
+    ///
+    /// Fails when `android_connect` did not run: attaching to a transport that
+    /// does not exist would leave the host with a live interface, no pump, and
+    /// no route back.
+    pub fn android_attach_tun_with<T>(&mut self, tun: Arc<Mutex<T>>) -> Result<()>
+    where
+        T: TunPackets + Send + 'static,
+    {
+        if self.pump.is_some() {
+            return Ok(());
+        }
+        let tunnel = self.pending.take().ok_or_else(|| {
+            ClientError::PlatformError(
+                "android_connect must run before attaching the tun".to_string(),
+            )
+        })?;
+        let pad = self.config.pad_multiple;
+        let handle = threads::spawn_pump_tls(tun, tunnel, pad)
+            .map_err(|e| ClientError::PlatformError(format!("tls pump spawn: {e}")))?;
+        self.pump = Some(handle);
+        self.up = true;
+        Ok(())
+    }
+
+    /// Android disconnect: stop the pump, drop a parked transport, report
+    /// down. The host closes the `VpnService` interface afterwards (Android
+    /// owns routes/DNS for the tun, Rust owns only the fd).
+    pub fn android_disconnect(&mut self) -> Result<()> {
+        self.stop_pump();
+        self.pending = None;
+        self.up = false;
+        Ok(())
+    }
+
+    /// Plan JSON the host applies to `VpnService.Builder`.
+    pub fn android_plan(&self) -> Result<String> {
+        crate::android_plan::plan_json(&self.config)
+    }
+
+    /// Status JSON for the JNI `clientStatus` call.
+    pub fn android_status(&self) -> Result<String> {
+        self.status()
     }
 
     /// Status snapshot as a JSON document (no secrets).

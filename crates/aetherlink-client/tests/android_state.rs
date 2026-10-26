@@ -84,15 +84,19 @@ fn spawn_server(listener: TcpListener, rounds: usize) -> std::thread::JoinHandle
                         break;
                     }
                     Ok(_) => continue,
+                    // A released transport may end with EOF (clean), a reset,
+                    // or an incomplete TLS close (`UnexpectedEof`) because the
+                    // core shuts the socket down instead of saying goodbye.
+                    // Only a stalled peer (timeout) means it is still open.
                     Err(e)
-                        if e.kind() == ErrorKind::ConnectionReset
-                            || e.kind() == ErrorKind::ConnectionAborted =>
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
                     {
+                        break;
+                    }
+                    Err(_) => {
                         closed += 1;
                         break;
                     }
-                    // Timeout: the client never released the transport.
-                    Err(_) => break,
                 }
             }
         }
@@ -172,10 +176,10 @@ fn connect_attach_report_and_disconnect_in_the_android_order() {
 fn refused_protection_leaves_the_client_down() {
     let mut client = Client::new(client_config("127.0.0.1:9")).expect("client");
 
-    let err = client
-        .android_connect(Some(Arc::new(AcceptAll)), |_| false)
-        .err()
-        .expect("a refused protect() must fail the connect");
+    let err = match client.android_connect(Some(Arc::new(AcceptAll)), |_| false) {
+        Ok(()) => panic!("a refused protect() must fail the connect"),
+        Err(e) => e,
+    };
 
     assert!(
         matches!(err, ClientError::PermissionDenied(_)),
