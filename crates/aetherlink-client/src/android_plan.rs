@@ -1,4 +1,4 @@
-﻿//! Android interface plan: the document Kotlin applies to `VpnService.Builder`.
+//! Android interface plan: the document Kotlin applies to `VpnService.Builder`.
 //!
 //! The Rust core owns *what* the tunnel looks like; the thin host only knows
 //! *how* to build it. Everything here is pure logic so it can be tested on the
@@ -262,20 +262,161 @@ fn parse_cidr(cidr: &str) -> Result<IpPrefix> {
     Ok(IpPrefix::new(&ip.to_string(), prefix))
 }
 
-fn routes_for(_config: &ClientConfig, split: &AndroidSplit) -> Result<Vec<IpPrefix>> {
+fn routes_for(config: &ClientConfig, split: &AndroidSplit) -> Result<Vec<IpPrefix>> {
     let mut routes = match split.mode {
         SplitMode::Subnets => split
             .subnets
             .iter()
             .map(|cidr| parse_cidr(cidr))
             .collect::<Result<Vec<_>>>()?,
+        _ if config.include_private_lan_direct => {
+            // Full tunnel minus LAN, then re-add the tunnel network: the
+            // netstack lives inside 10.255.0.0/30, which 10/8 excludes.
+            let mut kept = subtract_prefixes(&[IpPrefix::new("0.0.0.0", 0)], &rfc1918());
+            kept.push(IpPrefix::new(TUNNEL_NETWORK, TUNNEL_PREFIX));
+            kept
+        }
         _ => vec![IpPrefix::new("0.0.0.0", 0)],
     };
     let dns = IpPrefix::new(DNS_IP, 32);
     if !routes.contains(&dns) {
         routes.push(dns);
     }
-    Ok(routes)
+    Ok(sort_routes(routes))
+}
+
+/// `10.255.0.0/30` — the tunnel network the client itself occupies.
+pub const TUNNEL_NETWORK: &str = "10.255.0.0";
+
+fn rfc1918() -> Vec<IpPrefix> {
+    vec![
+        IpPrefix::new("10.0.0.0", 8),
+        IpPrefix::new("172.16.0.0", 12),
+        IpPrefix::new("192.168.0.0", 16),
+    ]
+}
+
+/// Sort deterministically by network address, then prefix length. Containment
+/// (a `/32` inside a `/30`) is preserved: Android accepts more specific routes,
+/// and the DNS route must stay explicit in the plan.
+fn sort_routes(routes: Vec<IpPrefix>) -> Vec<IpPrefix> {
+    let mut routes = routes;
+    routes.sort_by_key(|route| {
+        let addr = route
+            .ip
+            .parse::<std::net::Ipv4Addr>()
+            .map(u32::from)
+            .unwrap_or(u32::MAX);
+        (addr, route.prefix)
+    });
+    routes
+}
+
+/// One inclusive IPv4 range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Range {
+    start: u32,
+    end: u32,
+}
+
+fn prefix_range(prefix: &IpPrefix) -> Option<Range> {
+    if prefix.prefix > 32 {
+        return None;
+    }
+    let addr = prefix.ip.parse::<std::net::Ipv4Addr>().ok()?;
+    let size = 1u64 << (32 - u32::from(prefix.prefix));
+    let network = u64::from(u32::from(addr)) & !(size - 1);
+    let start = u32::try_from(network).ok()?;
+    let end = u32::try_from(network + size - 1).ok()?;
+    Some(Range { start, end })
+}
+
+/// Merge overlapping or adjacent ranges into a sorted, disjoint list.
+fn merge_ranges(mut ranges: Vec<Range>) -> Vec<Range> {
+    ranges.sort();
+    let mut merged: Vec<Range> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if u64::from(range.start) <= u64::from(last.end) + 1 => {
+                last.end = last.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+fn ranges_to_prefixes(ranges: &[Range]) -> Vec<IpPrefix> {
+    let mut out = Vec::new();
+    for range in ranges {
+        let mut current = u64::from(range.start);
+        let end = u64::from(range.end);
+        while current <= end {
+            let span = if current == 0 {
+                1u64 << 32
+            } else {
+                let low_bit = current & current.wrapping_neg();
+                low_bit.min(1u64 << 32)
+            };
+            let remaining = end - current + 1;
+            let mut size = span;
+            while size > remaining {
+                size >>= 1;
+            }
+            let prefix = 32 - size.trailing_zeros().min(32);
+            // `current` is a u64 view of a u32 range, so this cast is exact.
+            let addr = std::net::Ipv4Addr::from(current as u32);
+            out.push(IpPrefix::new(
+                &addr.to_string(),
+                u8::try_from(prefix).unwrap_or(32),
+            ));
+            current += size;
+        }
+    }
+    out
+}
+
+/// Subtract `exclude` from `include`, returning the minimal CIDR cover of
+/// what remains: sorted, merged, no overlaps.
+///
+/// Invalid [`IpPrefix`] values are ignored (the plan builds them from
+/// validated config and canonical constants), so a malformed entry can never
+/// turn into a silently wider route.
+#[must_use]
+pub fn subtract_prefixes(include: &[IpPrefix], exclude: &[IpPrefix]) -> Vec<IpPrefix> {
+    let includes = merge_ranges(include.iter().filter_map(prefix_range).collect());
+    let excludes = merge_ranges(exclude.iter().filter_map(prefix_range).collect());
+
+    let mut remaining = includes;
+    for cut in excludes {
+        let mut next = Vec::with_capacity(remaining.len() + 1);
+        for range in remaining {
+            if cut.end < range.start || cut.start > range.end {
+                next.push(range);
+                continue;
+            }
+            if range.start < cut.start {
+                next.push(Range {
+                    start: range.start,
+                    end: cut.start - 1,
+                });
+            }
+            if cut.end < range.end {
+                next.push(Range {
+                    start: cut.end + 1,
+                    end: range.end,
+                });
+            }
+        }
+        remaining = next;
+    }
+    ranges_to_prefixes(&merge_ranges(remaining))
+}
+
+/// Subtract the RFC1918 ranges from full-tunnel routes.
+#[must_use]
+pub fn subtract_rfc1918(include: &[IpPrefix]) -> Vec<IpPrefix> {
+    subtract_prefixes(include, &rfc1918())
 }
 
 /// Serialize the plan for `AetherCore.clientPlan`.
