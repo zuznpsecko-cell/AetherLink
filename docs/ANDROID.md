@@ -10,14 +10,21 @@
 ```
 
 Требования: Rust-таргеты `aarch64-linux-android`, `armv7-linux-androideabi`,
-`x86_64-linux-android`; `cargo-ndk`; Android SDK + NDK; Java 17+ (JBR 21).
-Скрипт собирает `aetherlink-ffi` под три ABI в `app/src/main/jniLibs` и запускает
-`assembleDebug`. APK: `apps/android/app/build/outputs/apk/debug/app-debug.apk`.
+`x86_64-linux-android`; `cargo-ndk`; Android SDK + NDK; **JDK 17–23** (проверено
+на 21). Gradle 8.10.2 + AGP 8.6.1 на Java 25 (JBR из Android Studio) не
+тестировались, поэтому скрипт сам выбирает JDK 21, если `JAVA_HOME` новее.
 
-Проверка контракта сборки:
+Скрипт собирает `aetherlink-ffi` под три ABI, переименовывает
+`libaetherlink_ffi.so` → `libaetherlink_core.so` в
+`app/src/main/jniLibs/<abi>/` (хост грузит `aetherlink_core`, как .NET-хосты
+грузят `aetherlink_core.dll`) и запускает `assembleDebug`.
+APK: `apps/android/app/build/outputs/apk/debug/app-debug.apk`.
+
+Проверки контрактов:
 
 ```powershell
-.\scripts\check_android_build.ps1
+.\scripts\check_android_build.ps1   # wrapper, 3 ABI в APK, JNI-символы
+.\scripts\check_android_host.ps1    # контракт Kotlin-хоста (red до G3/G4)
 ```
 
 ## Установка
@@ -45,15 +52,19 @@ CA (`ca-cert.pem`); системное хранилище Android клиенту
 
 ## Troubleshooting
 
-- **`JAVA_HOME` не найден** — укажите JBR: `F:\Program Files\Android\jbr`.
+- **`JAVA_HOME` указывает на JDK 24+** — Gradle 8.10 падает; поставьте JDK 21
+  (Android Studio: `C:\Program Files\Android\openjdk\jdk-21.0.8`).
 - **`cargo ndk` не найден** — `cargo install cargo-ndk`.
 - **Gradle качает дистрибутив** — первый запуск wrapper скачивает Gradle 8.10.2.
+- **`NativeCommandError` от cargo** — скрипт уже гоняет нативные команды через
+  `cmd /c`; если вызываете cargo вручную, используйте `cmd /c "cargo ..."`.
 - **VPN не поднимается** — проверьте согласие VPN и `adb logcat | Select-String aether`.
 
 ## TDD log
 
-Формат: `шаг | команда | RED | GREEN | коммиты`. Заполняется по ходу работы.
+Формат: `шаг | команда | RED | GREEN | коммиты`. Заполняется по ходу работы;
+без записи шаг не считается закрытым.
 
 ```
-P0-R1 build+host contract | .\scripts\check_android_build.ps1 -SkipBuild; .\scripts\check_android_host.ps1 | RED: 7 build checks failed (no wrapper/root build/scripts); 29 host checks failed (skeleton) | GREEN: pending | red: pending
+P0-R1 build+host contracts | .\scripts\check_android_build.ps1 -SkipBuild; .\scripts\check_android_host.ps1 | RED: build 7 failed (no root build.gradle, no wrapper, no build scripts); host 29 failed (no MainActivity/CoreApi/ConfigStore/..., no LAUNCHER, no FGS specialUse, service is a 0L stub) | GREEN: pending | red: a59a5af
 ```

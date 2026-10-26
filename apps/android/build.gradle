@@ -1,0 +1,6 @@
+// Root build file for the AetherLink Android host.
+// Plugin versions are pinned in app/build.gradle (AGP 8.6.1, Kotlin 2.0.20);
+// this file only keeps the root project cleanable.
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory.get().asFile
+}

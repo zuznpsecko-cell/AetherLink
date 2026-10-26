@@ -15,3 +15,6 @@
 *.csproj text eol=crlf
 *.sln text eol=crlf
 *.service text eol=lf
+# Gradle wrapper shell script must stay LF (CRLF breaks the shebang on Linux).
+gradlew text eol=lf
+*.jar binary
