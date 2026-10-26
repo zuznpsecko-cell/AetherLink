@@ -1,4 +1,4 @@
-//! Android interface plan: the document Kotlin applies to `VpnService.Builder`.
+﻿//! Android interface plan: the document Kotlin applies to `VpnService.Builder`.
 //!
 //! The Rust core owns *what* the tunnel looks like; the thin host only knows
 //! *how* to build it. Everything here is pure logic so it can be tested on the
@@ -88,10 +88,32 @@ pub struct AndroidPlan {
 }
 
 impl AndroidPlan {
-    /// Build the plan for a validated client config.
-    #[must_use]
-    pub fn from_config(config: &ClientConfig) -> Self {
-        Self {
+    /// Build the plan for a validated client config (no per-app split).
+    pub fn from_config(config: &ClientConfig) -> Result<Self> {
+        Self::from_split(config, &AndroidSplit::default())
+    }
+
+    /// Build the plan for a config plus an explicit split selection.
+    ///
+    /// Fails with [`ClientError::ConfigError`] when the split selection is
+    /// inconsistent (empty allow list, `0.0.0.0/0` in `subnets`, bad package
+    /// name, malformed CIDR).
+    pub fn from_split(config: &ClientConfig, split: &AndroidSplit) -> Result<Self> {
+        validate_split(split)?;
+        let apps = AppsSpec {
+            mode: match split.mode {
+                SplitMode::All => AppsMode::All,
+                SplitMode::Allow => AppsMode::Allow,
+                SplitMode::Deny => AppsMode::Deny,
+                // `subnets` filters by destination, not by app.
+                SplitMode::Subnets => AppsMode::All,
+            },
+            packages: match split.mode {
+                SplitMode::Allow | SplitMode::Deny => split.apps.clone(),
+                SplitMode::All | SplitMode::Subnets => Vec::new(),
+            },
+        };
+        Ok(Self {
             session: SESSION.to_string(),
             mtu: config.mtu,
             address: TunnelAddress {
@@ -99,18 +121,170 @@ impl AndroidPlan {
                 prefix: TUNNEL_PREFIX,
             },
             dns: vec![DNS_IP.to_string()],
-            routes: vec![IpPrefix::new("0.0.0.0", 0), IpPrefix::new(DNS_IP, 32)],
-            apps: AppsSpec {
-                mode: AppsMode::All,
-                packages: Vec::new(),
-            },
+            routes: routes_for(config, split)?,
+            apps,
             block_ipv6: true,
+        })
+    }
+}
+
+/// Split-tunnel selection as it arrives from config or the app picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidSplit {
+    /// Which routing rule applies.
+    pub mode: SplitMode,
+    /// Package names for `allow` / `deny`.
+    pub apps: Vec<String>,
+    /// CIDR strings for `subnets`.
+    pub subnets: Vec<String>,
+}
+
+impl Default for AndroidSplit {
+    fn default() -> Self {
+        Self {
+            mode: SplitMode::All,
+            apps: Vec::new(),
+            subnets: Vec::new(),
         }
     }
 }
 
+/// Split mode as it arrives from config (UI only offers `all` and `allow`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitMode {
+    /// Everything through the tunnel.
+    All,
+    /// Only `apps`.
+    Allow,
+    /// Everything except `apps`.
+    Deny,
+    /// Only `subnets`.
+    Subnets,
+}
+
+fn validate_split(split: &AndroidSplit) -> Result<()> {
+    for pkg in &split.apps {
+        if !is_valid_package(pkg) {
+            return Err(ClientError::ConfigError(format!(
+                "invalid package name: {pkg:?}"
+            )));
+        }
+    }
+    match split.mode {
+        SplitMode::All => {
+            if !split.apps.is_empty() {
+                return Err(ClientError::ConfigError(
+                    "all mode does not take a package list".to_string(),
+                ));
+            }
+            if !split.subnets.is_empty() {
+                return Err(ClientError::ConfigError(
+                    "all mode does not take subnet list".to_string(),
+                ));
+            }
+        }
+        SplitMode::Allow | SplitMode::Deny => {
+            let label = if split.mode == SplitMode::Allow {
+                "allow"
+            } else {
+                "deny"
+            };
+            if split.apps.is_empty() {
+                return Err(ClientError::ConfigError(format!(
+                    "{label} mode needs at least one package"
+                )));
+            }
+            if !split.subnets.is_empty() {
+                return Err(ClientError::ConfigError(format!(
+                    "{label} mode does not take subnet list"
+                )));
+            }
+        }
+        SplitMode::Subnets => {
+            if !split.apps.is_empty() {
+                return Err(ClientError::ConfigError(
+                    "subnets mode does not take a package list".to_string(),
+                ));
+            }
+            if split.subnets.is_empty() {
+                return Err(ClientError::ConfigError(
+                    "subnets mode needs at least one subnet".to_string(),
+                ));
+            }
+            for cidr in &split.subnets {
+                parse_cidr(cidr)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Package names Android accepts in `addAllowedApplication`.
+fn is_valid_package(pkg: &str) -> bool {
+    !pkg.is_empty()
+        && pkg.split('.').all(|part| !part.is_empty())
+        && pkg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+}
+
+/// Parse `a.b.c.d/len` into a route, rejecting host bits and `/0`.
+fn parse_cidr(cidr: &str) -> Result<IpPrefix> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| ClientError::ConfigError(format!("cidr must be ip/prefix: {cidr:?}")))?;
+    let ip: std::net::Ipv4Addr = addr
+        .parse()
+        .map_err(|_| ClientError::ConfigError(format!("invalid cidr address: {cidr:?}")))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| ClientError::ConfigError(format!("invalid cidr prefix: {cidr:?}")))?;
+    if prefix > 32 {
+        return Err(ClientError::ConfigError(format!(
+            "invalid cidr prefix: {cidr:?}"
+        )));
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    if u32::from(ip) & !mask != 0 {
+        return Err(ClientError::ConfigError(format!(
+            "cidr has host bits set: {cidr:?}"
+        )));
+    }
+    if prefix == 0 {
+        return Err(ClientError::ConfigError(
+            "0.0.0.0/0 is not a subnet split; use mode: all".to_string(),
+        ));
+    }
+    Ok(IpPrefix::new(&ip.to_string(), prefix))
+}
+
+fn routes_for(_config: &ClientConfig, split: &AndroidSplit) -> Result<Vec<IpPrefix>> {
+    let mut routes = match split.mode {
+        SplitMode::Subnets => split
+            .subnets
+            .iter()
+            .map(|cidr| parse_cidr(cidr))
+            .collect::<Result<Vec<_>>>()?,
+        _ => vec![IpPrefix::new("0.0.0.0", 0)],
+    };
+    let dns = IpPrefix::new(DNS_IP, 32);
+    if !routes.contains(&dns) {
+        routes.push(dns);
+    }
+    Ok(routes)
+}
+
 /// Serialize the plan for `AetherCore.clientPlan`.
 pub fn plan_json(config: &ClientConfig) -> Result<String> {
-    serde_json::to_string(&AndroidPlan::from_config(config))
+    plan_json_for(config, &AndroidSplit::default())
+}
+
+/// Serialize the plan for an explicit split selection.
+pub fn plan_json_for(config: &ClientConfig, split: &AndroidSplit) -> Result<String> {
+    serde_json::to_string(&AndroidPlan::from_split(config, split)?)
         .map_err(|e| ClientError::ConfigError(format!("android plan serialization failed: {e}")))
 }
