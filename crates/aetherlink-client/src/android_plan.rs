@@ -1,4 +1,4 @@
-//! Android interface plan: the document Kotlin applies to `VpnService.Builder`.
+﻿//! Android interface plan: the document Kotlin applies to `VpnService.Builder`.
 //!
 //! The Rust core owns *what* the tunnel looks like; the thin host only knows
 //! *how* to build it. Everything here is pure logic so it can be tested on the
@@ -90,7 +90,7 @@ pub struct AndroidPlan {
 impl AndroidPlan {
     /// Build the plan for a validated client config (no per-app split).
     pub fn from_config(config: &ClientConfig) -> Result<Self> {
-        Self::from_split(config, &AndroidSplit::default())
+        Self::from_split(config, &config.android_split)
     }
 
     /// Build the plan for a config plus an explicit split selection.
@@ -162,7 +162,8 @@ pub enum SplitMode {
     Subnets,
 }
 
-fn validate_split(split: &AndroidSplit) -> Result<()> {
+/// Validate a split selection: package names, mode/list consistency, CIDRs.
+pub fn validate_split(split: &AndroidSplit) -> Result<()> {
     for pkg in &split.apps {
         if !is_valid_package(pkg) {
             return Err(ClientError::ConfigError(format!(
@@ -269,7 +270,7 @@ fn routes_for(config: &ClientConfig, split: &AndroidSplit) -> Result<Vec<IpPrefi
             .iter()
             .map(|cidr| parse_cidr(cidr))
             .collect::<Result<Vec<_>>>()?,
-        _ if config.include_private_lan_direct => {
+        _ if config.android_lan_direct => {
             // Full tunnel minus LAN, then re-add the tunnel network: the
             // netstack lives inside 10.255.0.0/30, which 10/8 excludes.
             let mut kept = subtract_prefixes(&[IpPrefix::new("0.0.0.0", 0)], &rfc1918());
@@ -285,7 +286,7 @@ fn routes_for(config: &ClientConfig, split: &AndroidSplit) -> Result<Vec<IpPrefi
     Ok(sort_routes(routes))
 }
 
-/// `10.255.0.0/30` — the tunnel network the client itself occupies.
+/// `10.255.0.0/30` вЂ” the tunnel network the client itself occupies.
 pub const TUNNEL_NETWORK: &str = "10.255.0.0";
 
 fn rfc1918() -> Vec<IpPrefix> {
@@ -421,7 +422,7 @@ pub fn subtract_rfc1918(include: &[IpPrefix]) -> Vec<IpPrefix> {
 
 /// Serialize the plan for `AetherCore.clientPlan`.
 pub fn plan_json(config: &ClientConfig) -> Result<String> {
-    plan_json_for(config, &AndroidSplit::default())
+    plan_json_for(config, &config.android_split)
 }
 
 /// Serialize the plan for an explicit split selection.

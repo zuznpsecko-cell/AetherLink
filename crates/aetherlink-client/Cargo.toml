@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "aetherlink-client"
 version = { workspace = true }
 edition = { workspace = true }
@@ -14,6 +14,7 @@ aetherlink-mux = { path = "../aetherlink-mux" }
 aetherlink-protocol = { path = "../../protocol" }
 tokio = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -31,6 +32,7 @@ socket2 = { workspace = true }
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 rcgen = "0.13"
 
 [lib]

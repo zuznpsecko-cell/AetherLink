@@ -3,6 +3,7 @@
 //! Parsed once at the boundary (`Client::new`); interior code receives the
 //! typed value and never re-validates.
 
+use crate::android_plan::{validate_split, AndroidSplit, SplitMode};
 use crate::routing::Ruleset;
 use crate::{ClientError, Result};
 
@@ -31,6 +32,13 @@ pub struct ClientConfig {
     pub dns_mode: String,
     /// Routing rules (default LAN rules included).
     pub rules: Ruleset,
+    /// Inline PEM CA for Android: the app cannot read the system trust store.
+    pub tls_ca_pem: Option<String>,
+    /// Android per-app / per-destination split selection.
+    pub android_split: AndroidSplit,
+    /// Android: carve RFC1918 out of `0.0.0.0/0` (defaults to
+    /// `full_tunnel.include_private_lan_direct`).
+    pub android_lan_direct: bool,
 }
 
 fn required_str(doc: &serde_json::Value, field: &str) -> Result<String> {
@@ -134,6 +142,7 @@ impl ClientConfig {
                 parse_rule(&mut rules, rule_doc)?;
             }
         }
+        let android = parse_android(doc.get("android"), rules.include_private_lan_direct)?;
         Ok(ClientConfig {
             server_addr,
             outer_sni,
@@ -148,10 +157,88 @@ impl ClientConfig {
             restore_on_exit: get_bool(full, "restore_on_exit", true),
             include_private_lan_direct: rules.include_private_lan_direct,
             dns_mode,
+            tls_ca_pem: parse_tls_ca(doc.get("tls"))?,
+            android_split: android.0,
+            android_lan_direct: android.1,
             rules,
         })
     }
 } // impl ClientConfig
+
+/// Optional `client.tls.ca_pem`: validated as PEM, kept verbatim.
+fn parse_tls_ca(tls: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(pem) = tls.and_then(|section| section.get("ca_pem")) else {
+        return Ok(None);
+    };
+    let text = pem.as_str().ok_or_else(|| {
+        ClientError::ConfigError("client.tls.ca_pem must be a string".to_string())
+    })?;
+    let mut reader = std::io::Cursor::new(text.as_bytes());
+    match rustls_pemfile::certs(&mut reader) {
+        Ok(certs) if !certs.is_empty() => Ok(Some(text.to_string())),
+        _ => Err(ClientError::ConfigError(
+            "client.tls.ca_pem is not a valid PEM certificate".to_string(),
+        )),
+    }
+}
+
+/// `android.split` + `android.use_full_tunnel_lan_direct`.
+fn parse_android(
+    android: Option<&serde_json::Value>,
+    default_lan_direct: bool,
+) -> Result<(AndroidSplit, bool)> {
+    let Some(section) = android else {
+        return Ok((AndroidSplit::default(), default_lan_direct));
+    };
+    let split = match section.get("split") {
+        Some(split) if !split.is_null() => {
+            let mode = match split
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("all")
+            {
+                "all" => SplitMode::All,
+                "allow" => SplitMode::Allow,
+                "deny" => SplitMode::Deny,
+                "subnets" => SplitMode::Subnets,
+                other => {
+                    return Err(ClientError::ConfigError(format!(
+                        "android.split.mode must be all|allow|deny|subnets, got {other:?}"
+                    )))
+                }
+            };
+            AndroidSplit {
+                mode,
+                apps: string_list(split.get("apps"), "android.split.apps")?,
+                subnets: string_list(split.get("subnets"), "android.split.subnets")?,
+            }
+        }
+        _ => AndroidSplit::default(),
+    };
+    validate_split(&split)?;
+    let lan_direct = section
+        .get("use_full_tunnel_lan_direct")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default_lan_direct);
+    Ok((split, lan_direct))
+}
+
+fn string_list(value: Option<&serde_json::Value>, field: &str) -> Result<Vec<String>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    ClientError::ConfigError(format!("{field} must contain strings"))
+                })
+            })
+            .collect(),
+        Some(_) => Err(ClientError::ConfigError(format!(
+            "{field} must be an array"
+        ))),
+    }
+}
 
 /// Parse one routing rule document into the ruleset (via `Rule::from_doc`).
 fn parse_rule(rules: &mut Ruleset, doc: &serde_json::Value) -> Result<()> {
