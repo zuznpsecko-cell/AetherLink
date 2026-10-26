@@ -361,7 +361,7 @@ android:
 | **P0-R2** | Red: `HarnessSmokeTest` — JUnit + Robolectric context (`RuntimeEnvironment.getApplication() != null`), падает, пока нет тестовых зависимостей/`includeAndroidResources` | `apps/android/app/src/test/.../HarnessSmokeTest.kt` |
 | **P0-G2** | Green: тестовые зависимости (`junit:junit:4.13.2`, `org.robolectric:robolectric:4.14.1`, `androidx.test:core:1.6.1`, `androidx.test.ext:junit:1.2.1`), `testOptions.unitTests.includeAndroidResources = true`; Robolectric `@Config(sdk=[34])`; smoke зелёный | `app/build.gradle` |
 | **P0-R3** | Baseline: зафиксировать текущие `cargo test/clippy/fmt` на HEAD до изменений Rust. Результат: `test --workspace` — один вечный тест (`infinite_fast_download_aborted_by_rst_immediately_allows_upload`), остальное зелёное; `clippy -D warnings` — красный (88 warnings); `fmt --check` — красный (`threads.rs`). Всё — в `docs/LIVE_ISSUES.md`, чистится в P6-R0 | `docs/LIVE_ISSUES.md` |
-| **P0-G3** | Обновить `.gitignore`/`README` (сборка через скрипт, `.so` не коммитится) | `.gitignore`, `README.md` |
+| **P0-G3** | Обновить `.gitignore`/`README` (сборка через скрипт, `.so` не коммитится) + проверить G0 на чистом клоне: `git clone` → `scripts/build_android.ps1` → APK с 3 ABI | `.gitignore`, `README.md` |
 
 **Предпосылки P0** (проверяются скриптом): `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`, `cargo-ndk`, Android SDK + NDK (`ANDROID_NDK_HOME`), JDK 17–23 (проверено на 21). Без них G0 не закрывается.
 
