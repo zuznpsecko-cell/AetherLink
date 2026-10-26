@@ -14,9 +14,36 @@ use aetherlink_netstack::tun::{Snapshot, UpState};
 use crate::platform::{Platform, RealPlatform};
 use crate::Result;
 
+/// Which host owns the network configuration behind a tunnel.
+///
+/// The crash-recovery log describes desktop mutations (route/netsh/DNS). On
+/// Android those mutations never happen: `VpnService.Builder` owns the
+/// interface, routes and DNS, and the OS tears them down with the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKind {
+    /// Windows/Linux: routes, DNS and the state file are ours.
+    Desktop,
+    /// Android: only our own bookkeeping file is ours.
+    Android,
+}
+
 /// Restore network+DNS from the default state file. Idempotent.
 pub fn force_cleanup() -> Result<()> {
-    force_cleanup_from(&crate::platform::default_state_path())
+    force_cleanup_for(HostKind::Desktop)
+}
+
+/// Host-aware cleanup on the default state file.
+///
+/// `android_connect`/`android_disconnect` never write a desktop state file,
+/// so an Android cleanup only clears a leftover one and returns: replaying,
+/// snapshotting or resetting DNS would fail on a phone and could rewrite its
+/// network settings.
+pub fn force_cleanup_for(kind: HostKind) -> Result<()> {
+    force_cleanup_for_with(
+        kind,
+        &mut RealPlatform::new(),
+        &crate::platform::default_state_path(),
+    )
 }
 
 /// Clear a stale tunnel DNS that outlived its state file. Returns true on repair.
@@ -59,22 +86,44 @@ fn snapshot_has_tunnel_dns(snap: &Snapshot) -> bool {
 
 /// Restore from an explicit state file, consuming it. Idempotent.
 pub fn force_cleanup_from(path: &Path) -> Result<()> {
+    force_cleanup_for_with(HostKind::Desktop, &mut RealPlatform::new(), path)
+}
+
+/// Host-aware cleanup with an explicit platform and state file.
+///
+/// The platform is a seam: tests prove that Android cleanup makes no call at
+/// all, and that the desktop path still replays the log.
+pub fn force_cleanup_for_with(
+    kind: HostKind,
+    platform: &mut dyn Platform,
+    path: &Path,
+) -> Result<()> {
+    if kind == HostKind::Android {
+        // The VPN interface and everything attached to it is gone with the
+        // service. Our state file is the only leftover that is ours to drop:
+        // there is no snapshot to replay and no host DNS to heal.
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        return Ok(());
+    }
+    force_cleanup_with(platform, path)
+}
+
+fn force_cleanup_with(platform: &mut dyn Platform, path: &Path) -> Result<()> {
     if !path.exists() {
         // Nothing to replay, but the adapter may still point at us: repair it
         // instead of leaving the next `up` permanently refused.
-        let _ = heal_stale_dns(&mut RealPlatform::new());
+        let _ = heal_stale_dns(platform);
         return Ok(());
     }
     match UpState::load(path) {
-        Ok(state) => {
-            let mut platform = RealPlatform::new();
-            match platform.restore_applied(&state) {
-                Ok(()) => aetherlink_netstack::debug_log("force_cleanup: replay ok"),
-                Err(e) => {
-                    aetherlink_netstack::debug_log(&format!("force_cleanup: replay issues: {e}"));
-                }
+        Ok(state) => match platform.restore_applied(&state) {
+            Ok(()) => aetherlink_netstack::debug_log("force_cleanup: replay ok"),
+            Err(e) => {
+                aetherlink_netstack::debug_log(&format!("force_cleanup: replay issues: {e}"));
             }
-        }
+        },
         Err(e) => {
             aetherlink_netstack::debug_log(&format!(
                 "force_cleanup: unreadable state ({e}), dropping file"
