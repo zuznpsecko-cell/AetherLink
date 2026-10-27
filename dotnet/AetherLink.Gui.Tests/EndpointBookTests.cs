@@ -137,6 +137,6 @@ public sealed class EndpointBookTests
         var book = new EndpointBook();
         book.Load(new[] { Profile("home"), Profile("HOME") }, "home");
 
-        Assert.Equal("endpoint name 'HOME' is used twice", book.Validate());
+        Assert.Equal("endpoint name 'home' is used twice", book.Validate());
     }
 }
