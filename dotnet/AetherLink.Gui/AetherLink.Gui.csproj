@@ -11,6 +11,7 @@
   <ItemGroup>
     <Folder Include="Models\" />
     <AvaloniaResource Include="Assets\**" />
+    <InternalsVisibleTo Include="AetherLink.Gui.Tests" />
   </ItemGroup>
 
   <ItemGroup>

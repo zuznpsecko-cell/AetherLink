@@ -10,7 +10,7 @@ using System.Text.Json;
 
 namespace AetherLink.Gui.Services;
 
-internal sealed class TunnelService : IDisposable
+internal sealed class TunnelService : ITunnelController, IDisposable
 {
     // Held across native calls on purpose: a second Connect, or a Disconnect
     // racing an Up, must wait instead of interleaving. The core keeps a single
