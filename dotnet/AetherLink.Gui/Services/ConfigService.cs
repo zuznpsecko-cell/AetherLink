@@ -2,6 +2,7 @@
 // UI model (nested `when:` needs manual translation; attributes alone
 // cannot express the one-of shape). The core re-validates on Up().
 
+using AetherLink.Gui.Models;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -62,6 +63,66 @@ internal static class ConfigService
             {
                 cfg.Client.WintunDllPath = Str(v);
             }
+
+            if (m.TryGetValue("endpoints", out var eps) && eps is IEnumerable<object> rows)
+            {
+                foreach (var row in rows)
+                {
+                    if (row is not IDictionary<object, object?> em)
+                    {
+                        continue;
+                    }
+
+                    var endpoint = new EndpointProfile();
+                    if (em.TryGetValue("name", out var nv)) endpoint.Name = Str(nv);
+                    if (em.TryGetValue("server_addr", out nv)) endpoint.ServerAddr = Str(nv);
+                    if (em.TryGetValue("outer_sni", out nv)) endpoint.OuterSni = Str(nv);
+                    if (em.TryGetValue("psk", out nv)) endpoint.Psk = Str(nv);
+                    if (endpoint.Name.Length == 0
+                        && endpoint.ServerAddr.Length == 0
+                        && endpoint.OuterSni.Length == 0
+                        && endpoint.Psk.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    cfg.Client.Endpoints.Add(endpoint);
+                }
+            }
+
+            if (m.TryGetValue("active_endpoint", out var av))
+            {
+                cfg.Client.ActiveEndpoint = Str(av);
+            }
+        }
+
+        // Migration: an old single-server file becomes one "default" profile.
+        if (cfg.Client.Endpoints.Count == 0 && cfg.Client.ServerAddr.Length > 0)
+        {
+            cfg.Client.Endpoints.Add(new EndpointProfile
+            {
+                Name = "default",
+                ServerAddr = cfg.Client.ServerAddr,
+                OuterSni = cfg.Client.OuterSni,
+                Psk = cfg.Client.Psk,
+            });
+            cfg.Client.ActiveEndpoint = "default";
+        }
+
+        if (cfg.Client.Endpoints.Count > 0)
+        {
+            var active = cfg.Client.Endpoints.FirstOrDefault(
+                             e => string.Equals(
+                                 e.Name.Trim(),
+                                 cfg.Client.ActiveEndpoint.Trim(),
+                                 StringComparison.OrdinalIgnoreCase))
+                         ?? cfg.Client.Endpoints[0];
+            cfg.Client.ActiveEndpoint = active.Name;
+            // The list wins over the legacy mirror: keep the mirror consistent
+            // for any reader that still looks at client.server_addr.
+            cfg.Client.ServerAddr = active.ServerAddr;
+            cfg.Client.OuterSni = EndpointRules.EffectiveSni(active);
+            cfg.Client.Psk = active.Psk;
         }
 
         if (root.TryGetValue("full_tunnel", out var f))
@@ -114,13 +175,35 @@ internal static class ConfigService
             rules.Add(r.ToMapping());
         }
 
+        var endpointRows = new List<object>();
+        foreach (var endpoint in cfg.Client.Endpoints)
+        {
+            endpointRows.Add(new Dictionary<string, object>
+            {
+                ["name"] = endpoint.Name,
+                ["server_addr"] = endpoint.ServerAddr,
+                ["outer_sni"] = endpoint.OuterSni,
+                ["psk"] = endpoint.Psk,
+            });
+        }
+
+        var active = cfg.Client.Endpoints.FirstOrDefault(
+                         e => string.Equals(
+                             e.Name.Trim(),
+                             cfg.Client.ActiveEndpoint.Trim(),
+                             StringComparison.OrdinalIgnoreCase))
+                     ?? cfg.Client.Endpoints.FirstOrDefault();
+
         var root = new Dictionary<string, object>
         {
             ["client"] = new Dictionary<string, object>
             {
-                ["server_addr"] = cfg.Client.ServerAddr,
-                ["outer_sni"] = cfg.Client.OuterSni,
-                ["psk"] = cfg.Client.Psk,
+                ["active_endpoint"] = active?.Name ?? "",
+                ["endpoints"] = endpointRows,
+                // Legacy mirror: core and CLI read these three keys only.
+                ["server_addr"] = active?.ServerAddr ?? "",
+                ["outer_sni"] = active is null ? "" : EndpointRules.EffectiveSni(active),
+                ["psk"] = active?.Psk ?? "",
                 ["pad_multiple"] = cfg.Client.PadMultiple,
                 ["keepalive_s"] = cfg.Client.KeepaliveS,
                 ["wintun_dll_path"] = cfg.Client.WintunDllPath,
