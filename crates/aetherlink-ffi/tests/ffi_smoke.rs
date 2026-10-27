@@ -179,25 +179,32 @@ fn ffi_client_free_releases_handle() {
 }
 
 #[test]
-fn ffi_last_error_is_thread_local_and_copyable() {
-    // Given: a fresh test thread — no error recorded yet
-    // Then: null pointer (hosts map it to a default message)
-    assert!(aether_last_error().is_null());
-    // When: a call fails on this thread with a known exact message
-    assert_eq!(
-        unsafe { aether_client_up(usize::MAX) },
-        AetherError::InvalidHandle as i32
-    );
-    // Then: the text is NUL-terminated and EXACT — a Rust String has no NUL,
-    // so the old `String::as_ptr()` handout let CStr read past the allocation
-    // into heap garbage (Utf8Error / garbage tails in every GUI error).
-    let ptr = aether_last_error();
-    assert!(!ptr.is_null(), "error must be set after a failed call");
-    let msg = unsafe { CStr::from_ptr(ptr) }.to_str().expect("utf8");
-    assert_eq!(msg, "Invalid client handle");
-    // And: stable across reads until the next FFI call (callers copy, never free)
-    let again = aether_last_error();
-    assert!(!again.is_null());
-    let msg2 = unsafe { CStr::from_ptr(again) }.to_str().expect("utf8");
-    assert_eq!(msg, msg2, "error text is stable until the next FFI call");
+fn ffi_last_error_is_global_and_copyable() {
+    // The slot is process-global (P2-R2): a host may read `lastError()` on a
+    // different thread than the failing call. Other tests in this binary share
+    // the slot and may overwrite it between our call and our read, so retry
+    // until our own message is visible.
+    let mut last_seen = String::new();
+    for _ in 0..200 {
+        // When: a call fails with a known exact message
+        assert_eq!(
+            unsafe { aether_client_up(usize::MAX) },
+            AetherError::InvalidHandle as i32
+        );
+        // Then: the C ABI hands out a NUL-terminated copy — a Rust String has
+        // no NUL, so the old `String::as_ptr()` handout let CStr read past the
+        // allocation into heap garbage (Utf8Error / garbage tails in errors).
+        let ptr = aether_last_error();
+        if ptr.is_null() {
+            continue;
+        }
+        last_seen = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("utf8")
+            .to_string();
+        if last_seen == "Invalid client handle" {
+            return;
+        }
+    }
+    panic!("never observed our own error text, last saw {last_seen:?}");
 }

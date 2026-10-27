@@ -27,6 +27,7 @@ pub type Protector<'a> = &'a dyn Fn(i32) -> bool;
 /// C ABI so the Kotlin host has one contract for both entry points.
 #[must_use]
 pub fn create(config_json: &str) -> usize {
+    crate::clear_last_error();
     let doc: serde_json::Value = match serde_json::from_str(config_json) {
         Ok(doc) => doc,
         Err(e) => {
@@ -46,6 +47,7 @@ pub fn create(config_json: &str) -> usize {
 
 /// `clientPlan`: the `VpnService.Builder` document for a live handle.
 pub fn plan(handle: usize) -> Result<String, Code> {
+    crate::clear_last_error();
     let mut handles = HANDLES.lock().expect("handles");
     let client = match handles.get_client(handle) {
         Some(client) => client,
@@ -59,6 +61,7 @@ pub fn plan(handle: usize) -> Result<String, Code> {
 
 /// `clientStatus`: the status document for a live handle.
 pub fn status(handle: usize) -> Result<String, Code> {
+    crate::clear_last_error();
     let mut handles = HANDLES.lock().expect("handles");
     let client = match handles.get_client(handle) {
         Some(client) => client,
@@ -76,6 +79,7 @@ pub fn status(handle: usize) -> Result<String, Code> {
 /// send the server's SYN into the tunnel we are about to create. The
 /// transport stays parked until [`attach`] pairs it with the detached fd.
 pub fn connect(handle: usize, protector: Option<Protector<'_>>) -> Code {
+    crate::clear_last_error();
     let Some(protector) = protector else {
         crate::set_last_error(
             "clientConnect: VpnService.protect() is unavailable; refusing an unprotected transport",
@@ -102,6 +106,7 @@ pub fn connect(handle: usize, protector: Option<Protector<'_>>) -> Code {
 /// not close somebody else's descriptor, and a bad MTU must not leave the fd
 /// dangling.
 pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
+    crate::clear_last_error();
     let mut handles = HANDLES.lock().expect("handles");
     let client = match handles.get_client(handle) {
         Some(client) => client,
@@ -126,6 +131,7 @@ pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
 
 /// `clientDisconnect`: stop the pump and release the transport.
 pub fn disconnect(handle: usize) -> Code {
+    crate::clear_last_error();
     let mut handles = HANDLES.lock().expect("handles");
     let client = match handles.get_client(handle) {
         Some(client) => client,
@@ -143,6 +149,7 @@ pub fn disconnect(handle: usize) -> Code {
 /// `clientFree`: disconnect and drop the handle. Idempotent by contract —
 /// the host may free twice after a crash/restart path.
 pub fn free(handle: usize) -> Code {
+    crate::clear_last_error();
     let client = HANDLES.lock().expect("handles").remove_client(handle);
     if let Some(mut client) = client {
         let _ = client.android_disconnect();

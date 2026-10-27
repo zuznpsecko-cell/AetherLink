@@ -85,33 +85,47 @@ impl HandleMap {
     }
 }
 
-/// Thread-local last error message, stored **NUL-terminated**: the C ABI
-/// pointer must always be a valid C string — a Rust `String` has no NUL, so
-/// handing out `String::as_ptr()` let CStr read past the allocation into
-/// heap garbage (Utf8Error / garbage tails in every GUI error).
+/// Process-global last error message.
+///
+/// Global, not thread-local: the Kotlin host may read `lastError()` on a
+/// different thread than the worker that failed (a JNI call can return on a
+/// pool thread while the failure happened elsewhere). `None` means "no error
+/// since the last successful call".
+static LAST_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
 thread_local! {
-    static LAST_ERROR: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread NUL-terminated copy handed to C callers.
+    ///
+    /// The C ABI pointer must always be a valid C string — a Rust `String` has
+    /// no NUL, so handing out `String::as_ptr()` let CStr read past the
+    /// allocation into heap garbage (Utf8Error / garbage tails in every GUI
+    /// error). Each call on a thread refreshes this copy; the pointer stays
+    /// valid until the next call on that same thread.
+    static ERROR_COPY: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn set_last_error(msg: &str) {
-    LAST_ERROR.with(|e| {
-        let mut buf = e.borrow_mut();
-        buf.clear();
-        buf.extend_from_slice(msg.as_bytes());
-        buf.push(0);
-    });
+    let mut slot = LAST_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(msg.to_string());
+}
+
+/// Clear the slot: a successful call must not leave a stale message behind.
+pub(crate) fn clear_last_error() {
+    let mut slot = LAST_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
 }
 
 /// Current error text (no trailing NUL), if any was recorded.
 pub(crate) fn last_error_text() -> Option<String> {
-    LAST_ERROR.with(|e| {
-        let buf = e.borrow();
-        if buf.len() <= 1 {
-            None
-        } else {
-            Some(String::from_utf8_lossy(&buf[..buf.len() - 1]).into_owned())
-        }
-    })
+    LAST_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// Log callback type: `level` (0 info, higher = more severe), nul-terminated message.
@@ -144,24 +158,35 @@ pub extern "C" fn aether_version() -> *const c_char {
     VERSION.as_ptr() as *const c_char
 }
 
-/// Last error message for the calling thread.
+/// Last error message, process-global.
 ///
-/// Returns a pointer into the thread-local NUL-terminated buffer: valid until
-/// the next FFI call on this thread, and owned by the core — callers must
-/// copy the text, never free the pointer. Null when no error was recorded.
+/// Returns a pointer into a per-thread NUL-terminated **copy** of the slot:
+/// valid until the next call on this thread, and owned by the core — callers
+/// must copy the text, never free the pointer. Null when no error was
+/// recorded. The slot itself is global, so a host may read it from a
+/// different thread than the failing call.
 /// (The previous `CString::into_raw` leaked on every call and, worse, let
 /// .NET free Rust-allocated memory with CoTaskMemFree for `string` return
 /// values — heap corruption, random GUI crashes.)
 #[no_mangle]
 pub extern "C" fn aether_last_error() -> *const c_char {
-    LAST_ERROR.with(|e| {
-        let buf = e.borrow();
-        // Empty (never set) or just the NUL (set to "") both mean "no error".
-        if buf.len() <= 1 {
-            std::ptr::null()
-        } else {
-            buf.as_ptr() as *const c_char
+    let text = last_error_text();
+    ERROR_COPY.with(|copy| {
+        let mut buf = copy.borrow_mut();
+        buf.clear();
+        let Some(text) = text else {
+            return std::ptr::null();
+        };
+        // An interior NUL would silently truncate the C string; cut there so
+        // the pointer describes exactly what a CStr reader sees.
+        let bytes = text.as_bytes();
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        if end == 0 {
+            return std::ptr::null();
         }
+        buf.extend_from_slice(&bytes[..end]);
+        buf.push(0);
+        buf.as_ptr() as *const c_char
     })
 }
 
