@@ -11,6 +11,9 @@
 //! - `attach` rejects a bogus fd/mtu/handle before touching it;
 //! - `free` is idempotent and a freed handle is dead.
 
+use std::ffi::CStr;
+use std::sync::Mutex;
+
 use aetherlink_ffi::android_api as api;
 use aetherlink_ffi::AetherError;
 use serde_json::Value;
@@ -32,8 +35,18 @@ fn create_ok(addr: &str) -> usize {
     handle
 }
 
+/// The error slot is process-global, so tests that observe it must not race.
+static ERROR_SLOT: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    ERROR_SLOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn create_rejects_a_bad_document_with_a_reason() {
+    let _serial = serial();
     assert_eq!(api::create("{not json"), 0);
     let err = api::last_error().expect("a failed create must leave error text");
     assert!(
@@ -48,6 +61,7 @@ fn create_rejects_a_bad_document_with_a_reason() {
 
 #[test]
 fn plan_roundtrips_the_interface_contract() {
+    let _serial = serial();
     let handle = create_ok("127.0.0.1:9");
     let raw = api::plan(handle).expect("plan for a live handle");
     let plan: Value = serde_json::from_str(&raw).expect("plan json");
@@ -73,6 +87,7 @@ fn plan_roundtrips_the_interface_contract() {
 
 #[test]
 fn connect_without_a_protector_is_permission_denied() {
+    let _serial = serial();
     let handle = create_ok("127.0.0.1:9");
 
     let code = api::connect(handle, None);
@@ -98,6 +113,7 @@ fn connect_without_a_protector_is_permission_denied() {
 
 #[test]
 fn attach_rejects_bad_arguments_before_touching_the_fd() {
+    let _serial = serial();
     let handle = create_ok("127.0.0.1:9");
 
     assert_eq!(
@@ -120,6 +136,7 @@ fn attach_rejects_bad_arguments_before_touching_the_fd() {
 
 #[test]
 fn free_is_idempotent_and_kills_the_handle() {
+    let _serial = serial();
     let handle = create_ok("127.0.0.1:9");
 
     assert_eq!(api::free(handle), AetherError::Success as i32);
@@ -136,6 +153,7 @@ fn free_is_idempotent_and_kills_the_handle() {
 
 #[test]
 fn status_is_json_for_a_live_client() {
+    let _serial = serial();
     let handle = create_ok("127.0.0.1:9");
 
     let raw = api::status(handle).expect("status for a live handle");
@@ -145,4 +163,55 @@ fn status_is_json_for_a_live_client() {
     // Disconnect before connect is safe (the host may be killed early).
     assert_eq!(api::disconnect(handle), AetherError::Success as i32);
     assert_eq!(api::free(handle), AetherError::Success as i32);
+}
+
+/// P2-R2: the error slot is process-global, not thread-local — Kotlin may
+/// call `lastError()` from a different thread than the one that failed.
+#[test]
+fn last_error_crosses_threads() {
+    let _serial = serial();
+    std::thread::spawn(|| {
+        assert_eq!(api::create("{bad"), 0);
+    })
+    .join()
+    .expect("worker thread");
+
+    let text = api::last_error().expect("the error must be visible from another thread");
+    assert!(text.to_lowercase().contains("json"), "{text}");
+}
+
+/// A stale error must not survive a success: the host reads `lastError()` only
+/// after a failure code, but a thread that races between calls must never see
+/// an old message attached to a new result.
+#[test]
+fn a_successful_call_clears_the_error() {
+    let _serial = serial();
+    assert_eq!(api::create("{bad"), 0);
+    assert!(api::last_error().is_some());
+
+    let handle = create_ok("127.0.0.1:9");
+    assert_eq!(
+        api::last_error(),
+        None,
+        "success must clear the stale error"
+    );
+    assert_eq!(api::free(handle), AetherError::Success as i32);
+}
+
+/// The C ABI still hands out a NUL-terminated copy: `CStr` must read exactly
+/// the recorded message, never past the allocation.
+#[test]
+fn the_c_abi_pointer_is_a_nul_terminated_copy() {
+    let _serial = serial();
+    assert_eq!(api::create("{bad"), 0);
+
+    let ptr = aetherlink_ffi::aether_last_error();
+    assert!(!ptr.is_null());
+    let text = unsafe { CStr::from_ptr(ptr) }.to_str().expect("valid utf8");
+    assert!(text.to_lowercase().contains("json"), "{text}");
+    assert_eq!(
+        api::last_error().as_deref(),
+        Some(text),
+        "both surfaces must show the same error"
+    );
 }
