@@ -36,5 +36,24 @@ public sealed class EndpointSwitcher
         EndpointProfile target,
         Func<string> buildConfig,
         Func<bool> isCancelled)
-        => throw new NotImplementedException();
+    {
+        if (!_tunnel.IsUp)
+        {
+            return new EndpointSwitchResult(EndpointSwitchOutcome.SelectedOnly);
+        }
+
+        _tunnel.Down();
+        if (isCancelled())
+        {
+            return new EndpointSwitchResult(EndpointSwitchOutcome.Cancelled);
+        }
+
+        var config = buildConfig();
+        if (!_tunnel.Up(config, target.Name))
+        {
+            return new EndpointSwitchResult(EndpointSwitchOutcome.Failed, _tunnel.LastError);
+        }
+
+        return new EndpointSwitchResult(EndpointSwitchOutcome.Reconnected);
+    }
 }
