@@ -292,3 +292,62 @@ passive observation and unsolicited connection attempts.
 ### Non-goals (explicitly out of scope)
 - Custom per-browser ClientHello mimicry libraries; ECH; traffic decoys.
   Revisit only with measured need, as separate DECs.
+
+---
+
+## DEC-013: Endpoint Profiles in Client YAML
+
+**Date:** 2026-10-27
+**Status:** Accepted (Windows GUI; Android deferred)
+
+### Context
+The Windows GUI exposed exactly one server (`server_addr`, `outer_sni`,
+`psk`). Users switching between VPS endpoints had to retype all three fields
+and could not keep a named backup. The core, FFI and CLI are deliberately
+single-server, and moving endpoint selection into Rust would widen the
+protocol surface and break the thin-host rule.
+
+### Decision
+- A connection profile ("endpoint") is `name`, `server_addr`, `outer_sni`,
+  `psk`. Full tunnel, MTU, DNS mode and routing rules stay shared and are not
+  duplicated per profile.
+- Profiles live in the existing `client.local.yaml` under
+  `client.endpoints`, with `client.active_endpoint` naming the selection.
+- The active profile is mirrored into the legacy
+  `client.server_addr/outer_sni/psk` on every save. Core and CLI keep reading
+  those three keys and never learn about the list; an empty `outer_sni` is
+  mirrored as the host.
+- A legacy single-server file is migrated on load into one profile named
+  `default`. The list wins over a stale mirror when both are present.
+- Switching is manual. Selecting another profile while the tunnel is up runs
+  `Down → save config → Up`; while down it only saves. A failed reconnect
+  leaves the tunnel down with the network restored and the profile selected
+  for retry.
+- `name` is the identity: unique case-insensitively, 1..64 chars. The last
+  profile cannot be deleted. PSK stays plaintext in YAML as before and is
+  never logged.
+
+### Rationale
+- One protocol stack (Rust) and one document (YAML): the GUI adds a list and a
+  mirror, not a second config path. `gui_endpoint_list_is_ignored_by_core`
+  pins the contract.
+- Mirroring keeps CLI, Android and any config reader working unchanged
+  during the transition.
+- Down-before-up avoids two live sessions, stale routes and DNS pointing at a
+  dead tunnel; explicit failures beat silent failover while transport quality
+  is still being measured.
+
+### Non-goals (explicitly out of scope)
+- Automatic failover, health checks, latency probes, subscriptions, QR/import,
+  PSK encryption at rest, and endpoint lists in core/FFI/CLI. Revisit with
+  measured need as separate DECs.
+- Android UI profiles: separate effort after live Windows testing; it can read
+  the same `client.endpoints` shape later.
+
+### Tests
+- `dotnet/AetherLink.Gui.Tests`: EndpointRules (14), EndpointBook (11),
+  ConfigService (8), EndpointSwitcher (4), MainViewModel (12) — 49 total.
+- `crates/aetherlink-client/tests/config_schema.rs`:
+  `gui_endpoint_list_is_ignored_by_core`.
+- Gates: `scripts/check_gui_endpoints.ps1`, `scripts/check_thin_hosts.ps1`.
+- Log: `docs/WINDOWS_GUI.md`.

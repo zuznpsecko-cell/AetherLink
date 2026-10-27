@@ -9,7 +9,7 @@ Ubuntu: `./scripts/run_server_ubuntu.sh`, `sudo ./scripts/run_client_ubuntu.sh`
 
 ## GUI client (Windows, Avalonia)
 
-Tray icon + main window (status/egress IP, server config, routing rules,
+Tray icon + main window (status/egress IP, endpoint profiles, routing rules,
 logs). Thin host like the console client: same `aetherlink_core.dll`
 via FFI, no protocol code in C#. Requires admin at startup (TUN).
 
@@ -17,8 +17,16 @@ via FFI, no protocol code in C#. Requires admin at startup (TUN).
 .\scripts\run_gui_windows.ps1   # build + stage to dist/win-gui, then run AetherLink.Gui.exe
 ```
 
+The Server tab keeps named endpoint profiles (name, address, SNI, PSK) with
+Add / Duplicate / Delete. Full tunnel, MTU, DNS mode and routing rules are
+shared. Selecting another profile while connected reconnects (`Down → Up`);
+there is no automatic failover.
+
 Config: `client.local.yaml` next to the exe (edited in the Server tab,
-validated by the core on connect). Logs: `logs/gui-<date>.log`.
+validated by the core on connect). The active profile is mirrored into the
+legacy `server_addr`/`outer_sni`/`psk`, so core and CLI still read one server;
+old single-server configs migrate to a `default` profile. Logs:
+`logs/gui-<date>.log`. Details: `docs/WINDOWS_GUI.md`, decision DEC-013.
 
 ## Android client
 
@@ -39,8 +47,10 @@ plan: `PLAN_ANDROID.md`.
 ## Checks
 
 `cargo test --workspace`, `cargo clippy --workspace --all-targets`,
-`scripts/check_thin_hosts.ps1`, `scripts/check_quickstart.ps1`,
-`scripts/check_android_build.ps1`.
+`scripts/check_thin_hosts.ps1`, `scripts/check_gui_endpoints.ps1`,
+`scripts/check_quickstart.ps1`, `scripts/check_android_build.ps1`.
 
 Docs: `PLAN_FINAL_TDD.md` (live plan), `PLAN_ANDROID.md` (Android plan),
-`docs/ANDROID.md` (Android TDD log), `docs/DECISIONS.md`, `docs/STATUS.md`.
+`PLAN_ENDPOINTS_WINDOWS.md` (Windows endpoint plan), `docs/WINDOWS_GUI.md`
+(GUI + TDD log), `docs/ANDROID.md` (Android TDD log), `docs/DECISIONS.md`,
+`docs/STATUS.md`.

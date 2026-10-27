@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_ISSUES.md)_
+_Last Updated: 2026-10-27 (GUI endpoint profiles: 49/49 .NET tests + gates green; live acceptance pending admin/VPS — see docs/WINDOWS_GUI.md. Rust baseline unchanged: TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
 
 > **0l (upload 0.00): фикс в дереве, гейты НЕ прогонялись.** Причины и список правок — в
 > [docs/LIVE_ISSUES.md](LIVE_ISSUES.md#0l-аплоад-000-байты-терялись-молча-fin-убивал-ответ-id-кончались-в-дереве-гейты-не-прогонялись).
@@ -30,6 +30,7 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 | **Phase 14: Android** | ✅ Done (build) | minSdk 26, APK assembles with 3 ABIs + JNI; on-device test pending |
 | **Phase 15: Deploy Scripts** | ✅ Done | install/uninstall from dist + example configs + checks |
 | **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live runbook pending privs |
+| **Phase 17: GUI endpoint profiles** | ✅ Done (code) | `client.endpoints` + mirror, 49/49 .NET tests, `check_gui_endpoints.ps1`; live switching matrix pending admin/VPS |
 | **Phase I: Assembly (VPN works)** | ⏳ Next | OPEN frames → bind/serve loop → client up tail → FFI threads → live E2E (see PLAN_FINAL_TDD.md) |
 
 ## Detailed Status
@@ -39,9 +40,21 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 - [x] Root `Cargo.toml` with workspace config
 - [x] Individual crate `Cargo.toml` files
 - [x] `protocol/` crate with golden test harness
-- [x] `DECISIONS.md` (DEC-001..DEC-011)
+- [x] `DECISIONS.md` (DEC-001..DEC-013)
 - [x] `STATUS.md` (this file)
 - [x] Basic `README.md`
+
+### Phase 17: Windows GUI endpoint profiles
+
+- [x] `EndpointProfile`/`EndpointRules`/`EndpointBook` (validation, unique names, last profile protected)
+- [x] `ConfigService` load/save/migration + legacy mirror (`client.endpoints`, `client.active_endpoint`)
+- [x] `ITunnelController` seam + `EndpointSwitcher` (Down → config → Up, cancel and failure paths)
+- [x] `MainViewModel`: selection, Add/Duplicate/Delete, persistence, Connect on selected profile
+- [x] Server tab: list + editor, shared full tunnel / routing settings
+- [x] Core characterization: `client.endpoints` ignored, mirror is authoritative
+- [x] Gates: `check_gui_endpoints.ps1`, GUI crypto guard in `check_thin_hosts.ps1`
+- [x] Docs: `docs/WINDOWS_GUI.md` (usage, YAML, limitations, TDD log), DEC-013
+- [ ] Live acceptance matrix (`PLAN_ENDPOINTS_WINDOWS.md` §5): needs admin + real VPS/PSK
 
 ### Crate Compilation Status
 | Crate | Compiles | Tests Pass |
@@ -82,6 +95,10 @@ _Last Updated: 2026-09-29 (TDD 230/230 green; TUNNEL WORKS live vs VPS: DNS+TCP+
 2. **On-device Android test** — APK assembles; needs phone/TV for VpnService run
 3. **Gradle JVM** — must run under Java 21 (Rider JBR); Gradle 8.10 refuses
    Java 25 from the new Studio bundle
+4. **Windows GUI endpoint acceptance** — 49/49 unit tests and gates green, but
+   live `Down → Up` switching, stale-state restore after kill, and PSK-free
+   logs were not exercised on real servers; requires admin + VPS credentials
+   (`docs/WINDOWS_GUI.md` §Ручная приёмка)
 
 ## Next Steps
 
