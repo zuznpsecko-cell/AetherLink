@@ -6,6 +6,7 @@
 //! The `jni` module adds `Java_link_aether_client_AetherCore_*` entry points
 //! so the same core `.so` serves both the C ABI and Kotlin/JNI.
 
+pub mod android_api;
 pub mod jni;
 
 use once_cell::sync::Lazy;
@@ -99,6 +100,18 @@ fn set_last_error(msg: &str) {
         buf.extend_from_slice(msg.as_bytes());
         buf.push(0);
     });
+}
+
+/// Current error text (no trailing NUL), if any was recorded.
+pub(crate) fn last_error_text() -> Option<String> {
+    LAST_ERROR.with(|e| {
+        let buf = e.borrow();
+        if buf.len() <= 1 {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&buf[..buf.len() - 1]).into_owned())
+        }
+    })
 }
 
 /// Log callback type: `level` (0 info, higher = more severe), nul-terminated message.

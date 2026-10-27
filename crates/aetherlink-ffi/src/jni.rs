@@ -6,11 +6,16 @@
 //!
 //! Error codes mirror [`crate::AetherError`] so Kotlin sees one contract.
 
+// JNI entry points are `unsafe` only because the JVM owns `JNIEnv`/`JClass`;
+// the JVM is the single caller and guarantees their validity. A `# Safety`
+// section per function would repeat that sentence a dozen times.
+#![allow(clippy::missing_safety_doc)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jint, jlong};
+use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 
@@ -69,17 +74,101 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientCreate<'local>
 ) -> jlong {
     let json: String = match env.get_string(&config) {
         Ok(s) => s.into(),
-        Err(_) => return 0,
+        Err(e) => {
+            crate::set_last_error(&format!("clientCreate: bad Java string: {e}"));
+            return 0;
+        }
     };
-    let value: serde_json::Value = match serde_json::from_str(&json) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    let client = match aetherlink_client::Client::new(value) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    HANDLES.lock().expect("handles").insert_client(client) as jlong
+    crate::android_api::create(&json) as jlong
+}
+
+/// Return a Java string, or null when the JVM refuses to allocate it.
+fn as_jstring(env: &mut JNIEnv<'_>, text: String) -> jstring {
+    match env.new_string(text) {
+        Ok(s) => s.into_raw(),
+        Err(e) => {
+            crate::set_last_error(&format!("JNI: could not return string: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `AetherCore.clientPlan(handle): String` — "" on error (contract).
+#[no_mangle]
+pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientPlan<'local>(
+    mut env: JNIEnv<'local>,
+    _cls: JClass<'local>,
+    handle: jlong,
+) -> jstring {
+    let json = crate::android_api::plan(handle as usize).unwrap_or_default();
+    as_jstring(&mut env, json)
+}
+
+/// `AetherCore.clientStatus(handle): String` — "" on error (contract).
+#[no_mangle]
+pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientStatus<'local>(
+    mut env: JNIEnv<'local>,
+    _cls: JClass<'local>,
+    handle: jlong,
+) -> jstring {
+    let json = crate::android_api::status(handle as usize).unwrap_or_default();
+    as_jstring(&mut env, json)
+}
+
+/// `AetherCore.lastError(): String` — "" when nothing failed.
+#[no_mangle]
+pub unsafe extern "C" fn Java_link_aether_client_AetherCore_lastError<'local>(
+    mut env: JNIEnv<'local>,
+    _cls: JClass<'local>,
+) -> jstring {
+    let text = crate::android_api::last_error().unwrap_or_default();
+    as_jstring(&mut env, text)
+}
+
+/// `AetherCore.clientConnect(handle): Int`.
+///
+/// The protector bridge into Kotlin (`VpnService.protect`) lands in P2-G3;
+/// until then the call is refused with `PermissionDenied` instead of ever
+/// connecting the transport unprotected.
+#[no_mangle]
+pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientConnect<'local>(
+    _env: JNIEnv<'local>,
+    _cls: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    crate::android_api::connect(handle as usize, None) as jint
+}
+
+/// `AetherCore.clientAttachTun(handle, fd, mtu): Int`.
+#[no_mangle]
+pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientAttachTun<'local>(
+    _env: JNIEnv<'local>,
+    _cls: JClass<'local>,
+    handle: jlong,
+    fd: jint,
+    mtu: jint,
+) -> jint {
+    crate::android_api::attach(handle as usize, fd, mtu) as jint
+}
+
+/// `AetherCore.clientDisconnect(handle): Int`.
+#[no_mangle]
+pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientDisconnect<'local>(
+    _env: JNIEnv<'local>,
+    _cls: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    crate::android_api::disconnect(handle as usize) as jint
+}
+
+/// `AetherCore.clientFree(handle): Int` — idempotent.
+#[no_mangle]
+pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientFree<'local>(
+    _env: JNIEnv<'local>,
+    _cls: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    crate::android_api::free(handle as usize) as jint
 }
 
 /// `AetherCore.clientUp(handle): Int`.
@@ -161,14 +250,23 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_setSplitConfig<'loca
 }
 
 /// `AetherCore.forceCleanup(): Int`.
+///
+/// Android owns the VPN interface, routes and DNS: there is no desktop
+/// applied-change log to replay and no host resolver to heal. Only our own
+/// state file is dropped (Phase 1, P1-G8).
 #[no_mangle]
 pub unsafe extern "C" fn Java_link_aether_client_AetherCore_forceCleanup<'local>(
     _env: JNIEnv<'local>,
     _cls: JClass<'local>,
 ) -> jint {
-    match aetherlink_client::cleanup::force_cleanup() {
+    match aetherlink_client::cleanup::force_cleanup_for(
+        aetherlink_client::cleanup::HostKind::Android,
+    ) {
         Ok(()) => crate::AetherError::Success as jint,
-        Err(_) => crate::AetherError::InternalError as jint,
+        Err(e) => {
+            crate::set_last_error(&format!("forceCleanup: {e}"));
+            crate::AetherError::InternalError as jint
+        }
     }
 }
 

@@ -9,6 +9,7 @@ description = "AetherLink FFI C ABI exports for .NET, Android, and CLI consumers
 aetherlink-client = { path = "../aetherlink-client" }
 aetherlink-server = { path = "../aetherlink-server" }
 aetherlink-core = { path = "../aetherlink-core" }
+aetherlink-netstack = { path = "../aetherlink-netstack" }
 libc = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
