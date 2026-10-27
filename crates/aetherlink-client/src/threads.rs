@@ -361,6 +361,56 @@ fn flush_tls_writes(
     Ok(written)
 }
 
+/// Write all of `plain` into the rustls plaintext buffer, flushing ciphertext
+/// to the socket whenever the writer reports `WouldBlock`. The 256 KiB
+/// `set_buffer_limit` is a real cap that can make `writer().write()` return
+/// `WouldBlock` mid-slice even after flushing, at which point we give up and
+/// leave the remainder in the caller's buffer (returning the unconsumed
+/// tail). Callers must keep any unwritten bytes for the next turn; never
+/// treat a partial write as a fatal error.
+///
+/// Returns `Ok(remaining)` where `remaining.is_empty()` means everything was
+/// accepted. Mirrors the server's `write_tls_all` — the client previously
+/// called `writer().write_all(&buf)` directly, which treated any `WouldBlock`
+/// from a full rustls buffer as fatal and killed the session on every
+/// response larger than ~250 KB (the exact symptom reported: connect goes
+/// green, egress returns HttpRequestException, every request fails).
+fn write_tls_all<'a>(
+    stream: &mut aetherlink_core::tls::ClientTlsStream,
+    mut plain: &'a [u8],
+    stalled_since: &mut Option<Instant>,
+) -> std::io::Result<&'a [u8]> {
+    use std::io::{Error, ErrorKind};
+    while !plain.is_empty() {
+        flush_tls_writes(stream, stalled_since)?;
+        if stream.conn.wants_write() {
+            // Still have ciphertext to flush but kernel buffer is full; we
+            // cannot push more plaintext yet. Return what's left.
+            return Ok(plain);
+        }
+        match stream.conn.writer().write(plain) {
+            Ok(0) => {
+                return Err(Error::new(ErrorKind::WriteZero, "tls writer returned 0 after flush"));
+            }
+            Ok(n) => plain = &plain[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // 256 KiB plaintext buffer full; try flushing once and if the
+                // writer still won't accept more, return what's left.
+                flush_tls_writes(stream, stalled_since)?;
+                if stream.conn.wants_write() {
+                    return Ok(plain);
+                }
+                // If buffer drained, loop back and write more.
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let _ = flush_tls_writes(stream, stalled_since);
+    Ok(plain)
+}
+
 /// Spawn the non-blocking full-duplex pump inside an established TLS session.
 ///
 /// Runs both directions non-blockingly on a single owner thread:
@@ -491,43 +541,85 @@ where
                 }
             }
 
-            // 3. Coalesce queued frames into full 16 KiB TLS records while the
-            //    socket send buffer accepts data (up to 1 MiB per turn), issuing
-            //    window-update ACKs as each batch enters the WAN socket.
+            // 3. Write queued frames into TLS 1.3 records, coalescing up to
+            //    TLS_BATCH_BYTES per call. Frames are popped from `outbox`
+            //    ONLY after they are fully accepted by the rustls plaintext
+            //    writer; a `WouldBlock` mid-batch (256 KiB rustls buffer full,
+            //    or kernel send buffer full) leaves any partially-processed
+            //    frame reconstructed and requeued, never lost.
+            //
+            //    The previous code called `writer().write_all()` directly
+            //    which treated any `WouldBlock` from rustls as fatal. That
+            //    killed the pump the moment an HTTP response exceeded ~250
+            //    KiB (the exact symptom the user reported: connect goes
+            //    green, egress returns HttpRequestException, every request
+            //    fails because TCP FINs and reply bytes never made it to the
+            //    socket and the peer timed out).
+            let mut sent_frames: usize = 0;
             for _ in 0..64 {
+                match flush_tls_writes(&mut stream, &mut write_stalled_since) {
+                    Ok(n) if n > 0 => progressed = true,
+                    Err(e) => break 'pump format!("tls socket write failed: {e}"),
+                    _ => {}
+                }
                 if stream.conn.wants_write() || outbox.is_empty() {
                     break;
                 }
                 tx_buf.clear();
-                let mut batch = 0usize;
-                while batch < TLS_BATCH_FRAMES {
-                    let Some(front) = outbox.front() else {
-                        break;
-                    };
-                    let wire_len = FRAME_HEADER_SIZE + front.ciphertext.len();
-                    if batch > 0 && tx_buf.len() + wire_len > TLS_BATCH_BYTES {
+                let mut frames_in_batch = 0usize;
+                // Peek frames, building a wire batch without popping yet.
+                for f in outbox.iter().take(TLS_BATCH_FRAMES) {
+                    let wire_len = FRAME_HEADER_SIZE + f.ciphertext.len();
+                    if frames_in_batch > 0 && tx_buf.len() + wire_len > TLS_BATCH_BYTES {
                         break;
                     }
-                    let Some(f) = outbox.pop_front() else {
-                        break;
-                    };
                     f.header.encode(&mut tx_buf);
                     tx_buf.extend_from_slice(&f.ciphertext);
-                    batch += 1;
+                    frames_in_batch += 1;
                 }
-                if batch == 0 {
+                if frames_in_batch == 0 {
                     break;
                 }
-                if let Err(e) = stream.conn.writer().write_all(&tx_buf) {
-                    break 'pump format!("tls plaintext writer failed: {e}");
+                // Write the batch with WouldBlock-aware writer; remaining
+                // holds any bytes rustls would not accept.
+                let remaining = match write_tls_all(&mut stream, &tx_buf, &mut write_stalled_since) {
+                    Ok(r) => r,
+                    Err(e) => break 'pump format!("tls plaintext writer failed: {e}"),
+                };
+                let accepted_bytes = tx_buf.len() - remaining.len();
+                // Pop frames whose full wire bytes were accepted, by
+                // walking the original batch and counting frames whose
+                // header+ciphertext fit inside accepted_bytes.
+                let mut accepted_frames = 0usize;
+                let mut acc = 0usize;
+                for _ in 0..frames_in_batch {
+                    let Some(f) = outbox.front() else { break };
+                    let w = FRAME_HEADER_SIZE + f.ciphertext.len();
+                    if acc + w > accepted_bytes {
+                        break;
+                    }
+                    acc += w;
+                    outbox.pop_front();
+                    accepted_frames += 1;
                 }
+                if accepted_frames == 0 {
+                    // Nothing could be accepted even after flushing —
+                    // kernel buffer is full; yield to reads.
+                    break;
+                }
+                sent_frames += accepted_frames;
                 last_tx = Instant::now();
                 progressed = true;
-
+                if accepted_frames < frames_in_batch {
+                    // Partial batch: stop writing, drain ciphertext below.
+                    break;
+                }
+            }
+            if sent_frames > 0 {
                 let write_res = flush_tls_writes(&mut stream, &mut write_stalled_since);
                 match tun.lock() {
                     Ok(mut guard) => {
-                        pump.frames_written(batch);
+                        pump.frames_written(sent_frames);
                         pump.flush_acks(&mut *guard);
                     }
                     Err(_) => {
@@ -557,10 +649,16 @@ where
                     }
                     .encode(&mut tx_buf);
                     tx_buf.extend_from_slice(&[0u8; 16]);
-                    let _ = stream.conn.writer().write_all(&tx_buf);
-                    last_tx = Instant::now();
-                    if let Err(e) = flush_tls_writes(&mut stream, &mut write_stalled_since) {
-                        break 'pump format!("tls keepalive write failed: {e}");
+                    // Use the WouldBlock-aware writer (a full send buffer at
+                    // idle would otherwise kill the session for no reason).
+                    match write_tls_all(&mut stream, &tx_buf, &mut write_stalled_since) {
+                        Ok(remaining) if remaining.is_empty() => {
+                            last_tx = Instant::now();
+                        }
+                        Ok(_) => {
+                            // Partially written — try again next turn.
+                        }
+                        Err(e) => break 'pump format!("tls keepalive write failed: {e}"),
                     }
                 }
 
