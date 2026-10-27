@@ -1,12 +1,15 @@
 # Quickstart: AetherLink GUI client on Windows. Run ELEVATED (admin) to test:
-#   .\scripts\run_gui_windows.ps1 [-Config <path>]
+#   .\scripts\run_gui_windows.ps1 [-Config <path>] [-ResetConfig]
 # Builds core, publishes the Avalonia GUI host (win-x64, self-contained),
 # stages core DLL + wintun.dll side-by-side. The app itself prompts for
-# admin at startup (requireAdministrator manifest).
+# admin at startup (requireAdministrator manifest). An existing staged
+# client.local.yaml (with the user's endpoint profiles) is kept unless
+# -ResetConfig is passed.
 [CmdletBinding()]
 param(
     [string]$Config = "configs/client.example.yaml",
-    [string]$OutDir = "dist/win-gui"
+    [string]$OutDir = "dist/win-gui",
+    [switch]$ResetConfig
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -42,6 +45,6 @@ if (Test-Path -LiteralPath ./wintun.dll) {
 if (-not (Test-Path -LiteralPath $Config)) {
     Copy-Item -Force configs/client.example.yaml $Config
 }
-Copy-Item -Force $Config "$OutDir/client.local.yaml"
+& (Join-Path $PSScriptRoot "stage_gui_config.ps1") -Source $Config -OutDir $OutDir -Reset:$ResetConfig
 
 Write-Output "==> Staged in $OutDir (run AetherLink.Gui.exe elevated)."

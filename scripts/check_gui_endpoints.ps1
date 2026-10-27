@@ -69,5 +69,32 @@ Check "example config documents active endpoint" (Has-Text $example "(?m)^\s*act
 Check "tests project references gui" (Has-Text $testsCsproj "AetherLink\.Gui")
 Check "gui exposes internals to tests" (Has-Text $guiCsproj "InternalsVisibleTo")
 
+# --- staging must not wipe saved profiles ---
+$stageScript = "$root/scripts/stage_gui_config.ps1"
+Check "staging helper exists" (Test-Path -LiteralPath $stageScript)
+Check "run script uses staging helper" (Has-Text "$root/scripts/run_gui_windows.ps1" "stage_gui_config\.ps1")
+if (Test-Path -LiteralPath $stageScript) {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("aetherlink-stage-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        $src = Join-Path $tmp "example.yaml"
+        Set-Content -LiteralPath $src -Value "client:`n  server_addr: new.example:443" -Encoding utf8
+        $outDir = Join-Path $tmp "out"
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        $dst = Join-Path $outDir "client.local.yaml"
+        Set-Content -LiteralPath $dst -Value "saved-profile" -Encoding utf8
+
+        & $stageScript -Source $src -OutDir $outDir | Out-Null
+        Check "staging keeps existing config" (((Get-Content -LiteralPath $dst -Raw).Trim()) -eq "saved-profile")
+
+        & $stageScript -Source $src -OutDir $outDir -Reset | Out-Null
+        Check "reset replaces config" (((Get-Content -LiteralPath $dst -Raw)) -match "new\.example:443")
+        Check "reset keeps backup" (@(Get-ChildItem -LiteralPath $outDir -Filter "client.local.yaml.bak-*").Count -eq 1)
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($fail -gt 0) { Write-Output "$fail checks failed"; exit 1 }
 Write-Output "all gui endpoint checks passed"

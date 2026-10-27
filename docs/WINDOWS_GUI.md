@@ -21,9 +21,15 @@ powershell -NoProfile -File scripts/check_thin_hosts.ps1
 
 `check_gui_endpoints.ps1` — контракт профилей: YAML-поля, привязки XAML,
 команды Add/Duplicate/Delete, отсутствие PSK в логах, отсутствие
-криптостека и заглушек `NotImplementedException` в GUI.
+криптостека и заглушек `NotImplementedException` в GUI, а также то, что
+стейдж не затирает сохранённые профили.
 `check_thin_hosts.ps1` дополнительно проверяет, что в `dotnet/AetherLink.Gui`
 нет `SslStream|ChaCha|HMAC|AesGcm`.
+
+Пересборка не перезаписывает существующий `dist/win-gui/client.local.yaml`:
+профили остаются. Заменить конфиг примером принудительно —
+`.\scripts\run_gui_windows.ps1 -ResetConfig` (старый файл сохраняется рядом
+как `client.local.yaml.bak-<дата>`).
 
 ## Использование
 
