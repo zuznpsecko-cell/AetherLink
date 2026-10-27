@@ -61,6 +61,12 @@ Check "client has no SslStream" (No-Text $clientProg "SslStream")
 Check "client has no ChaCha/HMAC" (No-Text $clientProg "(ChaCha|HMAC|AesGcm)")
 Check "client self-contained publish" (Has-Text $clientCsproj "SelfContained")
 
+# --- Windows GUI: endpoint profiles, still a thin host ---
+$guiSources = @(Get-ChildItem "$root/dotnet/AetherLink.Gui" -Recurse -Filter *.cs |
+    Where-Object { $_.FullName -notmatch '\\(bin|obj)\\' })
+$guiCrypto = @($guiSources | Where-Object { (Code-Text $_.FullName) -match "(SslStream|ChaCha|HMAC|AesGcm)" })
+Check "gui has no crypto stack" ($guiCrypto.Count -eq 0)
+
 # --- Android: VpnService fd -> core, split default all, no crypto in Kotlin ---
 Check "vpn establishes Builder" (Has-Text $vpnService "Builder")
 Check "vpn passes tun fd to core" (Has-Text $vpnService "setTunFd|SetTunFd|tunFd")

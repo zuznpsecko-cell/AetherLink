@@ -1,6 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:AetherLink.Gui.ViewModels"
+        xmlns:models="using:AetherLink.Gui.Models"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="640" d:DesignHeight="520"
@@ -31,23 +32,63 @@
 
         <TabControl>
             <TabItem Header="Server">
-                <StackPanel Spacing="8" Margin="4">
-                    <TextBlock Text="Server address (host:port)" />
-                    <TextBox Text="{Binding ServerAddr}" />
-                    <TextBlock Text="Outer SNI" />
-                    <TextBox Text="{Binding OuterSni}" />
-                    <TextBlock Text="PSK (base64)" />
-                    <TextBox Text="{Binding Psk}" PasswordChar="*" />
-                    <CheckBox Content="Full tunnel" IsChecked="{Binding FullTunnel}" />
-                    <TextBlock Text="DNS mode" />
-                    <TextBox Text="{Binding DnsMode}" />
-                    <TextBlock Text="{Binding ConfigPath, StringFormat='Config: {0}'}" FontSize="11" />
-                    <Button Content="Refresh egress IP" Command="{Binding RefreshEgressCommand}"
-                            HorizontalAlignment="Left" />
-                    <TextBlock Text="After a crash or forced shutdown the network may still point into the tunnel. Restore it before reconnecting." FontSize="11" TextWrapping="Wrap" />
-                    <Button Content="Restore network" Command="{Binding RestoreNetworkCommand}"
-                            HorizontalAlignment="Left" />
-                </StackPanel>
+                <Grid ColumnDefinitions="200,*" Margin="4">
+                    <DockPanel Grid.Column="0" Margin="0,0,12,0">
+                        <StackPanel DockPanel.Dock="Bottom" Spacing="6" Margin="0,8,0,0">
+                            <Button Content="Add" Command="{Binding AddEndpointCommand}"
+                                    IsEnabled="{Binding CanEditEndpoints}"
+                                    HorizontalAlignment="Stretch" />
+                            <Button Content="Duplicate" Command="{Binding DuplicateEndpointCommand}"
+                                    IsEnabled="{Binding CanEditEndpoints}"
+                                    HorizontalAlignment="Stretch" />
+                            <Button Content="Delete" Command="{Binding DeleteEndpointCommand}"
+                                    IsEnabled="{Binding CanDeleteEndpoint}"
+                                    HorizontalAlignment="Stretch" />
+                        </StackPanel>
+                        <ListBox ItemsSource="{Binding Endpoints}"
+                                 SelectedItem="{Binding SelectedEndpoint, Mode=TwoWay}"
+                                 IsEnabled="{Binding CanEditEndpoints}">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate x:DataType="models:EndpointProfile">
+                                    <StackPanel>
+                                        <TextBlock Text="{Binding Display}" FontWeight="SemiBold" />
+                                        <TextBlock Text="{Binding ServerAddr}" FontSize="11"
+                                                   Opacity="0.7" TextTrimming="CharacterEllipsis" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </DockPanel>
+
+                    <ScrollViewer Grid.Column="1">
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="Endpoint" FontWeight="Bold" />
+                            <StackPanel Spacing="8" IsEnabled="{Binding HasSelection}">
+                                <TextBlock Text="Name" />
+                                <TextBox Text="{Binding SelectedEndpoint.Name, Mode=TwoWay}" />
+                                <TextBlock Text="Server address (host:port)" />
+                                <TextBox Text="{Binding SelectedEndpoint.ServerAddr, Mode=TwoWay}" />
+                                <TextBlock Text="Outer SNI (empty = server host)" />
+                                <TextBox Text="{Binding SelectedEndpoint.OuterSni, Mode=TwoWay}" />
+                                <TextBlock Text="PSK (base64)" />
+                                <TextBox Text="{Binding SelectedEndpoint.Psk, Mode=TwoWay}"
+                                         PasswordChar="*" />
+                            </StackPanel>
+                            <TextBlock Text="Selecting another profile while connected reconnects the tunnel."
+                                       FontSize="11" TextWrapping="Wrap" />
+                            <TextBlock Text="Shared settings" FontWeight="Bold" Margin="0,8,0,0" />
+                            <CheckBox Content="Full tunnel" IsChecked="{Binding FullTunnel}" />
+                            <TextBlock Text="DNS mode" />
+                            <TextBox Text="{Binding DnsMode}" />
+                            <TextBlock Text="{Binding ConfigPath, StringFormat='Config: {0}'}" FontSize="11" />
+                            <Button Content="Refresh egress IP" Command="{Binding RefreshEgressCommand}"
+                                    HorizontalAlignment="Left" />
+                            <TextBlock Text="After a crash or forced shutdown the network may still point into the tunnel. Restore it before reconnecting." FontSize="11" TextWrapping="Wrap" />
+                            <Button Content="Restore network" Command="{Binding RestoreNetworkCommand}"
+                                    HorizontalAlignment="Left" />
+                        </StackPanel>
+                    </ScrollViewer>
+                </Grid>
             </TabItem>
             <TabItem Header="Routes">
                 <DockPanel>

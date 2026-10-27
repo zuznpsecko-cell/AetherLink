@@ -7,7 +7,15 @@ namespace AetherLink.Gui.ViewModels;
 
 public partial class MainViewModel : ViewModelBase
 {
-    private readonly Services.TunnelService _tunnel = new();
+    private readonly Services.ITunnelController _tunnel;
+    private readonly Services.EndpointSwitcher _switcher;
+    private readonly Services.EndpointBook _book = new();
+    private readonly Action<Action> _uiPost;
+    private readonly Func<Task<string>> _egress;
+
+    // Set while LoadConfig fills the book: selection changes must not save
+    // or trigger a reconnect during startup.
+    private bool _loading;
 
     // UI-thread only. Set while an Up/Down/restore is in flight so repeated
     // clicks cannot queue a second tunnel behind the first.
@@ -36,15 +44,6 @@ public partial class MainViewModel : ViewModelBase
     public partial string EgressIp { get; set; } = "-";
 
     [ObservableProperty]
-    public partial string ServerAddr { get; set; } = "";
-
-    [ObservableProperty]
-    public partial string OuterSni { get; set; } = "";
-
-    [ObservableProperty]
-    public partial string Psk { get; set; } = "";
-
-    [ObservableProperty]
     public partial string DnsMode { get; set; } = "tunnel";
 
     [ObservableProperty]
@@ -58,11 +57,39 @@ public partial class MainViewModel : ViewModelBase
 
     public ObservableCollection<Models.RouteRule> Rules { get; } = new();
 
+    public ObservableCollection<Models.EndpointProfile> Endpoints => _book.Items;
+
+    [ObservableProperty]
+    public partial Models.EndpointProfile? SelectedEndpoint { get; set; }
+
     public bool IsUp => _tunnel.IsUp;
     public string ConnectLabel => _busy && !_tunnel.IsUp ? "Cancel" : IsUp ? "Disconnect" : "Connect";
+    public bool HasSelection => SelectedEndpoint is not null;
+    public bool CanDeleteEndpoint => _book.CanRemove && !_busy;
+    public bool CanEditEndpoints => !_busy;
+
+    /// <summary>
+    /// Completes when the automatic Down/Up of a profile switch finishes.
+    /// Exposed for tests; the UI observes status text instead.
+    /// </summary>
+    internal Task SwitchCompletion { get; private set; } = Task.CompletedTask;
 
     public MainViewModel()
+        : this(new Services.TunnelService(), null, null, null)
     {
+    }
+
+    internal MainViewModel(
+        Services.ITunnelController tunnel,
+        string? configPath = null,
+        Action<Action>? uiPost = null,
+        Func<Task<string>>? egress = null)
+    {
+        _tunnel = tunnel;
+        _switcher = new Services.EndpointSwitcher(tunnel);
+        _uiPost = uiPost ?? (a => Dispatcher.UIThread.Post(a));
+        _egress = egress ?? (() => Services.EgressService.GetEgressIpAsync());
+
         // Changed fires on worker and poll threads; bindings must only be
         // touched on the UI thread.
         // Notifications must never break the caller: this also runs from the
@@ -71,14 +98,16 @@ public partial class MainViewModel : ViewModelBase
         {
             try
             {
-                Dispatcher.UIThread.Post(OnTunnelChanged);
+                _uiPost(OnTunnelChanged);
             }
             catch (Exception ex)
             {
                 Services.GuiLog.Warn($"ui notify skipped: {ex.Message}");
             }
         };
-        ConfigPath = Services.ConfigService.ResolvePath();
+        ConfigPath = string.IsNullOrEmpty(configPath)
+            ? Services.ConfigService.ResolvePath()
+            : configPath;
         LoadConfig();
     }
 
@@ -155,15 +184,18 @@ public partial class MainViewModel : ViewModelBase
         }
 
         LastError = "";
-        if (string.IsNullOrWhiteSpace(ServerAddr))
+        var endpointError = _book.Validate();
+        if (endpointError is not null)
         {
-            LastError = "config error: server address is empty";
+            LastError = $"config error: {endpointError}";
+            Services.GuiLog.Warn($"connect blocked: {endpointError}");
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(Psk))
+        var endpoint = SelectedEndpoint;
+        if (endpoint is null)
         {
-            LastError = "config error: PSK is empty";
+            LastError = "config error: select an endpoint";
             return;
         }
 
@@ -177,11 +209,12 @@ public partial class MainViewModel : ViewModelBase
 
         SaveConfig();
         var raw = Services.ConfigService.RawText(ConfigPath);
-        var label = ServerAddr;
+        var label = endpoint.Name;
         _disconnectRequested = false;
         _busy = true;
         StatusText = "Connecting...";
         OnPropertyChanged(nameof(ConnectLabel));
+        OnPropertyChanged(nameof(CanEditEndpoints));
         bool ok;
         try
         {
@@ -234,6 +267,7 @@ public partial class MainViewModel : ViewModelBase
 
         _busy = false;
         OnPropertyChanged(nameof(ConnectLabel));
+        OnPropertyChanged(nameof(CanEditEndpoints));
 
         OnTunnelChanged();
         if (ok && _disconnectRequested)
@@ -289,6 +323,7 @@ public partial class MainViewModel : ViewModelBase
 
         LastError = "";
         _busy = true;
+        OnPropertyChanged(nameof(CanEditEndpoints));
         string? err;
         try
         {
@@ -301,6 +336,7 @@ public partial class MainViewModel : ViewModelBase
         finally
         {
             _busy = false;
+            RaiseBusyChanged();
         }
 
         if (err is not null)
@@ -321,7 +357,125 @@ public partial class MainViewModel : ViewModelBase
     private async Task RefreshEgressAsync()
     {
         EgressIp = "checking...";
-        EgressIp = await Services.EgressService.GetEgressIpAsync();
+        EgressIp = await _egress();
+    }
+
+    [RelayCommand]
+    private void AddEndpoint()
+    {
+        var endpoint = _book.Add();
+        SelectedEndpoint = endpoint;
+        RaiseBookChanged();
+    }
+
+    [RelayCommand]
+    private void DuplicateEndpoint()
+    {
+        var source = SelectedEndpoint ?? _book.Active;
+        if (source is null)
+        {
+            AddEndpoint();
+            return;
+        }
+
+        var copy = _book.Duplicate(source);
+        SelectedEndpoint = copy;
+        RaiseBookChanged();
+    }
+
+    [RelayCommand]
+    private void DeleteEndpoint()
+    {
+        var target = SelectedEndpoint;
+        if (target is null || !_book.Remove(target))
+        {
+            RaiseBookChanged();
+            return;
+        }
+
+        SelectedEndpoint = _book.Active;
+        SaveConfig();
+        RaiseBookChanged();
+    }
+
+    private void RaiseBookChanged()
+    {
+        OnPropertyChanged(nameof(CanDeleteEndpoint));
+        OnPropertyChanged(nameof(HasSelection));
+    }
+
+    private void RaiseBusyChanged()
+    {
+        OnPropertyChanged(nameof(CanEditEndpoints));
+        OnPropertyChanged(nameof(CanDeleteEndpoint));
+    }
+
+    partial void OnSelectedEndpointChanged(Models.EndpointProfile? value)
+    {
+        OnPropertyChanged(nameof(HasSelection));
+        if (_loading)
+        {
+            return;
+        }
+
+        _book.Select(value);
+        if (value is null)
+        {
+            return;
+        }
+
+        SaveConfig();
+        if (_tunnel.IsUp && !_busy)
+        {
+            SwitchCompletion = SwitchToAsync(value);
+        }
+    }
+
+    /// <summary>
+    /// Selection changed while the tunnel is up: Down, then Up on the new
+    /// profile. A failure leaves the tunnel down with the network restored;
+    /// the selected profile stays so Connect can retry it.
+    /// </summary>
+    private async Task SwitchToAsync(Models.EndpointProfile target)
+    {
+        LastError = "";
+        _disconnectRequested = false;
+        _busy = true;
+        StatusText = "Switching...";
+        OnPropertyChanged(nameof(ConnectLabel));
+        OnPropertyChanged(nameof(CanEditEndpoints));
+
+        Services.EndpointSwitchResult result;
+        try
+        {
+            result = await Task.Run(() => _switcher.Switch(
+                target,
+                () => Services.ConfigService.RawText(ConfigPath),
+                () => _disconnectRequested));
+        }
+        catch (Exception ex)
+        {
+            result = new Services.EndpointSwitchResult(
+                Services.EndpointSwitchOutcome.Failed, ex.Message);
+            Services.GuiLog.Error($"switch threw: {ex.Message}");
+        }
+        finally
+        {
+            _busy = false;
+            OnPropertyChanged(nameof(ConnectLabel));
+            RaiseBusyChanged();
+        }
+
+        if (result.Error is not null)
+        {
+            LastError = result.Error;
+        }
+
+        OnTunnelChanged();
+        if (result.Outcome == Services.EndpointSwitchOutcome.Reconnected)
+        {
+            await RefreshEgressAsync();
+        }
     }
 
     [RelayCommand]
@@ -367,11 +521,20 @@ public partial class MainViewModel : ViewModelBase
         {
             var cfg = Services.ConfigService.Load(ConfigPath);
             _config = cfg;
-            ServerAddr = cfg.Client.ServerAddr;
-            OuterSni = cfg.Client.OuterSni;
-            Psk = cfg.Client.Psk;
+            _loading = true;
+            try
+            {
+                _book.Load(cfg.Client.Endpoints, cfg.Client.ActiveEndpoint);
+                SelectedEndpoint = _book.Active;
+            }
+            finally
+            {
+                _loading = false;
+            }
+
             DnsMode = cfg.FullTunnel.DnsMode;
             FullTunnel = cfg.FullTunnel.Enabled;
+            RaiseBookChanged();
             Rules.Clear();
             foreach (var r in cfg.Routing.Rules)
             {
@@ -395,9 +558,8 @@ public partial class MainViewModel : ViewModelBase
     {
         try
         {
-            _config.Client.ServerAddr = ServerAddr;
-            _config.Client.OuterSni = OuterSni;
-            _config.Client.Psk = Psk;
+            _config.Client.Endpoints = _book.Items.ToList();
+            _config.Client.ActiveEndpoint = SelectedEndpoint?.Name ?? "";
             _config.FullTunnel.Enabled = FullTunnel;
             _config.FullTunnel.DnsMode = DnsMode;
             _config.Routing.Rules = Rules.ToList();
@@ -423,6 +585,8 @@ public partial class MainViewModel : ViewModelBase
     /// </summary>
     public void Shutdown(TimeSpan timeout)
     {
+        // Persist the latest profile edits even when the user never connected.
+        SaveConfig();
         try
         {
             Task.Run(() => _tunnel.Down()).Wait(timeout);

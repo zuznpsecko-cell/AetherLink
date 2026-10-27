@@ -86,13 +86,13 @@ public sealed class MainViewModelTests : IDisposable
     }
 
     [Fact]
-    public void Connect_UsesSelectedEndpoint_AndSavesMirror()
+    public async Task Connect_UsesSelectedEndpoint_AndSavesMirror()
     {
         var vm = Create();
         vm.AddEndpointCommand.Execute(null);
         Fill(vm.SelectedEndpoint!, "home", "home.example.com:443", "psk-home");
 
-        vm.ConnectDisconnectCommand.ExecuteAsync(null).GetAwaiter().GetResult();
+        await vm.ConnectDisconnectCommand.ExecuteAsync(null);
 
         var call = Assert.Single(_tunnel.Calls);
         Assert.StartsWith("up:home:", call);
@@ -111,39 +111,39 @@ public sealed class MainViewModelTests : IDisposable
     }
 
     [Fact]
-    public void Connect_WithInvalidEndpoint_DoesNotCallNative()
+    public async Task Connect_WithInvalidEndpoint_DoesNotCallNative()
     {
         var vm = Create();
         vm.AddEndpointCommand.Execute(null);
         Fill(vm.SelectedEndpoint!, "home", "not-an-address");
         _tunnel.Calls.Clear();
 
-        vm.ConnectDisconnectCommand.ExecuteAsync(null).GetAwaiter().GetResult();
+        await vm.ConnectDisconnectCommand.ExecuteAsync(null);
 
         Assert.Empty(_tunnel.Calls);
         Assert.Contains("server address must be host:port", vm.LastError);
     }
 
     [Fact]
-    public void Connect_WithNoEndpoints_DoesNotCallNative()
+    public async Task Connect_WithNoEndpoints_DoesNotCallNative()
     {
         var vm = Create();
 
-        vm.ConnectDisconnectCommand.ExecuteAsync(null).GetAwaiter().GetResult();
+        await vm.ConnectDisconnectCommand.ExecuteAsync(null);
 
         Assert.Empty(_tunnel.Calls);
         Assert.Contains("add at least one endpoint", vm.LastError);
     }
 
     [Fact]
-    public void Switch_WhenUp_ReconnectsWithSelectedProfile()
+    public async Task Switch_WhenUp_ReconnectsWithSelectedProfile()
     {
         var vm = Create(TwoEndpoints);
-        vm.ConnectDisconnectCommand.ExecuteAsync(null).GetAwaiter().GetResult();
+        await vm.ConnectDisconnectCommand.ExecuteAsync(null);
         Assert.True(vm.IsUp);
 
         vm.SelectedEndpoint = vm.Endpoints[1];
-        vm.SwitchCompletion.GetAwaiter().GetResult();
+        await vm.SwitchCompletion;
 
         Assert.Equal(3, _tunnel.Calls.Count);
         Assert.Equal("down", _tunnel.Calls[1]);
@@ -154,12 +154,12 @@ public sealed class MainViewModelTests : IDisposable
     }
 
     [Fact]
-    public void Switch_WhenDown_OnlySelectsAndSaves()
+    public async Task Switch_WhenDown_OnlySelectsAndSaves()
     {
         var vm = Create(TwoEndpoints);
 
         vm.SelectedEndpoint = vm.Endpoints[1];
-        vm.SwitchCompletion.GetAwaiter().GetResult();
+        await vm.SwitchCompletion;
 
         Assert.Empty(_tunnel.Calls);
         Assert.Contains("active_endpoint: backup", File.ReadAllText(_path));
@@ -179,6 +179,70 @@ public sealed class MainViewModelTests : IDisposable
 
         vm.DeleteEndpointCommand.Execute(null);
         Assert.Single(vm.Endpoints);
+    }
+
+    [Fact]
+    public async Task Switch_UpFailure_LeavesTunnelDown()
+    {
+        var vm = Create(TwoEndpoints);
+        await vm.ConnectDisconnectCommand.ExecuteAsync(null);
+        _tunnel.UpResult = false;
+
+        vm.SelectedEndpoint = vm.Endpoints[1];
+        await vm.SwitchCompletion;
+
+        Assert.False(vm.IsUp);
+        Assert.Equal("connect failed", vm.LastError);
+        Assert.Equal("backup", vm.SelectedEndpoint!.Name);
+    }
+
+    [Fact]
+    public async Task Connect_WithDuplicateNames_DoesNotCallNative()
+    {
+        var vm = Create("""
+            client:
+              active_endpoint: home
+              endpoints:
+                - name: home
+                  server_addr: home.example.com:443
+                  psk: psk-home
+                - name: HOME
+                  server_addr: backup.example.com:443
+                  psk: psk-backup
+            """);
+
+        await vm.ConnectDisconnectCommand.ExecuteAsync(null);
+
+        Assert.Empty(_tunnel.Calls);
+        Assert.Contains("used twice", vm.LastError);
+    }
+
+    [Fact]
+    public void DuplicateEndpoint_CopiesSelectedProfile()
+    {
+        var vm = Create(TwoEndpoints);
+
+        vm.DuplicateEndpointCommand.Execute(null);
+
+        Assert.Equal(3, vm.Endpoints.Count);
+        Assert.Equal("home (copy)", vm.SelectedEndpoint!.Name);
+        Assert.Equal("home.example.com:443", vm.SelectedEndpoint.ServerAddr);
+        Assert.Equal("psk-home", vm.SelectedEndpoint.Psk);
+    }
+
+    [Fact]
+    public void Shutdown_PersistsProfileEdits()
+    {
+        var vm = Create();
+        vm.AddEndpointCommand.Execute(null);
+        Fill(vm.SelectedEndpoint!, "saved", "saved.example.com:443");
+
+        vm.Shutdown(TimeSpan.FromSeconds(1));
+
+        var saved = ConfigService.Load(_path);
+        var endpoint = Assert.Single(saved.Client.Endpoints);
+        Assert.Equal("saved", endpoint.Name);
+        Assert.Equal("saved.example.com:443", saved.Client.ServerAddr);
     }
 
     [Fact]
