@@ -131,7 +131,17 @@ fn ip_addr(ip: Ipv4Addr) -> IpAddress {
     IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
 }
 
-/// Parse one raw IPv4 packet, verifying checksums. Fails closed.
+/// Parse one raw IPv4 packet.
+///
+/// Checksum fields are ADVISORY on receive: wintun on Windows delivers TX
+/// packets with IPv4/TCP/UDP header checksums left at 0 (tcpip.sys expects
+/// a NIC to fill them via TCP/IP offloading, and wintun is a software
+/// adapter that does not). Refusing such packets ("bad tcp checksum" /
+/// "bad ip checksum") drops every outbound ACK/request after the SYN-ACK
+/// lands, so the server never sees the GET/POST and the browser times out
+/// into `ERR_CONNECTION_RESET`. We parse addresses/flags/ports from the
+/// wire bytes unconditionally; replies we emit back onto TUN always carry
+/// a fully-computed checksum (see `build_tcp_packet_full` / `build_udp_packet`).
 pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
     let ip = Ipv4Packet::new_checked(raw)
         .map_err(|_| NetstackError::InvalidPacket("truncated ip".to_string()))?;
@@ -144,9 +154,8 @@ pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
     if ip.total_len() as usize > raw.len() {
         return Err(NetstackError::InvalidPacket("short buffer".to_string()));
     }
-    if !ip.verify_checksum() {
-        return Err(NetstackError::InvalidPacket("bad ip checksum".to_string()));
-    }
+    // NOTE: intentionally skip ip.verify_checksum() here — see function
+    // doc comment about wintun checksum offload delivering zeroed csums.
     let src = Ipv4Addr::from(ip.src_addr());
     let dst = Ipv4Addr::from(ip.dst_addr());
     let body = &raw[ip.header_len() as usize..ip.total_len() as usize];
@@ -154,18 +163,15 @@ pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
         IpProtocol::Tcp => {
             let tcp = TcpPacket::new_checked(body)
                 .map_err(|_| NetstackError::InvalidPacket("truncated tcp".to_string()))?;
-            if !tcp.verify_checksum(&ip_addr(src), &ip_addr(dst)) {
-                return Err(NetstackError::InvalidPacket("bad tcp checksum".to_string()));
-            }
-            let header = tcp.header_len() as usize;
-            if header > body.len() {
+            if tcp.header_len() as usize > body.len() {
                 return Err(NetstackError::InvalidPacket("bad tcp header".to_string()));
             }
-            let mss = if header > 20 {
-                parse_tcp_mss(&body[20..header])
+            let mss = if tcp.header_len() as usize > 20 {
+                parse_tcp_mss(&body[20..tcp.header_len() as usize])
             } else {
                 None
             };
+            // NOTE: intentionally skip tcp.verify_checksum() — same reason.
             ParsedPayload::Tcp(TcpSegment {
                 src_port: tcp.src_port(),
                 dst_port: tcp.dst_port(),
@@ -178,16 +184,14 @@ pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
                 ack_num: tcp.ack_number().0 as u32,
                 window: tcp.window_len(),
                 mss,
-                payload: body[header..].to_vec(),
+                payload: body[tcp.header_len() as usize..].to_vec(),
             })
         }
         IpProtocol::Udp => {
             let udp = UdpPacket::new_checked(body)
                 .map_err(|_| NetstackError::InvalidPacket("truncated udp".to_string()))?;
-            // RFC 768: zero checksum means "none" on IPv4.
-            if udp.checksum() != 0 && !udp.verify_checksum(&ip_addr(src), &ip_addr(dst)) {
-                return Err(NetstackError::InvalidPacket("bad udp checksum".to_string()));
-            }
+            // RFC 768: zero checksum means "none" on IPv4. We also accept
+            // any non-zero checksum without verification (wintun offload).
             ParsedPayload::Udp(UdpSegment {
                 src_port: udp.src_port(),
                 dst_port: udp.dst_port(),
