@@ -351,7 +351,10 @@ fn connect_inner(
     let name = tls::server_name(&config.outer_sni).map_err(ClientError::Core)?;
     let tls_cfg = Arc::new(match verifier {
         Some(verifier) => tls::client_config(verifier).map_err(ClientError::Core)?,
-        None => tls::system_client_config().map_err(ClientError::Core)?,
+        // Android has no readable platform store: the app supplies the CA in
+        // the config. Desktop leaves it unset and keeps system roots.
+        None => tls::system_client_config_with_ca(config.tls_ca_pem.as_deref())
+            .map_err(ClientError::Core)?,
     });
     let mut stream = tls::connect_tls(sock, name, &tls_cfg).map_err(ClientError::Core)?;
     aetherlink_netstack::debug_log("connect: tls ok");

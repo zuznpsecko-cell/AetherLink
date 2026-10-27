@@ -127,6 +127,9 @@ fn a_different_private_ca_is_rejected() {
     let _ = server.join();
 
     // And the desktop default (no inline CA) does not trust it either.
+    let (cert, key) = rogue.issue_server();
+    let (listener, addr) = listen();
+    let server = spawn_server(listener, cert, key);
     let sock = TcpStream::connect(addr).expect("connect");
     let default_cfg = Arc::new(tls::system_client_config().expect("system config"));
     assert!(
@@ -138,6 +141,7 @@ fn a_different_private_ca_is_rejected() {
         .is_err(),
         "a private CA must not be trusted without ca_pem"
     );
+    let _ = server.join();
 }
 
 #[test]

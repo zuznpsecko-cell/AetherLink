@@ -89,9 +89,22 @@ pub fn client_config_tls12(verifier: Arc<dyn ServerCertVerifier>) -> Result<Clie
 /// (e.g. a smoke-test CA in LocalMachine\Root) verify correctly, and public
 /// chains keep working with no platform store involved.
 pub fn system_client_config() -> Result<ClientConfig> {
+    system_client_config_with_ca(None)
+}
+
+/// TLS1.3-only client config: platform roots, webpki roots, plus an optional
+/// inline CA PEM.
+///
+/// Android cannot read the platform trust store from the FFI build, so the
+/// app ships the server CA in `client.tls.ca_pem`. The CA is additive: it
+/// never replaces the usual roots and never disables verification, so a
+/// certificate from any other CA is still rejected. With a CA supplied, an
+/// unavailable platform store is not fatal: webpki roots plus the inline CA
+/// are enough. Without one this is exactly [`system_client_config`].
+pub fn system_client_config_with_ca(ca_pem: Option<&str>) -> Result<ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     let bundle = rustls_native_certs::load_native_certs();
-    if bundle.certs.is_empty() && !bundle.errors.is_empty() {
+    if bundle.certs.is_empty() && !bundle.errors.is_empty() && ca_pem.is_none() {
         return Err(CoreError::TlsError(format!(
             "native roots: {:?}",
             bundle.errors.first()
@@ -102,11 +115,35 @@ pub fn system_client_config() -> Result<ClientConfig> {
         let _ = roots.add(cert);
     }
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = ca_pem {
+        add_pem_ca(&mut roots, pem)?;
+    }
     let mut cfg = ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .with_root_certificates(roots)
         .with_no_client_auth();
     cfg.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
     Ok(cfg)
+}
+
+/// Add every certificate from an inline PEM bundle as a trust anchor.
+///
+/// An empty or unparsable bundle is a config error: silently falling back to
+/// public roots would turn a typo into an inscrutable handshake failure.
+fn add_pem_ca(roots: &mut rustls::RootCertStore, pem: &str) -> Result<()> {
+    let certs = rustls_pemfile::certs(&mut pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, std::io::Error>>()
+        .map_err(|e| CoreError::ConfigError(format!("bad ca pem: {e}")))?;
+    if certs.is_empty() {
+        return Err(CoreError::ConfigError(
+            "client.tls.ca_pem contains no certificates".to_string(),
+        ));
+    }
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| CoreError::ConfigError(format!("client.tls.ca_pem rejected: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Parse SNI host name.
