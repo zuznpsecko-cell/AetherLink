@@ -25,6 +25,14 @@ public sealed class ClientSection
 
     [YamlMember(Alias = "wintun_dll_path")]
     public string WintunDllPath { get; set; } = "./wintun.dll";
+
+    /// <summary>
+    /// Connection profiles. The active one is mirrored into
+    /// server_addr/outer_sni/psk so core and CLI keep reading one server.
+    /// </summary>
+    public List<EndpointProfile> Endpoints { get; set; } = new();
+
+    public string ActiveEndpoint { get; set; } = "";
 }
 
 public sealed class FullTunnelSection
