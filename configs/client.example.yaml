@@ -1,4 +1,15 @@
 client:
+  # Multi-endpoint profiles (Windows GUI). The GUI mirrors the active profile
+  # into server_addr/outer_sni/psk below, so core and CLI keep reading one
+  # server and never see this list.
+  active_endpoint: "default"
+  endpoints:
+    - name: "default"
+      server_addr: "server.example.com:443"
+      outer_sni: "server.example.com"
+      psk: "change-me-high-entropy"
+
+  # Active profile mirror (legacy single-server fields).
   server_addr: "server.example.com:443"
   outer_sni: "server.example.com"
   psk: "change-me-high-entropy"

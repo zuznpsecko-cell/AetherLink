@@ -15,6 +15,29 @@ fn client_example_parses() {
     assert!(!cfg.psk.is_empty());
 }
 
+/// Characterization guard for the Windows GUI multi-endpoint document: the
+/// list is host-only state, and the core must keep reading the mirrored
+/// active server from `server_addr`/`outer_sni`/`psk`.
+#[test]
+fn gui_endpoint_list_is_ignored_by_core() {
+    let doc: serde_json::Value = serde_json::json!({
+        "client": {
+            "active_endpoint": "backup",
+            "endpoints": [
+                {"name": "home", "server_addr": "home.example.com:443", "psk": "psk-home"},
+                {"name": "backup", "server_addr": "backup.example.com:8443", "psk": "psk-backup"}
+            ],
+            "server_addr": "backup.example.com:8443",
+            "outer_sni": "backup.example.com",
+            "psk": "psk-backup"
+        }
+    });
+    let cfg = aetherlink_client::config::ClientConfig::parse(&doc).expect("valid");
+    assert_eq!(cfg.server_addr, "backup.example.com:8443");
+    assert_eq!(cfg.outer_sni, "backup.example.com");
+    assert_eq!(cfg.psk, "psk-backup");
+}
+
 #[test]
 fn nested_file_inherits_root_routing_and_tunnel() {
     // Given: example layout (client: section + root-level sections)
