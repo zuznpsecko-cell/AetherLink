@@ -40,6 +40,28 @@ fn parse_tcp_syn_fields() {
 }
 
 #[test]
+fn injected_packets_carry_ttl_64() {
+    // Given: the TCP/UDP packets the pump injects into the TUN
+    let tcp = build_tcp_packet(
+        v4(10, 0, 0, 2),
+        v4(93, 184, 216, 34),
+        40001,
+        443,
+        true,
+        false,
+        false,
+        0x1122_3344,
+        0,
+        &[],
+    );
+    let udp = build_udp_packet(v4(10, 0, 0, 2), v4(10, 255, 0, 1), 53001, 53, b"q");
+    // Then: IPv4 TTL byte is 64, not 0 (0 is dropped by the adapter).
+    // TTL is byte 8 of the IPv4 header (RFC 791).
+    assert_eq!(tcp[8], 64);
+    assert_eq!(udp[8], 64);
+}
+
+#[test]
 fn parse_udp_dns_query_transparent() {
     // Given: DNS query bytes as UDP payload
     let query = b"\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00";

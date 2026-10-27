@@ -272,7 +272,7 @@ pub fn build_tcp_packet_full(
         ip.set_version(4);
         ip.set_header_len(IPV4_HEADER as u8);
         ip.set_total_len(total as u16);
-        ip.set_ttl(64);
+        ip.set_hop_limit(64);
         ip.set_next_header(IpProtocol::Tcp);
         ip.set_src_addr(src.into());
         ip.set_dst_addr(dst.into());
@@ -334,7 +334,7 @@ pub fn build_tcp_packet_window(
         ip.set_version(4);
         ip.set_header_len(IPV4_HEADER as u8);
         ip.set_total_len(total as u16);
-        ip.set_ttl(64);
+        ip.set_hop_limit(64);
         ip.set_next_header(IpProtocol::Tcp);
         ip.set_src_addr(src.into());
         ip.set_dst_addr(dst.into());
@@ -388,7 +388,7 @@ pub fn build_tcp_synack_mss(
         ip.set_version(4);
         ip.set_header_len(IPV4_HEADER as u8);
         ip.set_total_len(total as u16);
-        ip.set_ttl(64);
+        ip.set_hop_limit(64);
         ip.set_next_header(IpProtocol::Tcp);
         ip.set_src_addr(src.into());
         ip.set_dst_addr(dst.into());
@@ -427,7 +427,7 @@ pub fn build_udp_packet(
         ip.set_version(4);
         ip.set_header_len(IPV4_HEADER as u8);
         ip.set_total_len(total as u16);
-        ip.set_ttl(64);
+        ip.set_hop_limit(64);
         ip.set_next_header(IpProtocol::Udp);
         ip.set_src_addr(src.into());
         ip.set_dst_addr(dst.into());
