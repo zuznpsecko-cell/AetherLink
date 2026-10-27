@@ -133,24 +133,33 @@ fn rejects_non_ipv4_and_truncated() {
 }
 
 #[test]
-fn rejects_tampered_tcp_checksum() {
-    // Given: valid SYN with one flipped payload/checksum byte
+fn accepts_tun_packets_with_offloaded_checksum() {
+    // Given: wintun hands us a packet whose IPv4/TCP checksums are still zero
+    // (Windows checksum offload expects a NIC to fill them; wintun does not).
     let mut raw = build_tcp_packet(
         v4(10, 0, 0, 2),
         v4(93, 184, 216, 34),
         40001,
         443,
+        false,
         true,
-        false,
-        false,
+        true,
         1,
         0,
-        b"tamper-me",
+        b"GET / HTTP/1.0\r\n\r\n",
     );
-    let last = raw.len() - 1;
-    raw[last] ^= 0xFF;
-    // When/Then: checksum verification fails closed.
-    assert!(parse_ipv4_packet(&raw).is_err());
+    let ip_checksum = 10; // IPv4 header checksum offset
+    let tcp_checksum = 20 + 16; // IPv4 header + TCP checksum offset
+    raw[ip_checksum] = 0;
+    raw[ip_checksum + 1] = 0;
+    raw[tcp_checksum] = 0;
+    raw[tcp_checksum + 1] = 0;
+
+    // When/Then: accepted and parsed; refusing would drop every app packet
+    // after the SYN-ACK (see parse_ipv4_packet docs). Outbound builders still
+    // fill valid checksums (covered by the synack_mss test).
+    let pkt = parse_ipv4_packet(&raw).expect("offloaded checksums accepted");
+    assert_eq!(pkt.tcp().expect("tcp").payload, b"GET / HTTP/1.0\r\n\r\n");
 }
 
 #[test]
