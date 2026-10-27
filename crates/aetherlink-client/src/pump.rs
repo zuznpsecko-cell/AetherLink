@@ -982,7 +982,14 @@ impl DataPump {
                         &[],
                     );
                     let _ = tun.send_packet(&fin);
-                    flow.server_next = flow.server_next.wrapping_add(1);
+                    // Close out every table that holds this flow. The
+                    // `tcp` entry was already removed at the top of this
+                    // match arm (we hold `flow` by value) but earlier
+                    // revisions leaked it here, which kept the FlowKey in
+                    // `tcp` forever and wedged follow-up connections to the
+                    // same (client_ip, client_port, server_ip, server_port)
+                    // tuple until the session died.
+                    self.tcp.remove(&key);
                     self.tcp_by_id.remove(&id);
                     self.by_id.remove(&id);
                     self.by_tuple.remove(&key);
