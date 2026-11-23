@@ -8,7 +8,7 @@ pub mod flow;
 pub mod manager;
 pub mod stream;
 
-use aetherlink_frame::{FrameError, Result as FrameResult};
+use aetherlink_frame::FrameError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
