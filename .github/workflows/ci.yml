@@ -37,7 +37,10 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            grep -E "^(error|warning)" /tmp/clippy.log | head -20 | while IFS= read -r line; do
+            # clippy prints "error: ...", "warning: ..." and the
+            # "error: could not compile ..." trailer; grab the informative
+            # ones and annotate them (logs are not always retrievable).
+            grep -nE "^(error|warning)|^\s+--> " /tmp/clippy.log | head -20 | while IFS= read -r line; do
               echo "::error::$line"
             done
           fi
@@ -75,7 +78,7 @@ jobs:
           $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
           $code = $LASTEXITCODE
           if ($code -ne 0) {
-            ($out -split "`n") | Where-Object { $_ -match '^(error|warning)' } | Select-Object -First 20 |
+            ($out -split "`n") | Where-Object { $_ -match '^(error|warning)|^\s+--> ' } | Select-Object -First 20 |
               ForEach-Object { "::error::$_" }
           }
           exit $code
