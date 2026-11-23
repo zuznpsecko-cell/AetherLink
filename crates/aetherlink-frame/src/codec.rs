@@ -23,7 +23,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use crate::{FrameError, Result, FRAME_HEADER_SIZE};
 use aetherlink_crypto::aead::{self, AeadKey, AeadNonce};
-use aetherlink_crypto::{AEAD_TAG_LEN, DEFAULT_PAD_MULTIPLE, MAX_FRAME_PAYLOAD};
+use aetherlink_crypto::{AEAD_TAG_LEN, MAX_FRAME_PAYLOAD};
 use aetherlink_protocol::{FrameType, FRAME_HEADER_RANDOM_SIZE};
 use rand::RngCore;
 
@@ -321,6 +321,7 @@ pub fn decode_frame(
 mod tests {
     use super::*;
     use crate::types::Frame;
+    use aetherlink_crypto::DEFAULT_PAD_MULTIPLE;
 
     #[test]
     fn test_frame_header_encode_decode() {
