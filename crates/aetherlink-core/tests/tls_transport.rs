@@ -13,7 +13,7 @@ use std::sync::Arc;
 use aetherlink_core::tls;
 
 mod tls_common;
-use tls_common::{client_tls_config, localhost_cert, server_tls_config, AcceptAll};
+use tls_common::{localhost_cert, AcceptAll};
 
 #[test]
 fn tls13_handshake_negotiates_http11_and_echoes() {
