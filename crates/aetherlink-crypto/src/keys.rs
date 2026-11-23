@@ -7,7 +7,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{CryptoError, Result, AEAD_KEY_SIZE, HKDF_RX_LABEL, HKDF_SALT, HKDF_TX_LABEL};
+use crate::{AEAD_KEY_SIZE, HKDF_RX_LABEL, HKDF_SALT, HKDF_TX_LABEL};
 
 /// Derived key pair (TX key, RX key)
 pub type KeyPair = (AeadKey, AeadKey);

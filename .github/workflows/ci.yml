@@ -109,8 +109,15 @@ jobs:
         shell: pwsh
         run: |
           $fail = 0
-          foreach ($s in @("check_thin_hosts.ps1", "check_gui_endpoints.ps1", "check_quickstart.ps1")) {
-            $out = & "./scripts/$s" 2>&1
+          # -SkipArtifacts: the staged Android .so files are build outputs and
+          # .gitignore excludes them, so a source gate cannot assert them.
+          $scripts = @(
+            @{ name = "check_thin_hosts.ps1";    args = @("-SkipArtifacts") },
+            @{ name = "check_gui_endpoints.ps1"; args = @() },
+            @{ name = "check_quickstart.ps1";    args = @() }
+          )
+          foreach ($s in $scripts) {
+            $out = & "./scripts/$($s.name)" @s.args 2>&1
             if ($LASTEXITCODE -ne 0) {
               $fail++
               $out | Where-Object { $_ -match '^FAIL' } | Select-Object -First 10 | ForEach-Object { "::error::$_" }

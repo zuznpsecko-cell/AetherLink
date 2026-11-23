@@ -2,6 +2,14 @@
 # Thin-host contract checks (TDD RED first, then GREEN).
 # .NET hosts and Android UI must be THIN: config + service + FFI calls only.
 # A second protocol/crypto stack in C#/Kotlin is FORBIDDEN (AGENT_INSTRUCTIONS §1.1, DoD #1).
+[CmdletBinding()]
+param(
+    # Skip the checks that assert *build outputs* (staged Android .so files and
+    # their JNI symbols). Those cannot exist in a source checkout -- .gitignore
+    # excludes them -- so a CI gate that runs on source must pass -SkipArtifacts.
+    # `scripts/check_android_build.ps1` still guards them after building.
+    [switch]$SkipArtifacts
+)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $fail = 0
@@ -79,18 +87,22 @@ Check "manifest requires BIND_VPN_SERVICE" (Has-Text $manifest "BIND_VPN_SERVICE
 Check "gradle pins minSdk 26" (Has-Text $appGradle "minSdk 26")
 Check "gradle pins targetSdk 35" (Has-Text $appGradle "targetSdk 35")
 Check "settings includes app module" (Has-Text $settingsGradle "include\(':app'\)")
-foreach ($abi in @("arm64-v8a", "armeabi-v7a", "x86_64")) {
-    Check "jniLibs $abi/libaetherlink_core.so staged" (Test-Path -LiteralPath "$jniLibs/$abi/libaetherlink_core.so")
-}
-$sdkRoot = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { "F:/Android/Sdk" }
-$nm = "$sdkRoot/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-if (Test-Path -LiteralPath $nm) {
-    $syms = & $nm -D --defined-only --format=posix "$jniLibs/arm64-v8a/libaetherlink_core.so" 2>$null
-    foreach ($sym in @("clientCreate", "clientUp", "clientDown", "setTunFd", "setSplitConfig", "forceCleanup")) {
-        Check "jni symbol Java_link_aether_client_AetherCore_$sym" ($syms -match "Java_link_aether_client_AetherCore_$sym")
-    }
+if ($SkipArtifacts) {
+    Write-Output "skip staged jniLibs checks (-SkipArtifacts: build outputs are not in git)"
 } else {
-    Write-Output "skip jni symbol checks (llvm-nm not found)"
+    foreach ($abi in @("arm64-v8a", "armeabi-v7a", "x86_64")) {
+        Check "jniLibs $abi/libaetherlink_core.so staged" (Test-Path -LiteralPath "$jniLibs/$abi/libaetherlink_core.so")
+    }
+    $sdkRoot = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { "F:/Android/Sdk" }
+    $nm = "$sdkRoot/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+    if (Test-Path -LiteralPath $nm) {
+        $syms = & $nm -D --defined-only --format=posix "$jniLibs/arm64-v8a/libaetherlink_core.so" 2>$null
+        foreach ($sym in @("clientCreate", "clientUp", "clientDown", "setTunFd", "setSplitConfig", "forceCleanup")) {
+            Check "jni symbol Java_link_aether_client_AetherCore_$sym" ($syms -match "Java_link_aether_client_AetherCore_$sym")
+        }
+    } else {
+        Write-Output "skip jni symbol checks (llvm-nm not found)"
+    }
 }
 
 # --- deploy scripts mention lifecycle + DNS restore ---

@@ -16,7 +16,6 @@ members = [
 version = "1.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "AetherLink v1.5 - VPN with userspace network stack, single Rust core + FFI"
 
 [workspace.dependencies]
 # Core dependencies

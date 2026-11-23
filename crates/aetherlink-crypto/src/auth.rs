@@ -5,11 +5,8 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{
-    CryptoError, Result, AUTH_PREFIX, AUTH_TOKEN_SIZE, DEFAULT_NONCE_TTL_SECS, NONCE_SIZE,
-};
+use crate::{CryptoError, Result, AUTH_PREFIX, AUTH_TOKEN_SIZE, DEFAULT_NONCE_TTL_SECS, NONCE_SIZE};
 
 type HmacSha256 = Hmac<Sha256>;
 

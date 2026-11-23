@@ -165,6 +165,10 @@ impl NonceSequence {
     }
 
     /// Get the next nonce in the sequence
+    ///
+    /// Deliberately not `Iterator::next`: this is a nonce generator, and an
+    /// iterator would make `for n in seq` look like it terminates.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> AeadNonce {
         let mut nonce = self.base;
         // Encode counter in last 4 bytes of nonce (big-endian)
