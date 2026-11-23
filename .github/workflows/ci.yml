@@ -1,32 +1,110 @@
 name: CI
 
+# Gates in order of cost. Everything that can fail a PR here has been measured
+# on this repository (see docs/DECISIONS.md DEC-023) rather than assumed:
+# `cargo clippy` is warning-free, `cargo fmt --check` is clean as of the
+# formatting commit, and the .NET GUI suite is 49/49.
 on:
   pull_request:
   push:
     branches:
       - main
 
-permissions:
-  contents: write
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  fmt-commit:
+  linux-rust-and-server:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - name: Apply rustfmt and commit
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # Formatting and lints run first: they are seconds and they fail on the
+      # cheapest possible signal.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Full Rust workspace tests
+        run: cargo test --workspace
+
+      - name: Build release FFI library & Linux .NET server host
         run: |
-          cargo fmt --all
-          if git diff --quiet; then echo "::notice::NOTHING_TO_FORMAT"; exit 0; fi
-          git config user.name "aetherlink-fmt-bot"
-          git config user.email "fmt-bot@users.noreply.github.com"
-          git add -A
-          git commit -m "style: cargo fmt --all (rustfmt default config)"
-          git push origin HEAD:refs/heads/${{ github.head_ref }}
-          echo "::notice::FMT_COMMITTED $(git rev-parse --short HEAD)"
+          cargo build --release -p aetherlink-ffi
+          dotnet publish dotnet/AetherLink.Server/AetherLink.Server.csproj -c Release -r linux-x64
+
+  windows-client-and-gui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # Windows used to only *compile* the tests (`--no-run`), so a test that
+      # passed on Linux could panic on Windows and nobody would know. Now it
+      # runs them, plus the same lint gates.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Full Rust workspace tests (Windows)
+        run: cargo test --workspace
+
+      - name: Build release FFI library
+        run: cargo build --release -p aetherlink-ffi
+
+      - name: .NET GUI unit tests
+        run: dotnet test dotnet/AetherLink.Gui.Tests/AetherLink.Gui.Tests.csproj -c Release
+
+      - name: Publish Windows Avalonia GUI & CLI client hosts
+        run: |
+          dotnet publish dotnet/AetherLink.Gui/AetherLink.Gui.csproj -c Release -r win-x64
+          dotnet publish dotnet/AetherLink.Client/AetherLink.Client.csproj -c Release -r win-x64
+
+  contracts-and-audit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `check_thin_hosts.ps1` also asserts the staged Android .so files exist,
+      # but those are build outputs (.gitignore excludes them). The contract
+      # part is what belongs in a source gate; the binary part is guarded by
+      # `scripts/check_android_build.ps1` on a machine with an NDK.
+      - name: Thin-host and endpoint contracts
+        shell: pwsh
+        run: |
+          $fail = 0
+          foreach ($s in @("check_thin_hosts.ps1", "check_gui_endpoints.ps1", "check_quickstart.ps1")) {
+            & "./scripts/$s"
+            if ($LASTEXITCODE -ne 0) { $fail++ }
+          }
+          if ($fail -ne 0) { throw "$fail contract script(s) failed" }
+
+      # Non-blocking **for now**, and deliberately loud: a RustSec advisory
+      # needs a dependency bump, which may not be possible in the same change.
+      # The report is printed and annotated so it cannot be missed; flipping
+      # this to blocking is a one-line change once the tree is clean.
+      - name: Dependency audit (RustSec)
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+          echo "audit-exit=$LASTEXITCODE"
