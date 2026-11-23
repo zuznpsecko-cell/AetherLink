@@ -304,6 +304,9 @@ impl SocketPump {
         let socket = self.sockets.get_mut::<udp::Socket>(handle);
         while socket.can_recv() {
             match socket.recv() {
+                // A datagram whose endpoint cannot be converted is dropped:
+                // the client has no address to reply to, and skipping it keeps
+                // the rest of the queue draining.
                 Ok((data, meta)) => {
                     if let Some(from) = std_endpoint(meta.endpoint) {
                         out.push(PumpEvent::UdpDatagram {

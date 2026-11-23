@@ -208,7 +208,12 @@ pub fn parse_ipv4_packet(raw: &[u8]) -> Result<ParsedPacket> {
 }
 
 /// Build one IPv4/TCP packet with valid checksums (no options).
+///
+/// Eight arguments is the wire format, not a design smell: splitting it into a
+/// struct would only move the same fields behind a name and force 25 call sites
+/// to change. The `_full` variant below carries the same allowance.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_tcp_packet(
     src: Ipv4Addr,
     dst: Ipv4Addr,
