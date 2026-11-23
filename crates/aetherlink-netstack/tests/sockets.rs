@@ -10,10 +10,6 @@ use std::net::Ipv4Addr;
 use aetherlink_netstack::smoltcp_wrapper::{build_tcp_packet, build_udp_packet, parse_ipv4_packet};
 use aetherlink_netstack::sockets::{PumpEvent, SocketPump};
 
-fn v4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
-    Ipv4Addr::new(a, b, c, d)
-}
-
 const TUN: Ipv4Addr = Ipv4Addr::new(10, 255, 0, 2);
 const PEER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 9);
 
