@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilience (DEC-015) + header authentication (DEC-016), typed replay (DEC-017), library/deploy split (DEC-018), FFI lock (DEC-019); gates NOT run yet. Previous baseline: GUI endpoint profiles 49/49 .NET tests; Rust TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilience (DEC-015) + header authentication (DEC-016), typed replay (DEC-017), library/deploy split (DEC-018), FFI lock (DEC-019), idempotent OPEN (DEC-020); gates NOT run yet. Previous baseline: GUI endpoint profiles 49/49 .NET tests; Rust TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
 
 > **0l (upload 0.00): фикс в дереве, гейты НЕ прогонялись.** Причины и список правок — в
 > [docs/LIVE_ISSUES.md](LIVE_ISSUES.md#0l-аплоад-000-байты-терялись-молча-fin-убивал-ответ-id-кончались-в-дереве-гейты-не-прогонялись).
@@ -46,11 +46,11 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] Root `Cargo.toml` with workspace config
 - [x] Individual crate `Cargo.toml` files
 - [x] `protocol/` crate with golden test harness
-- [x] `DECISIONS.md` (DEC-001..DEC-019)
+- [x] `DECISIONS.md` (DEC-001..DEC-020)
 - [x] `STATUS.md` (this file)
 - [x] Basic `README.md`
 
-### Phase 20: Transport authenticity & host hygiene (DEC-016..DEC-019)
+### Phase 20: Transport authenticity & host hygiene (DEC-016..DEC-020)
 
 - [x] **Header is AEAD associated data** (`codec::header_aad`, 15 B: length/type/flags/stream_id/sequence/generation)
 - [x] `stream_id` can no longer be rewritten in flight (cross-flow injection closed)
@@ -63,7 +63,8 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] Client: rejected DATAGRAM is logged and the flow kept (UDP is lossy; was a propagated error)
 - [x] **`ensure_linux_wan_tuning` → `warn_if_wan_tuning_missing`**: the library no longer writes `/proc/sys`
 - [x] **FFI `HANDLES` lock not held across network I/O** (`take_client` / `return_client`)
-- [x] Tests: `frame/tests/header_auth.rs` (5), `mux/tests/replay_window.rs` (6)
+- [x] Tests: `frame/tests/header_auth.rs` (5), `mux/tests/replay_window.rs` (8), `mux/tests/nonce_generation.rs` (8)
+- [x] **Retransmitted OPEN is idempotent** (`MuxManager::generation` gate in `accept.rs`): a duplicate OPEN no longer resets the live flow, its replay window or its relay (DEC-020)
 - [ ] **Gates not run** — no Rust toolchain in the sandbox
 - [ ] Still open: per-IP rate limiting; FFI per-handle lock (narrow free-vs-call window); delayed-frame attack past the replay window
 

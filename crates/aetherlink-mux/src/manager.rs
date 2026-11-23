@@ -321,6 +321,17 @@ impl MuxManager {
             .ok_or(MuxError::StreamNotFound(id))
     }
 
+    /// Live incarnation generation for `id`, if it is open.
+    ///
+    /// The accept-loop decodes an unauthenticated OPEN header before it has
+    /// any mux state, so it uses this to tell a *retransmitted* OPEN (same
+    /// generation: keep the live flow and its replay window) from a genuine
+    /// recycle (newer generation: reset and re-dial).
+    #[must_use]
+    pub fn generation(&self, id: u16) -> Option<u32> {
+        self.entries.get(&id).map(|e| e.generation)
+    }
+
     fn seal(
         &mut self,
         key: &[u8],

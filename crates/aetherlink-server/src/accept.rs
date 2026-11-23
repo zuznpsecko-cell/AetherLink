@@ -1503,6 +1503,19 @@ fn tunnel_loop(
                     ));
                     continue;
                 }
+                if let Some(live) = sess.mux.generation(header.stream_id) {
+                    if live == header.generation {
+                        // Retransmitted OPEN for the incarnation that is
+                        // already running: the flow, its replay window and
+                        // its relay are current, so touching them would drop
+                        // live data (DEC-020). Ignore the duplicate.
+                        debug_log(&format!(
+                            "tunnel: open_tcp id={} duplicate for live generation {live}, ignoring",
+                            header.stream_id
+                        ));
+                        continue;
+                    }
+                }
                 if workers.remove(&header.stream_id).is_some() {
                     // The peer recycles ids, so this is a new flow on a
                     // fresh id: dropping the sender ends the stale relay
@@ -1513,8 +1526,9 @@ fn tunnel_loop(
                     ));
                 }
                 // Re-register: a recycled id carries the old flow's replay
-                // window, which would reject the new flow's first 1024
-                // frames as stale. OPEN means "new stream", so reset it.
+                // window, which would reject the new flow's first
+                // REPLAY_WINDOW frames as stale. Only a *new generation* is a
+                // new stream; a retransmit was returned above.
                 let _ = sess.mux.close(header.stream_id);
                 debug_log(&format!(
                     "tunnel: open_tcp id={} -> {}:{}",
@@ -1583,7 +1597,18 @@ fn tunnel_loop(
                     ));
                     (flow.addr.clone(), flow.port)
                 };
-                // Same as OPEN_TCP: ids are recycled, so reset the window.
+                // Same as OPEN_TCP: a *new generation* means a recycled id
+                // that needs a fresh replay window, but a retransmitted OPEN
+                // for the live generation must leave the flow alone (DEC-020).
+                if let Some(live) = sess.mux.generation(header.stream_id) {
+                    if live == header.generation {
+                        debug_log(&format!(
+                            "tunnel: open_udp id={} duplicate for live generation {live}, ignoring",
+                            header.stream_id
+                        ));
+                        continue;
+                    }
+                }
                 let _ = sess.mux.close(header.stream_id);
                 let sock = match dial_addr(&addr, port) {
                     Some(sock) => sock,

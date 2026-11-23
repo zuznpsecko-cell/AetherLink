@@ -696,3 +696,62 @@ run. Re-inserting would resurrect a freed handle — worse than dropping.
 Covered indirectly: the FFI surface is exercised by the .NET host and has no
 Rust integration test for lock behaviour (the race needs a real embedding).
 Upstream gate: the existing FFI compile check in CI.
+
+---
+
+## DEC-020: A retransmitted OPEN must not restart a live stream
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+`accept.rs` treated every incoming `OPEN_TCP` / `OPEN_UDP` as "the peer recycled
+this id": it dropped the relay worker, called `mux.close(id)` and re-dialled the
+target. That is right for a genuinely recycled id, but the id and the frame
+carry no evidence of recycling other than the header's `generation` — and the
+accept-loop ignored it.
+
+The peer's mux allocates a *new generation* when it reuses an id, so a
+retransmitted OPEN (the ACK was lost, the client resent the same sealed frame)
+arrives with the **same** generation as the incarnation already running. The
+server still reset the flow, and `register_inbound` claimed the *next*
+generation. From then on the two sides disagreed: the server sealed its echoes
+under generation N+1 while the client's window still expected N. Every reply
+failed `MuxError::StaleGeneration` on the client, the client never accumulated
+the echoed bytes, and the tunnel hung until the read timeout — the
+`burst_and_edge_traffic_keeps_server_alive` failure, with a duplicate OPEN on
+every 10th flow.
+
+### Decision
+`MuxManager::generation(id)` exposes the live incarnation's generation, and the
+accept-loop compares it with the unauthenticated header before touching any
+state:
+
+- **same generation** → retransmit: log, `continue`. The live flow, its replay
+  window, its relay worker and its route are left exactly as they are.
+- **different generation** (or id not open) → recycle: drop the stale worker,
+  `mux.close(id)` and `register_inbound` as before, which claims the next
+  generation and hands the new flow a fresh replay window.
+
+Same rule for `OPEN_UDP`.
+
+### Consequences
+- Duplicate OPENs are now idempotent, which is what the wire format already
+  claimed: OPEN is seq 0 and a duplicate is byte-identical, so it carries no
+  new information.
+- The generation comparison happens on an *unauthenticated* header, but that is
+  safe: it only selects between "ignore" and "reset and re-dial", and the frame
+  body is authenticated right after (`parse_open_*`). A forged header can at
+  worst make the server ignore an OPEN (the client retries) or drop one flow.
+- A reset now costs what it says it costs: only a real recycle re-dials the
+  target, so retransmits no longer leak a dial or a worker thread per retry.
+- Not addressed: a peer that recycles an id *without* bumping the generation
+  cannot be distinguished from a retransmit. The mux allocator always bumps it
+  (`claim_generation`), so this is a local invariant, not a wire assumption.
+
+### Tests
+- `server/tests/e2e_tunnel.rs::retransmitted_open_keeps_the_live_flow` — OPEN,
+  payload/echo, byte-identical duplicate OPEN, payload/echo again; asserts the
+  echo keeps the original generation and the target saw exactly one dial.
+- `server/tests/e2e_tunnel.rs::burst_and_edge_traffic_keeps_server_alive` — the
+  original soak, which is where the bug showed up.

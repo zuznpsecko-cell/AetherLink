@@ -75,6 +75,12 @@ generation on every re-incarnation. `PROTOCOL_VERSION` is `2`; a v1 peer is
 refused at the preface byte rather than failing frame authentication. Client
 and server must be updated together. Rationale: DEC-014 in `docs/DECISIONS.md`.
 
+Because the generation rides in every header, the receiver can also tell a
+**retransmitted OPEN** (same generation — the ACK was lost) from a **recycled
+id** (new generation). Only the latter resets the flow: the former is ignored,
+so a duplicate OPEN no longer restarts a live stream, its replay window or its
+relay. Rationale: DEC-020 in `docs/DECISIONS.md`.
+
 ## Known limitations
 
 - **IPv4 only.** IPv6 targets are parsed but dropped: dial targets are built as

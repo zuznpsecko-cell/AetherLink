@@ -209,3 +209,24 @@ fn generation_distinguishes_otherwise_identical_frames() {
     // Then: different nonces, so the recycled-id OPEN encrypts differently.
     assert_ne!(a, b);
 }
+
+#[test]
+fn generation_is_visible_for_the_live_incarnation() {
+    // Given: an open id
+    let mut mux = MuxManager::new();
+    let id = mux.open_tcp("127.0.0.1", 443).expect("open");
+    assert_eq!(mux.generation(id), Some(0), "first incarnation");
+
+    // Then: a closed id has no live incarnation, so the accept-loop treats an
+    // OPEN for it as a recycle rather than a retransmit (DEC-020).
+    mux.close(id).expect("close");
+    assert_eq!(mux.generation(id), None);
+
+    // When: the peer resurfaces the same id (a recycled id arrives inbound)
+    mux.register_inbound(id, "127.0.0.1", 443, false)
+        .expect("register recycled id");
+
+    // Then: the new incarnation is numerically distinguishable from the old
+    // one, which is what separates "ignore the duplicate" from "reset".
+    assert_eq!(mux.generation(id), Some(1));
+}
