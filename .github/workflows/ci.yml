@@ -6,31 +6,27 @@ on:
     branches:
       - main
 
+permissions:
+  contents: write
+
 jobs:
-  probe4:
+  fmt-commit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: PROBE audit
-        run: |
-          set +e
-          cargo install cargo-audit --locked --quiet > /tmp/inst.log 2>&1
-          echo "::notice::AUDIT_INSTALL exit=$?"
-          cargo audit > /tmp/audit.log 2>&1
-          code=$?
-          echo "::notice::AUDIT exit=$code"
-          grep -E "^(error|Crate:|ID:|Severity:)" /tmp/audit.log | head -8 | while read -r l; do echo "::notice::AUDITLINE $l"; done
-      - name: Produce fmt patch
+      - name: Apply rustfmt and commit
         run: |
           cargo fmt --all
-          git diff > /tmp/fmt.patch
-          echo "::notice::FMT_PATCH_BYTES $(wc -c < /tmp/fmt.patch)"
-          grep -c '^diff --git' /tmp/fmt.patch | sed 's/^/::notice::FMT_FILES /'
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fmt-patch
-          path: /tmp/fmt.patch
+          if git diff --quiet; then echo "::notice::NOTHING_TO_FORMAT"; exit 0; fi
+          git config user.name "aetherlink-fmt-bot"
+          git config user.email "fmt-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "style: cargo fmt --all (rustfmt default config)"
+          git push origin HEAD:refs/heads/${{ github.head_ref }}
+          echo "::notice::FMT_COMMITTED $(git rev-parse --short HEAD)"
