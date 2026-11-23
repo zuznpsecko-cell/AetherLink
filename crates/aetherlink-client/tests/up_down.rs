@@ -5,8 +5,6 @@
 //! crash-recovery file handling at the policy level. Real ioctls stay behind
 //! the `Platform` trait for the platform task.
 
-use std::net::IpAddr;
-
 use aetherlink_client::cleanup;
 use aetherlink_client::config::ClientConfig;
 use aetherlink_client::lifecycle;

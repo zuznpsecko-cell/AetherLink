@@ -58,10 +58,6 @@ fn syn(seq: u32) -> Vec<u8> {
     build_tcp_packet(CLIENT_IP, DST, 41000, 80, true, false, false, seq, 0, &[])
 }
 
-fn advance(pump: &mut DataPump, tun: &mut FakeTun) {
-    pump.poll_once(tun).expect("poll");
-}
-
 /// Full handshake, returns (client_isn, server_iss).
 fn handshake(pump: &mut DataPump, tun: &mut FakeTun, isn: u32) -> (u32, u32) {
     // Given: SYN in TUN

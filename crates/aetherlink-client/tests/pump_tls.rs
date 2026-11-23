@@ -390,7 +390,7 @@ fn bulk_send_does_not_wait_for_replies() {
                 true,
                 8001u32.wrapping_add(i.wrapping_mul(16)),
                 iss.wrapping_add(1),
-                &vec![i as u8; 16],
+                &[i as u8; 16],
             );
             guard.inbound.push_back(data);
         }
