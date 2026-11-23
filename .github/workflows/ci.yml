@@ -7,51 +7,27 @@ on:
       - main
 
 jobs:
-  gate-probe:
-    runs-on: windows-latest
+  probe2:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
-      - name: PROBE dotnet test
-        shell: pwsh
+      - name: PROBE fmt
         run: |
-          dotnet test dotnet/AetherLink.Gui.Tests/AetherLink.Gui.Tests.csproj -c Release 2>&1 | Select-Object -Last 25 | ForEach-Object { "::notice::$_" }
-          if ($LASTEXITCODE -ne 0) { "::error::PROBE dotnet test FAILED ($LASTEXITCODE)" } else { "::notice::PROBE dotnet test PASSED" }
-      - name: PROBE contract scripts
-        shell: pwsh
-        run: |
-          foreach ($s in @("check_thin_hosts.ps1","check_gui_endpoints.ps1","check_quickstart.ps1")) {
-            $out = & "./scripts/$s" 2>&1
-            $code = $LASTEXITCODE
-            $fails = $out | Where-Object { $_ -match '^FAIL' }
-            if ($code -ne 0 -or $fails) {
-              "::notice::PROBE $s FAILED (exit $code)"
-              $fails | Select-Object -First 8 | ForEach-Object { "::notice::  $_" }
-            } else {
-              "::notice::PROBE $s PASSED"
-            }
-          }
-      - name: PROBE cargo fmt
-        shell: pwsh
-        run: |
-          cargo fmt --all -- --check 2>&1 | Out-String | Write-Output
-          if ($LASTEXITCODE -ne 0) { "::notice::PROBE fmt FAILED - diff files listed above" } else { "::notice::PROBE fmt PASSED" }
+          set +e
+          cargo fmt --all -- --check > /tmp/fmt.log 2>&1
+          echo "fmt exit=$?"
+          grep -oP 'Diff in \K[^:]+(?=:)' /tmp/fmt.log | sort -u | head -6 | while read -r f; do echo "::notice::FMTFILE $f"; done
+          echo "::notice::FMTTOTAL $(grep -c 'Diff in' /tmp/fmt.log)"
       - name: PROBE clippy
-        shell: pwsh
         run: |
-          $out = cargo clippy --workspace --all-targets 2>&1 | Out-String
-          $warn = ([regex]::Matches($out, '^warning: ', 'Multiline')).Count
-          $err  = ([regex]::Matches($out, '^error', 'Multiline')).Count
-          "::notice::PROBE clippy warnings=$warn errors=$err exit=$LASTEXITCODE"
-      - name: PROBE fmt detail
-        shell: pwsh
-        run: |
-          $out = cargo fmt --all -- --check 2>&1 | Out-String
-          $files = [regex]::Matches($out, 'Diff in (?<p>[^:]+):') | ForEach-Object { $_.Groups['p'].Value }
-          "::notice::PROBE fmt files=$((($files | Sort-Object -Unique) -join ', '))"
+          set +e
+          cargo clippy --workspace --all-targets > /tmp/clippy.log 2>&1
+          code=$?
+          warn=$(grep -c '^warning: ' /tmp/clippy.log)
+          err=$(grep -c '^error' /tmp/clippy.log)
+          echo "::notice::CLIPPY exit=$code warnings=$warn errors=$err"
+          grep -oP '^warning: \K.*' /tmp/clippy.log | sort | uniq -c | sort -rn | head -6 | while read -r line; do echo "::notice::CLIPPYTOP $line"; done
