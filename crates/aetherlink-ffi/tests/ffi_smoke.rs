@@ -69,15 +69,9 @@ fn ffi_server_start_stop_lifecycle() {
         started.elapsed() < std::time::Duration::from_secs(5),
         "start must not block on serving"
     );
-    assert_eq!(
-        aether_server_stop(h),
-        AetherError::Success as i32
-    );
+    assert_eq!(aether_server_stop(h), AetherError::Success as i32);
     // Then: handle is gone
-    assert_eq!(
-        aether_server_stop(h),
-        AetherError::InvalidHandle as i32
-    );
+    assert_eq!(aether_server_stop(h), AetherError::InvalidHandle as i32);
 }
 
 #[test]
@@ -116,10 +110,7 @@ fn ffi_accepts_yaml_configs() {
     // When: starting → Then: serving handle out.
     let sh = unsafe { aether_server_start(c(&server_yaml).as_ptr()) };
     assert_ne!(sh, 0, "server must accept yaml config");
-    assert_eq!(
-        aether_server_stop(sh),
-        AetherError::Success as i32
-    );
+    assert_eq!(aether_server_stop(sh), AetherError::Success as i32);
 }
 
 #[test]
@@ -156,10 +147,7 @@ fn ffi_client_free_releases_handle() {
     let h = unsafe { aether_client_create(cfg.as_ptr()) };
     assert_ne!(h, 0, "create must yield a handle");
     // When: freeing it
-    assert_eq!(
-        aether_client_free(h),
-        AetherError::Success as i32
-    );
+    assert_eq!(aether_client_free(h), AetherError::Success as i32);
     // Then: the handle is gone — status/down/free all report InvalidHandle.
     let mut buf = vec![0u8; 256];
     assert_eq!(
@@ -168,14 +156,8 @@ fn ffi_client_free_releases_handle() {
         },
         AetherError::InvalidHandle as i32
     );
-    assert_eq!(
-        aether_client_down(h),
-        AetherError::InvalidHandle as i32
-    );
-    assert_eq!(
-        aether_client_free(h),
-        AetherError::InvalidHandle as i32
-    );
+    assert_eq!(aether_client_down(h), AetherError::InvalidHandle as i32);
+    assert_eq!(aether_client_free(h), AetherError::InvalidHandle as i32);
 }
 
 #[test]
