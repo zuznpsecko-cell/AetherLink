@@ -16,10 +16,19 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Check (short diagnostics surface in annotations)
-        run: cargo check --workspace --all-targets --message-format=short 2>&1 | tail -40 || true
       - name: Run full Rust workspace test suite
-        run: cargo test --workspace
+        run: |
+          set +e
+          cargo test --workspace 2>&1 | tee /tmp/test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            # Surface the actual error as check annotations: job logs are not
+            # always retrievable from outside, annotations are.
+            grep -nE "^(error|failures:|---- )|panicked at|thread .* panicked|FAILED" /tmp/test.log \
+              | head -40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit $status
       - name: Build release FFI library & Linux .NET server host
         run: |
           cargo build --release -p aetherlink-ffi
