@@ -16,6 +16,8 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+      - name: Check (short diagnostics surface in annotations)
+        run: cargo check --workspace --all-targets --message-format=short 2>&1 | tail -40 || true
       - name: Run full Rust workspace test suite
         run: cargo test --workspace
       - name: Build release FFI library & Linux .NET server host
