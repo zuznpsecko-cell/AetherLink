@@ -29,7 +29,19 @@ jobs:
       # Formatting and lints run first: they are seconds and they fail on the
       # cheapest possible signal.
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        # `cargo fmt --check` prints no file paths, so a red gate would say
+        # nothing about *what* to fix. Format in place, show the diff, then
+        # fail: the annotation carries the fix instructions.
+        run: |
+          cargo fmt --all
+          if git diff --quiet; then
+            echo "::notice::formatting clean"
+            exit 0
+          fi
+          git diff --stat
+          BODY=$(git diff | head -c 55000 | sed 's/%/%25/g; s/$/%0A/')
+          echo "::error title=rustfmt::$BODY"
+          exit 1
 
       - name: Clippy (warnings are errors)
         env:
@@ -72,7 +84,17 @@ jobs:
       # passed on Linux could panic on Windows and nobody would know. Now it
       # runs them, plus the same lint gates.
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        shell: pwsh
+        # Same rationale as the Linux step: surface the diff, not a bare exit 1.
+        run: |
+          cargo fmt --all
+          if (git diff --quiet) { "::notice::formatting clean"; exit 0 }
+          git diff --stat
+          $diff = (git diff) -join "`n"
+          if ($diff.Length -gt 55000) { $diff = $diff.Substring(0, 55000) }
+          $body = $diff -replace '%', '%25' -replace "`r?`n", '%0A'
+          "::error title=rustfmt::$body"
+          exit 1
 
       - name: Clippy (warnings are errors)
         shell: pwsh
