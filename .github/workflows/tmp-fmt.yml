@@ -1,31 +1,36 @@
-name: FMT-DIAG
+name: FMT-COMMIT
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+
+permissions:
+  contents: write
 
 jobs:
-  fmt-diag:
+  fmt-commit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Show what rustfmt would change
+      - name: Apply rustfmt and commit
+        shell: bash
         run: |
-          cargo fmt --all 2>&1 | head -40
-          echo "----- exit: $? -----"
+          set -o pipefail
+          cargo fmt --all; echo "::notice::fmt-exit=$?"
           if git diff --quiet; then echo "::notice::NOTHING_TO_FORMAT"; exit 0; fi
-          git diff > /tmp/fmt.diff || true
-          echo "=== files ==="
-          git diff --stat
-          # One annotation with percent-encoded newlines: GitHub clips at ~10
-          # annotations per step, and the whole point here is the full hunk list.
-          BODY=$(head -c 60000 /tmp/fmt.diff | sed 's/%/%25/g; s/$/%0A/')
-          echo "::error title=rustfmt-diff::$BODY"
-          exit 1
+          echo "::notice::files=$(git diff --name-only | tr '\n' ' ')"
+          git config user.name "aetherlink-fmt-bot"
+          git config user.email "fmt-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "style: cargo fmt --all (rustfmt default config)"; echo "::notice::commit-exit=$?"
+          if git push origin HEAD:refs/heads/${{ github.head_ref }} 2>/tmp/push.err; then
+            echo "::notice::FMT_COMMITTED"
+          else
+            echo "::error title=push-failed::$(head -c 400 /tmp/push.err | sed 's/%/%25/g; s/$/%0A/')"
+            exit 1
+          fi
