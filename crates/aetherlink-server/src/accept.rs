@@ -69,10 +69,19 @@ pub struct ServerCtx {
     pub live_connections: Arc<AtomicUsize>,
     /// Hard cap on concurrently served connections.
     pub max_connections: usize,
+    /// Max concurrent streams/flows per connection (mux state bound).
+    ///
+    /// Applied to the session's mux once the handshake succeeds
+    /// (`MuxManager::set_max`): the mux is created before the config is in
+    /// scope, and until now the configured value was silently ignored.
+    pub max_streams: usize,
 }
 
 /// Default cap when a context is built without an explicit one.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
+/// Default stream/flow cap per connection, matching `config::ServerConfig`.
+pub const DEFAULT_MAX_STREAMS: usize = 4096;
 
 impl ServerCtx {
     /// Claim a connection slot, or `None` when the cap is already reached.
@@ -114,7 +123,7 @@ impl Drop for ConnectionSlot {
         // wedge the server at "full" forever.
         let _ = self
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 }
 

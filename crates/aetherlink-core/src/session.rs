@@ -17,7 +17,7 @@ use aetherlink_frame::codec::FrameHeader;
 use aetherlink_frame::types::{Frame, FramePayload};
 use aetherlink_mux::manager::MuxManager;
 use aetherlink_protocol::{FrameType, PROTOCOL_VERSION};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::BytesMut;
 
 use crate::tls::{ClientTlsStream, ServerTlsStream};
 use crate::{CoreError, Result};

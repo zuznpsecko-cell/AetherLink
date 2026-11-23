@@ -39,6 +39,7 @@ fn ctx() -> ServerCtx {
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
         live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         max_connections: aetherlink_server::accept::DEFAULT_MAX_CONNECTIONS,
+        max_streams: aetherlink_server::accept::DEFAULT_MAX_STREAMS,
     }
 }
 

@@ -27,7 +27,7 @@ impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
         let _ = self
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 }
 
@@ -125,7 +125,7 @@ where
         // first, so the drain decremented an increment that had not happened
         // yet and `active` underflowed to `usize::MAX`: `dispatch` then
         // refused every job until the process restarted.
-        let slot = match self.active.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+        let slot = match self.active.try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
             if n >= self.cap {
                 None
             } else {
@@ -187,7 +187,7 @@ where
     fn release_one(&self) {
         let _ = self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
     /// Refund every reservation reported through the panic channel.

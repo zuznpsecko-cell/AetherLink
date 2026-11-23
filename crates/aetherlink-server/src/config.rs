@@ -105,7 +105,7 @@ impl ServerConfig {
             max_streams: (doc
                 .get("max_streams")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(4096) as usize)
+                .unwrap_or(crate::accept::DEFAULT_MAX_STREAMS as u64) as usize)
                 .max(1),
             max_connections: doc
                 .get("max_connections")

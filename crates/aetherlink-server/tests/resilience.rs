@@ -96,6 +96,7 @@ fn ctx_with(max_connections: usize) -> ServerCtx {
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
         live_connections: Arc::new(AtomicUsize::new(0)),
         max_connections,
+        max_streams: aetherlink_server::accept::DEFAULT_MAX_STREAMS,
     }
 }
 

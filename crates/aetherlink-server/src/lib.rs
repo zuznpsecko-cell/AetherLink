@@ -137,6 +137,7 @@ impl Server {
                 },
                 live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 max_connections: self.config.max_connections,
+                max_streams: self.config.max_streams,
             },
         })
     }
