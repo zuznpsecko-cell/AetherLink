@@ -5,7 +5,7 @@
 //! can be injected for tests; production passes `None` (system roots).
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::Arc;
 
 use aetherlink_client::config::ClientConfig;

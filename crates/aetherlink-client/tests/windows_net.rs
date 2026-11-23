@@ -206,9 +206,12 @@ fn iface_admin_arg_builder() {
 
 #[test]
 fn tun_iface_metric_arg_builder() {
-    // Given: newborn wintun adapter → Then: interface metric pinned low so
-    // derived route metrics beat DHCP Ethernet.
-    assert!(TUN_IFACE_METRIC < 25, "must beat observed physical 25");
+    // Given: newborn wintun adapter → Then: the metric is the pinned
+    // constant (1), which is what makes derived route metrics beat DHCP
+    // Ethernet. A compile-time assert, not a runtime one: the value is a
+    // constant, so `assert!` on it would be dead code by definition.
+    const _: () = assert!(TUN_IFACE_METRIC < 25, "must beat observed physical 25");
+    assert_eq!(TUN_IFACE_METRIC, 1);
     assert_eq!(
         iface_metric_args("aether0", TUN_IFACE_METRIC).expect("args"),
         vec![
