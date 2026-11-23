@@ -52,7 +52,7 @@ fn aad_covers_every_meaningful_header_field() {
         header_aad(&header),
         [
             0x01, 0x02, 0x03, // length
-            0x01, // type = Data
+            0x00, // type = FrameType::Data (discriminant 0)
             0x07, // flags
             0x04, 0x05, // stream id
             0x06, 0x07, 0x08, 0x09, // sequence
