@@ -48,6 +48,11 @@ fn test_server(listen: &str, static_body: &[u8]) -> aetherlink_server::Server {
         "local_static_root": dir.to_str().expect("utf8"),
         "tls_cert": cert_path.to_str().expect("utf8"),
         "tls_key": key_path.to_str().expect("utf8"),
+        // The echo targets in this file are 127.0.0.1, which the default
+        // egress policy refuses (DEC-021). Relaying to a loopback target is
+        // exactly what these tests assert, so the operator opt-out is set
+        // here the same way a LAN-relaying deployment would set it.
+        "egress": { "deny_private": false },
     });
     let mut server = aetherlink_server::Server::new(doc).expect("server new");
     // Keep the temp dir alive for the test duration via the config path.

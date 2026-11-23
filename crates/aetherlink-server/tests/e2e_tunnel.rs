@@ -35,6 +35,9 @@ fn ctx() -> ServerCtx {
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
+        // Tests relay to 127.0.0.1 on purpose; the policy itself is
+        // covered by `egress_policy.rs` / `egress_tests.rs` (DEC-021).
+        egress: aetherlink_server::egress::EgressPolicy::permissive(),
         live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         max_connections: aetherlink_server::accept::DEFAULT_MAX_CONNECTIONS,
         max_streams: aetherlink_server::accept::DEFAULT_MAX_STREAMS,
@@ -102,8 +105,8 @@ fn oversized_reply_arrives_chunked_loop_survives() {
     });
     let echo = tcp_echo();
     let mut routes = HashMap::new();
-    routes.insert(1u16, format!("127.0.0.1:{big_port}").parse().expect("sa"));
-    routes.insert(3u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+    routes.insert(1u16, ("127.0.0.1".to_string(), big_port));
+    routes.insert(3u16, ("127.0.0.1".to_string(), echo));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -193,8 +196,8 @@ fn giant_udp_reply_dropped_loop_survives() {
     });
     let echo = tcp_echo();
     let mut routes = HashMap::new();
-    routes.insert(1u16, format!("127.0.0.1:{big_port}").parse().expect("sa"));
-    routes.insert(3u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+    routes.insert(1u16, ("127.0.0.1".to_string(), big_port));
+    routes.insert(3u16, ("127.0.0.1".to_string(), echo));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -346,7 +349,7 @@ fn dribbled_frame_body_still_processed() {
     // Given: echo target + pre-registered route (production shape)
     let echo = tcp_echo();
     let mut routes = HashMap::new();
-    routes.insert(1u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+    routes.insert(1u16, ("127.0.0.1".to_string(), echo));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -413,8 +416,8 @@ fn slow_stream_does_not_stall_fast_stream() {
     });
     let echo = tcp_echo();
     let mut routes = HashMap::new();
-    routes.insert(1u16, format!("127.0.0.1:{pit_port}").parse().expect("sa"));
-    routes.insert(3u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+    routes.insert(1u16, ("127.0.0.1".to_string(), pit_port));
+    routes.insert(3u16, ("127.0.0.1".to_string(), echo));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -467,6 +470,147 @@ fn slow_stream_does_not_stall_fast_stream() {
         .open_data(sess.keys.rx_key(), &h, &c)
         .expect("open echo");
     assert_eq!(back, b"hi");
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn egress_policy_refuses_loopback_and_keeps_the_session_alive() {
+    // Given: default policy (deny_private) plus one operator allow entry for
+    // the healthy target, and a *separate* loopback address left denied.
+    // 127.0.0.0/8 is entirely local on Linux, so both addresses are bindable.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let refused = TcpListener::bind("127.0.0.2:0").expect("refused target bind");
+    let refused_port = refused.local_addr().expect("addr").port();
+    let dials = Arc::new(AtomicUsize::new(0));
+    {
+        let dials = Arc::clone(&dials);
+        std::thread::spawn(move || loop {
+            let (sock, _) = match refused.accept() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            dials.fetch_add(1, Ordering::SeqCst);
+            drop(sock);
+        });
+    }
+    let echo = tcp_echo();
+
+    let mut base = ctx();
+    // Allow only `127.0.0.1`; `127.0.0.2` stays private and must be refused.
+    base.egress = aetherlink_server::egress::EgressPolicy::new(
+        true,
+        vec![aetherlink_server::egress::Cidr::parse("127.0.0.1/32").expect("cidr")],
+        Vec::new(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &base, &mut routes), Path::Tunnel);
+    });
+
+    // When: OPEN + DATA to the denied loopback address, then a healthy flow
+    // on the allowed one, in the same session.
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let nonce = [0xE9u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+    let denied = sess
+        .mux
+        .open_tcp("127.0.0.2", refused_port)
+        .expect("open denied");
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), denied, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), denied, b"probe", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    let allowed = sess.mux.open_tcp("127.0.0.1", echo).expect("open allowed");
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), allowed, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), allowed, b"alive", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    // Then: the session survives the refusal. The server closes the denied
+    // flow with an empty DATA (its close notification), and the healthy flow
+    // still answers afterwards.
+    let mut back = Vec::new();
+    let mut got = 0usize;
+    let mut closed_denied = false;
+    while got < b"alive".len() {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        if h.stream_id == denied {
+            // The denied flow may be announced first; it must never carry
+            // payload, and closing it locally also retires its window.
+            let payload = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("denied frame opens");
+            assert!(payload.is_empty(), "refused flow must not carry data");
+            closed_denied = true;
+            let _ = sess.mux.close(denied);
+            continue;
+        }
+        assert_eq!(h.stream_id, allowed, "only the healthy flow carries data");
+        let chunk = sess
+            .mux
+            .open_data(sess.keys.rx_key(), &h, &c)
+            .expect("healthy echo");
+        got += chunk.len();
+        back.extend_from_slice(&chunk);
+    }
+    assert_eq!(back, b"alive");
+    // The close notification may be ordered before or after the healthy
+    // echo (independent flows), so read until it arrives rather than
+    // assuming a position.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !closed_denied && std::time::Instant::now() < deadline {
+        let (h, c) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wire_help::read_frame(&mut stream)
+        })) {
+            Ok(frame) => frame,
+            // Read timed out: the server never announced the refusal.
+            Err(_) => break,
+        };
+        if h.stream_id == denied {
+            let payload = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("denied frame opens");
+            assert!(payload.is_empty(), "refused flow must not carry data");
+            closed_denied = true;
+            let _ = sess.mux.close(denied);
+        }
+    }
+    assert!(
+        closed_denied,
+        "the refused flow must be closed, not silently left open"
+    );
+
+    // ...and the denied target was never dialed at all.
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        0,
+        "egress policy must refuse before dialing"
+    );
+
     drop(stream);
     server.join().expect("server thread");
 }
@@ -678,9 +822,9 @@ fn e2e_two_streams_one_flow_plus_dns() {
     });
 
     let mut routes = HashMap::new();
-    routes.insert(1u16, format!("127.0.0.1:{echo1}").parse().expect("sa"));
-    routes.insert(3u16, format!("127.0.0.1:{echo2}").parse().expect("sa"));
-    routes.insert(5u16, format!("127.0.0.1:{udp_port}").parse().expect("sa"));
+    routes.insert(1u16, ("127.0.0.1".to_string(), echo1));
+    routes.insert(3u16, ("127.0.0.1".to_string(), echo2));
+    routes.insert(5u16, ("127.0.0.1".to_string(), udp_port));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -1613,7 +1757,7 @@ fn retransmitted_open_keeps_the_live_flow() {
 fn dribbled_frame_header_still_processed() {
     let echo = tcp_echo();
     let mut routes = HashMap::new();
-    routes.insert(1u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+    routes.insert(1u16, ("127.0.0.1".to_string(), echo));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -1667,7 +1811,7 @@ fn dribbled_frame_header_still_processed() {
 fn zero_and_padded_ping_keep_tunnel_alive() {
     let echo = tcp_echo();
     let mut routes = HashMap::new();
-    routes.insert(1u16, format!("127.0.0.1:{echo}").parse().expect("sa"));
+    routes.insert(1u16, ("127.0.0.1".to_string(), echo));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();

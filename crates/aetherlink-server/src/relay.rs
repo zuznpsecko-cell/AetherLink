@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
+use crate::egress::{EgressDenied, EgressPolicy};
 use crate::{Result, ServerError};
 
 /// Bound for outbound TCP dials: a silent target must fail fast instead of
@@ -36,7 +37,15 @@ pub fn classify_dial_err(e: &std::io::Error) -> DialFail {
 ///
 /// Failure kind travels with the error so the loop cools down only
 /// definitive refusals (see [`DialFail`]).
-pub fn dial_tcp(addr: &str, port: u16) -> std::result::Result<TcpStream, DialFail> {
+///
+/// Runs in the per-stream worker, never on the tunnel loop (DEC-022). The
+/// egress check (DEC-021) is applied per **resolved** address: a name says
+/// nothing about where it points.
+pub fn dial_tcp(
+    addr: &str,
+    port: u16,
+    egress: &EgressPolicy,
+) -> std::result::Result<TcpStream, DialFail> {
     let target = format!("{addr}:{port}");
     let mut last = DialFail::Transient;
     let addrs = match target.to_socket_addrs() {
@@ -44,6 +53,11 @@ pub fn dial_tcp(addr: &str, port: u16) -> std::result::Result<TcpStream, DialFai
         Err(_) => return Err(DialFail::Transient),
     };
     for sock_addr in addrs {
+        if egress.check(sock_addr.ip()).is_err() {
+            // Definitive: the policy will refuse this target on every retry,
+            // so classify as refused and let the caller cool it down.
+            return Err(DialFail::Refused);
+        }
         match TcpStream::connect_timeout(&sock_addr, TCP_DIAL_TIMEOUT) {
             Ok(stream) => {
                 // Leave SO_SNDBUF/SO_RCVBUF unlocked so Linux tcp_rmem/tcp_wmem
@@ -65,11 +79,41 @@ pub fn dial_tcp(addr: &str, port: u16) -> std::result::Result<TcpStream, DialFai
 /// Relay one UDP datagram: send `payload`, wait for the reply.
 ///
 /// Bounded by `timeout` so a silent target can never stall the mux.
-pub fn relay_udp(addr: &str, port: u16, payload: &[u8], timeout: Duration) -> Result<Vec<u8>> {
+pub fn relay_udp(
+    addr: &str,
+    port: u16,
+    payload: &[u8],
+    timeout: Duration,
+    egress: &EgressPolicy,
+) -> Result<Vec<u8>> {
     let target = format!("{addr}:{port}");
+    // Resolve first so the policy sees addresses, not the name (DEC-021).
+    // `UdpSocket::connect` would resolve internally, bypassing the check.
+    // A name can resolve to several addresses (and a resolved name can mix
+    // allowed and denied ones), so keep the first accepted candidate and
+    // report the real reason when none survives.
+    let mut denied: Option<EgressDenied> = None;
+    let dest = target
+        .to_socket_addrs()
+        .map_err(|e| ServerError::RelayError(format!("udp resolve {target}: {e}")))?
+        .find_map(|cand| match egress.check(cand.ip()) {
+            Ok(()) => Some(cand),
+            Err(reason) => {
+                if denied.is_none() {
+                    denied = Some(reason);
+                }
+                None
+            }
+        })
+        .ok_or_else(|| match denied {
+            Some(reason) => {
+                ServerError::RelayError(format!("udp target {target}: {}", reason.as_str()))
+            }
+            None => ServerError::RelayError(format!("udp target {target}: no address")),
+        })?;
     let sock = UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| ServerError::RelayError(format!("udp bind: {e}")))?;
-    sock.connect(&target)
+    sock.connect(dest)
         .map_err(|e| ServerError::RelayError(format!("udp connect {target}: {e}")))?;
     sock.set_read_timeout(Some(timeout))
         .map_err(|e| ServerError::RelayError(format!("udp timeout: {e}")))?;

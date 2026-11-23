@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aetherlink_crypto::auth::NonceCache;
 use aetherlink_frame::codec::FrameHeader;
@@ -37,6 +38,9 @@ fn ctx() -> ServerCtx {
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
+        // Tests relay to 127.0.0.1 on purpose; the policy itself is
+        // covered by `egress_policy.rs` / `egress_tests.rs` (DEC-021).
+        egress: aetherlink_server::egress::EgressPolicy::permissive(),
         live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         max_connections: aetherlink_server::accept::DEFAULT_MAX_CONNECTIONS,
         max_streams: aetherlink_server::accept::DEFAULT_MAX_STREAMS,
@@ -103,10 +107,7 @@ fn valid_auth_reaches_tunnel_tcp_echo() {
         sock.write_all(&buf).expect("echo write");
     });
     let mut routes = HashMap::new();
-    routes.insert(
-        1u16,
-        format!("127.0.0.1:{echo_port}").parse().expect("sockaddr"),
-    );
+    routes.insert(1u16, ("127.0.0.1".to_string(), echo_port));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -220,10 +221,7 @@ fn udp_datagram_relayed_transparently() {
         echo.send_to(&buf[..n], from).expect("echo send");
     });
     let mut routes = HashMap::new();
-    routes.insert(
-        1u16,
-        format!("127.0.0.1:{echo_port}").parse().expect("sockaddr"),
-    );
+    routes.insert(1u16, ("127.0.0.1".to_string(), echo_port));
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -254,6 +252,93 @@ fn udp_datagram_relayed_transparently() {
         .expect("open reply");
     assert_eq!(back, b"ping-udp");
     // Dropping the client stream lets the server loop observe EOF and return.
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
+fn unresolvable_target_does_not_stall_the_session() {
+    // Given: a healthy echo target and a server on the default loopback ctx
+    let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+    let echo_port = echo.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = echo.accept().expect("echo accept");
+        let mut buf = [0u8; 5];
+        use std::io::{Read, Write};
+        sock.read_exact(&mut buf).expect("echo read");
+        sock.write_all(&buf).expect("echo write");
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        assert_eq!(
+            serve_connection(sock, &ctx(), &mut HashMap::new()),
+            Path::Tunnel
+        );
+    });
+
+    // When: an OPEN to a name that cannot resolve (RFC 6761 `.invalid`) is
+    // followed immediately by traffic on a healthy flow. Before DEC-022 the
+    // resolver ran on the tunnel loop, so the healthy flow would wait for
+    // getaddrinfo to give up — and this test would time out.
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let nonce = [0xEAu8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    let dead = sess
+        .mux
+        .open_tcp("no-such-host.invalid", 443)
+        .expect("open unresolvable");
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), dead, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), dead, b"probe", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    let live = sess.mux.open_tcp("127.0.0.1", echo_port).expect("open live");
+    let sealed = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), live, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+    let sealed = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), live, b"hello", 128)
+        .expect("seal data");
+    wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
+
+    // Then: the healthy flow answers regardless of the dead name.
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        let (h, c) = wire_help::read_frame(&mut stream);
+        if h.stream_id != live {
+            let other = sess
+                .mux
+                .open_data(sess.keys.rx_key(), &h, &c)
+                .expect("frame opens");
+            assert!(other.is_empty(), "dead flow must carry no payload");
+            continue;
+        }
+        let chunk = sess
+            .mux
+            .open_data(sess.keys.rx_key(), &h, &c)
+            .expect("healthy echo");
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, b"hello");
+
     drop(stream);
     server.join().expect("server thread");
 }

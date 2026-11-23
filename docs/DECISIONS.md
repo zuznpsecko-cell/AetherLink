@@ -755,3 +755,107 @@ Same rule for `OPEN_UDP`.
   echo keeps the original generation and the target saw exactly one dial.
 - `server/tests/e2e_tunnel.rs::burst_and_edge_traffic_keeps_server_alive` — the
   original soak, which is where the bug showed up.
+
+---
+
+## DEC-021: The server enforces an egress policy on resolved addresses
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+After AUTH the client names every target itself: `OPEN_TCP` / `OPEN_UDP` carry an
+`addr` + `port` that the server resolves and connects to. Nothing restricted
+those addresses. The blocklist in `accept.rs` is an ads/tracker domain list — it
+matches suffixes, and an IP literal never matches — so it never was an egress
+control.
+
+Consequences on a deployed VPS: a client can reach the server's own loopback
+(including the listener on `127.0.0.1:443`), the private LAN behind the host,
+link-local, and `169.254.169.254`, which is the cloud metadata endpoint on
+EC2/GCE/Azure/OpenStack. That turns the tunnel into an internal-network proxy
+for anyone holding the PSK, and leaks instance credentials on the providers
+that authenticate metadata by reachability alone.
+
+### Decision
+A new `server::egress::EgressPolicy` filters the target **after resolution**,
+never by name:
+
+- `deny_private` (default `true`) rejects loopback, private, link-local,
+  CGNAT, ULA and unspecified addresses, IPv4 and IPv6, including v4-mapped v6.
+- `allow` / `deny` CIDR lists, checked in that order, for deployments that need
+  a specific hole (e.g. a local cache on `10.0.0.5`).
+- The check runs on **every** resolved address, right before `connect_timeout`
+  (TCP, `relay::dial_tcp`) and before `connect` (UDP, `relay::relay_udp`).
+  Checking after resolution is the point: `127.0.0.1.nip.io` resolves to
+  loopback and is rejected like a literal would be.
+
+A rejected target is a per-flow failure, not a session failure: the stream gets
+RST, the loop and the other flows stay up, matching how blocked domains are
+already handled.
+
+### Consequences
+- Default-deny breaks reachability of private targets for legitimate cases
+  (relaying to a host on the same LAN). Those deployments set
+  `egress.deny_private: false` explicitly — an informed opt-out, not an
+  insecure default.
+- The DNS intercept (`10.255.0.1:53`) is unaffected: it is translated to an
+  upstream *before* the policy, and upstreams are operator-controlled. The
+  `dns_upstream` entries are not filtered — an operator pointing the server at
+  a private resolver is configuration, not a client request.
+- Tests that relay to `127.0.0.1` (most of `e2e_tunnel.rs`) build their
+  `ServerCtx` with `deny_private: false`; the default stays `true`.
+- This is not an allowlist of ports or of the whole internet: it stops lateral
+  movement and metadata access, not a client reaching any public host.
+
+### Tests
+`server/tests/egress_policy.rs` (v4/v6 range boundaries, allow/deny order,
+v4-mapped v6) and `server/tests/egress_tests.rs` (OPEN to `127.0.0.1` is
+refused while the session and unrelated flows survive).
+
+---
+
+## DEC-022: Name resolution never runs on the tunnel event-loop
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+`tunnel_loop` is single-threaded and multiplexes every flow of a connection.
+On `OPEN_TCP` / `OPEN_UDP` it called `dial_addr()`, i.e. a blocking
+`getaddrinfo` (`to_socket_addrs`) **inside** that loop, purely to learn a
+`SocketAddr` for the `routes` table. Measured effect (see `docs/LIVE_ISSUES.md`):
+one slow lookup stalls the entire tunnel — uploads, downloads, UDP and pings of
+all flows — until the system resolver answers. On a VPS with a broken
+`/etc/resolv.conf` that is seconds to full timeout, and the client sees it as a
+frozen session.
+
+The resolved address was also thrown away and resolved a second time in
+`stream_worker` (`relay::dial_tcp`), so the loop paid the blocking cost for a
+value nobody used.
+
+### Decision
+`routes` stores the **target name**, `HashMap<u16, (String, u16)>`, not a
+`SocketAddr`. Resolution happens only where blocking is harmless:
+
+- TCP: in the per-stream worker thread (`stream_worker` → `relay::dial_tcp`).
+- UDP: in the relay pool worker (`relay::relay_udp` / `dns::resolve_any`).
+
+The loop only ever parses and dispatches, so no client-supplied name can block
+it, whatever the resolver does.
+
+### Consequences
+- Public signature change: `serve_connection` takes `&mut HashMap<u16, (String,
+  u16)>`, and `FlowKey.target` / the dead-cooldown key become the same pair, so
+  the "one target, two representations" split is gone.
+- Tests that pre-register routes pass a tuple instead of a `SocketAddr`.
+- A name that never resolves now costs a worker slot (bounded by `DIAL`
+  timeouts and `SEND_HOLD`), not the whole session; the flow fails closed with
+  RST while healthy flows keep flowing.
+- Nothing caches DNS yet. Each new stream resolves once, in its worker; adding a
+  cache is a separate change and does not affect the loop either way.
+
+### Tests
+`server/tests/accept_loop.rs::unresolvable_target_does_not_stall_the_session` —
+an OPEN to a name that cannot resolve followed immediately by traffic on a
+healthy flow: the healthy flow still gets its echo within the normal timeout.

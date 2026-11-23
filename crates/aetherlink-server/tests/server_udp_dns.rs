@@ -9,6 +9,11 @@ use std::time::Duration;
 
 use aetherlink_server::{dns, relay};
 
+/// TEST-NET/loopback targets on purpose (DEC-021 policy tested elsewhere).
+fn permissive() -> aetherlink_server::egress::EgressPolicy {
+    aetherlink_server::egress::EgressPolicy::permissive()
+}
+
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Local UDP echo helper: replies every datagram back to sender.
@@ -28,7 +33,7 @@ fn udp_relay_echoes_payload() {
     // Given: local UDP echo target
     let (port, h) = echo_server();
     // When: relaying one datagram
-    let back = relay::relay_udp("127.0.0.1", port, b"datagram-1", TIMEOUT).expect("relay");
+    let back = relay::relay_udp("127.0.0.1", port, b"datagram-1", TIMEOUT, &permissive()).expect("relay");
     // Then: transparent roundtrip
     assert_eq!(back, b"datagram-1");
     h.join().expect("echo thread");
@@ -39,7 +44,7 @@ fn udp_relay_times_out_on_silence() {
     // Given: unroutable TEST-NET target (RFC 5737, nothing answers)
     // When: relaying with a short timeout
     // Then: bounded Err, never hangs the mux
-    let err = relay::relay_udp("192.0.2.1", 53, b"q", Duration::from_millis(200));
+    let err = relay::relay_udp("192.0.2.1", 53, b"q", Duration::from_millis(200), &permissive());
     assert!(err.is_err());
 }
 
@@ -76,4 +81,37 @@ fn dns_resolve_times_out_on_silence() {
     // Then: bounded Err
     let err = dns::resolve(b"q", "192.0.2.1:53", Duration::from_millis(200));
     assert!(err.is_err());
+}
+
+/// DEC-021: the egress policy must stop a datagram before it leaves the host,
+/// and the refusal must be a normal `Err` (the mux skips that flow), not a
+/// panic or a hang.
+#[test]
+fn udp_relay_refuses_targets_the_policy_denies() {
+    // Given: a live loopback echo (so a dial *would* succeed without policy)
+    let (port, h) = echo_server();
+    // When: the default policy is in force
+    let policy = aetherlink_server::egress::EgressPolicy::new(true, Vec::new(), Vec::new());
+    let err = relay::relay_udp("127.0.0.1", port, b"blocked", TIMEOUT, &policy);
+    // Then: refused with a reason naming the policy
+    let text = format!("{err:?}");
+    assert!(text.contains("private or metadata"), "got: {text}");
+    drop(h);
+}
+
+/// DEC-021: an explicit allow entry re-opens exactly that target.
+#[test]
+fn udp_relay_honours_an_explicit_allow_entry() {
+    // Given: the default deny plus an operator hole for loopback
+    let (port, h) = echo_server();
+    let policy = aetherlink_server::egress::EgressPolicy::new(
+        true,
+        vec![aetherlink_server::egress::Cidr::parse("127.0.0.1/32").expect("cidr")],
+        Vec::new(),
+    );
+    // Then: the datagram round-trips through the allowed address
+    let back = relay::relay_udp("127.0.0.1", port, b"allowed", TIMEOUT, &policy)
+        .expect("allow entry re-opens loopback");
+    assert_eq!(back, b"allowed");
+    h.join().expect("echo thread");
 }

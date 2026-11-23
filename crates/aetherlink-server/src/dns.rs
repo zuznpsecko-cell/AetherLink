@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::egress::EgressPolicy;
 use crate::relay;
 use crate::{Result, ServerError};
 
@@ -92,13 +93,25 @@ pub fn empty_response(query: &[u8]) -> Vec<u8> {
 /// Resolve one DNS query through `upstream` (`"ip:port"`), relaying the
 /// answer back verbatim. Bounded by `timeout`.
 pub fn resolve(query: &[u8], upstream: &str, timeout: Duration) -> Result<Vec<u8>> {
+    // Operator-configured upstreams are trusted by default; a caller that
+    // relays to a *client-chosen* target passes its own policy (DEC-021).
+    resolve_with(query, upstream, timeout, &EgressPolicy::permissive())
+}
+
+/// Same as [`resolve`], with the egress policy applied to the upstream.
+pub fn resolve_with(
+    query: &[u8],
+    upstream: &str,
+    timeout: Duration,
+    egress: &EgressPolicy,
+) -> Result<Vec<u8>> {
     let (host, port) = upstream
         .rsplit_once(':')
         .ok_or_else(|| ServerError::DnsError(format!("bad upstream {upstream}")))?;
     let port: u16 = port
         .parse()
         .map_err(|_| ServerError::DnsError(format!("bad upstream {upstream}")))?;
-    relay::relay_udp(host, port, query, timeout)
+    relay::relay_udp(host, port, query, timeout, egress)
         .map_err(|e| ServerError::DnsError(format!("resolve via {upstream}: {e}")))
 }
 

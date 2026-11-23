@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilience (DEC-015) + header authentication (DEC-016), typed replay (DEC-017), library/deploy split (DEC-018), FFI lock (DEC-019), idempotent OPEN (DEC-020); gates NOT run yet. Previous baseline: GUI endpoint profiles 49/49 .NET tests; Rust TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilience (DEC-015) + header authentication (DEC-016), typed replay (DEC-017), library/deploy split (DEC-018), FFI lock (DEC-019), idempotent OPEN (DEC-020), egress policy (DEC-021), resolution off the loop (DEC-022); gates NOT run yet. Previous baseline: GUI endpoint profiles 49/49 .NET tests; Rust TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
 
 > **0l (upload 0.00): фикс в дереве, гейты НЕ прогонялись.** Причины и список правок — в
 > [docs/LIVE_ISSUES.md](LIVE_ISSUES.md#0l-аплоад-000-байты-терялись-молча-fin-убивал-ответ-id-кончались-в-дереве-гейты-не-прогонялись).
@@ -46,9 +46,19 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] Root `Cargo.toml` with workspace config
 - [x] Individual crate `Cargo.toml` files
 - [x] `protocol/` crate with golden test harness
-- [x] `DECISIONS.md` (DEC-001..DEC-020)
+- [x] `DECISIONS.md` (DEC-001..DEC-022)
 - [x] `STATUS.md` (this file)
 - [x] Basic `README.md`
+
+### Phase 21: Egress control & loop hygiene (DEC-021..DEC-022)
+
+- [x] **Egress policy on resolved addresses** (`server::egress`): `deny_private` default on blocks loopback/RFC1918/link-local/CGNAT/ULA/metadata, v4 **and** v6, plus `allow`/`deny` CIDRs
+- [x] Policy applied after resolution (TCP `dial_tcp`, UDP `relay_udp`), never on the name
+- [x] **`routes` stores `(String, u16)`**; `getaddrinfo` no longer runs on the tunnel event-loop
+- [x] Resolution moved entirely into the stream worker / relay pool
+- [x] Tests: `server/tests/egress_policy.rs`, `egress_tests.rs`, `accept_loop::unresolvable_target_does_not_stall_the_session`
+- [ ] **Gates not run** — no Rust toolchain in the sandbox
+- [ ] Still open: per-IP rate limiting; DNS cache; IPv6 dial targets (still IPv4-only)
 
 ### Phase 20: Transport authenticity & host hygiene (DEC-016..DEC-020)
 
