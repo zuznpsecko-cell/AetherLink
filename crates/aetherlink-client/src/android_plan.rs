@@ -356,7 +356,8 @@ fn ranges_to_prefixes(ranges: &[Range]) -> Vec<IpPrefix> {
             let span = if current == 0 {
                 1u64 << 32
             } else {
-                let low_bit = current & current.wrapping_neg();
+                // `x & -x` in stable form: the branch proves `current != 0`.
+                let low_bit = 1u64 << current.trailing_zeros();
                 low_bit.min(1u64 << 32)
             };
             let remaining = end - current + 1;

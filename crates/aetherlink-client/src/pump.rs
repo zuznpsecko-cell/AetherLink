@@ -690,10 +690,7 @@ impl DataPump {
                         // SYN carrying payload (fast-open style): forward it
                         // now instead of waiting for the completing ACK.
                         if !seg.payload.is_empty() {
-                            let frames = match self.seal_payload(&fk, &mut flow, &seg.payload) {
-                                Ok(frames) => frames,
-                                Err(e) => return Err(e),
-                            };
+                            let frames = self.seal_payload(&fk, &mut flow, &seg.payload)?;
                             self.tcp.insert(fk, flow);
                             return Ok(Some(frames));
                         }
