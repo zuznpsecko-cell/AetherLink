@@ -56,10 +56,7 @@ fn rules_set_list_reload_roundtrip() {
     let listed = read_out(h);
     assert!(listed.contains("\"one\""), "got: {listed}");
     assert!(listed.contains("\"site\""), "got: {listed}");
-    assert_eq!(
-        aether_client_rules_reload(h),
-        AetherError::Success as i32
-    );
+    assert_eq!(aether_client_rules_reload(h), AetherError::Success as i32);
 }
 
 #[test]
