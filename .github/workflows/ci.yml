@@ -7,27 +7,28 @@ on:
       - main
 
 jobs:
-  probe2:
+  probe3:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: PROBE fmt
+      - name: PROBE audit
+        run: |
+          set +e
+          cargo install cargo-audit --locked --quiet > /tmp/inst.log 2>&1
+          echo "install exit=$?"
+          cargo audit > /tmp/audit.log 2>&1
+          echo "audit exit=$?"
+          tail -25 /tmp/audit.log | tr '\n' '|' | head -c 1800
+          echo
+      - name: PROBE fmt files (all)
         run: |
           set +e
           cargo fmt --all -- --check > /tmp/fmt.log 2>&1
-          echo "fmt exit=$?"
-          grep -oP 'Diff in \K[^:]+(?=:)' /tmp/fmt.log | sort -u | head -6 | while read -r f; do echo "::notice::FMTFILE $f"; done
-          echo "::notice::FMTTOTAL $(grep -c 'Diff in' /tmp/fmt.log)"
-      - name: PROBE clippy
-        run: |
-          set +e
-          cargo clippy --workspace --all-targets > /tmp/clippy.log 2>&1
-          code=$?
-          warn=$(grep -c '^warning: ' /tmp/clippy.log)
-          err=$(grep -c '^error' /tmp/clippy.log)
-          echo "::notice::CLIPPY exit=$code warnings=$warn errors=$err"
-          grep -oP '^warning: \K.*' /tmp/clippy.log | sort | uniq -c | sort -rn | head -6 | while read -r line; do echo "::notice::CLIPPYTOP $line"; done
+          grep -oP 'Diff in \K[^:]+(?=:)' /tmp/fmt.log | sort -u | sed 's#.*/AetherLink/##' > /tmp/files.txt
+          wc -l < /tmp/files.txt
+          head -38 /tmp/files.txt | tr '\n' ',' | head -c 1500
+          echo
