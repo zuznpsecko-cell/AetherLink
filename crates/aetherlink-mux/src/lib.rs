@@ -36,6 +36,34 @@ pub enum MuxError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// A stream id recycled through the whole 32-bit generation space.
+    ///
+    /// Wrapping here would repeat an AEAD nonce under the live traffic key,
+    /// so the manager refuses instead. Reaching this needs 4 billion
+    /// re-incarnations of a single id in one session: rekey and reconnect.
+    #[error("Nonce space exhausted for stream id: rekey required")]
+    NonceSpaceExhausted,
+
+    /// A frame was rejected by the replay window: duplicate or outside it.
+    ///
+    /// This is a *normal* event on a live tunnel (the peer retransmits after
+    /// loss, and UDP duplicates arrive), so callers drop the frame and keep
+    /// the flow. It is a distinct variant precisely so it is never confused
+    /// with [`MuxError::Internal`], which means the stream state is broken.
+    #[error("Replayed frame on stream {stream_id}: seq {seq}")]
+    ReplayDetected { stream_id: u16, seq: u32 },
+
+    /// The peer sent a frame for a different incarnation of this stream id.
+    ///
+    /// Late arrival from a previous life of a recycled id, or a peer that
+    /// re-opened the id before this side registered it. Drop the frame.
+    #[error("Stale generation on stream {stream_id}: {got} != {expected}")]
+    StaleGeneration {
+        stream_id: u16,
+        got: u32,
+        expected: u32,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MuxError>;

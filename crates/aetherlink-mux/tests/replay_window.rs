@@ -1,0 +1,162 @@
+//! Replay-window behaviour of the mux: typed rejections, never silent loss.
+//!
+//! `MuxManager::open` used to report a duplicate or too-old sequence as
+//! `MuxError::Internal("replay seq")` — the same variant it used for genuinely
+//! broken state. Callers only log, so the practical effect was a silent skip;
+//! but anything inspecting the error could not tell "the peer retransmitted"
+//! (normal on a lossy path, drop the frame) from "this stream is corrupt"
+//! (tear it down). The window itself also updated its anchor only for
+//! in-order frames, which is exactly backwards: an out-of-order frame that is
+//! accepted must move the anchor, or a later duplicate looks new again.
+
+use aetherlink_frame::codec::FrameHeader;
+use aetherlink_frame::types::Frame;
+use aetherlink_mux::manager::{seal_frame_with, MuxManager, SealedFrame};
+use aetherlink_mux::MuxError;
+use aetherlink_protocol::FrameType;
+
+const KEY: [u8; 32] = [0x5Au8; 32];
+const PAD: usize = 128;
+
+/// Seal DATA for `id` at an explicit sequence, bypassing the manager's own
+/// counter (these tests need to replay and reorder deliberately).
+fn seal_at(id: u16, generation: u32, seq: u32, payload: &[u8]) -> SealedFrame {
+    let frame = Frame::data(id, seq, payload.to_vec());
+    seal_frame_with(&KEY, id, generation, seq, frame, PAD).expect("seal")
+}
+
+/// A manager with one live TCP stream, plus that stream's generation.
+fn live_stream() -> (MuxManager, u16, u32) {
+    let mut mux = MuxManager::with_max(4);
+    let id = mux.open_tcp("93.184.216.34", 443).expect("open");
+    let generation = mux
+        .seal_open_tcp(&KEY, id, PAD)
+        .expect("open frame")
+        .header
+        .generation;
+    (mux, id, generation)
+}
+
+#[test]
+fn duplicate_sequence_is_a_typed_replay_rejection() {
+    let (mut mux, id, generation) = live_stream();
+    let frame = seal_at(id, generation, 7, b"once");
+
+    assert!(
+        mux.open_data(&KEY, &frame.header, &frame.ciphertext).is_ok(),
+        "first arrival is accepted"
+    );
+    // Same frame again: a normal retransmit on a lossy path.
+    let err = mux
+        .open_data(&KEY, &frame.header, &frame.ciphertext)
+        .expect_err("duplicate must be rejected");
+    match err {
+        MuxError::ReplayDetected { stream_id, seq } => {
+            assert_eq!(stream_id, id);
+            assert_eq!(seq, 7);
+        }
+        other => panic!("expected ReplayDetected, got {other:?}"),
+    }
+
+    // And: the stream is still usable — a replay must not poison it.
+    let next = seal_at(id, generation, 8, b"next");
+    assert!(mux.open_data(&KEY, &next.header, &next.ciphertext).is_ok());
+}
+
+#[test]
+fn stale_generation_is_reported_separately_from_replay() {
+    let (mut mux, id, generation) = live_stream();
+    // A frame from a previous life of this id: same seq, older generation.
+    let old_generation = generation.saturating_sub(1);
+    let frame = seal_at(id, old_generation, 1, b"from the past");
+    let err = mux
+        .open_data(&KEY, &frame.header, &frame.ciphertext)
+        .expect_err("stale incarnation must be rejected");
+    match err {
+        MuxError::StaleGeneration {
+            stream_id,
+            got,
+            expected,
+        } => {
+            assert_eq!(stream_id, id);
+            assert_eq!(got, old_generation);
+            assert_eq!(expected, generation);
+        }
+        other => panic!("expected StaleGeneration, got {other:?}"),
+    }
+}
+
+#[test]
+fn out_of_order_frame_advances_the_anchor() {
+    // Given: seq 1 accepted, then seq 5 (a gap: 2..4 lost)
+    let (mut mux, id, generation) = live_stream();
+    let one = seal_at(id, generation, 1, b"one");
+    assert!(mux.open_data(&KEY, &one.header, &one.ciphertext).is_ok());
+
+    let five = seal_at(id, generation, 5, b"five");
+    assert!(mux.open_data(&KEY, &five.header, &five.ciphertext).is_ok());
+
+    // Then: replaying seq 1 is behind the anchor and must be rejected — even
+    // though seq 1 itself was accepted long ago.
+    let err = mux
+        .open_data(&KEY, &one.header, &one.ciphertext)
+        .expect_err("seq 1 is behind the anchor");
+    assert!(matches!(err, MuxError::ReplayDetected { .. }));
+
+    // And: an in-window gap can still be filled (seq 3 was merely delayed).
+    let three = seal_at(id, generation, 3, b"three");
+    assert!(
+        mux.open_data(&KEY, &three.header, &three.ciphertext).is_ok(),
+        "a delayed in-window frame must still be accepted"
+    );
+    // ... but only once.
+    assert!(matches!(
+        mux.open_data(&KEY, &three.header, &three.ciphertext),
+        Err(MuxError::ReplayDetected { .. })
+    ));
+}
+
+#[test]
+fn sequence_zero_data_frame_is_rejected() {
+    // seq 0 is reserved for OPEN; seeing it on DATA means a forged header.
+    let (mut mux, id, generation) = live_stream();
+    let frame = seal_at(id, generation, 0, b"forged");
+    let err = mux
+        .open_data(&KEY, &frame.header, &frame.ciphertext)
+        .expect_err("seq 0 on DATA must be rejected");
+    assert!(
+        matches!(err, MuxError::Internal(_)),
+        "seq 0 is a protocol violation, not a replay: {err:?}"
+    );
+}
+
+#[test]
+fn header_that_does_not_match_the_ciphertext_fails_authentication() {
+    // The header is AEAD associated data now, so a header claiming another
+    // generation cannot be decrypted with this ciphertext.
+    let (mut mux, id, generation) = live_stream();
+    let frame = seal_at(id, generation, 2, b"payload");
+    let forged = FrameHeader {
+        generation: generation + 1,
+        ..frame.header.clone()
+    };
+    assert!(
+        mux.open_data(&KEY, &forged, &frame.ciphertext).is_err(),
+        "a header that does not match the sealed ciphertext must fail"
+    );
+    // And: the honest header still opens the same bytes (nothing was consumed
+    // by the failed attempt).
+    assert!(mux.open_data(&KEY, &frame.header, &frame.ciphertext).is_ok());
+}
+
+#[test]
+fn unexpected_frame_type_is_not_a_replay() {
+    let (mut mux, id, generation) = live_stream();
+    let frame = seal_at(id, generation, 3, b"data");
+    let mut wrong_type = frame.header.clone();
+    wrong_type.frame_type = FrameType::UdpDatagram;
+    assert!(
+        mux.open_data(&KEY, &wrong_type, &frame.ciphertext).is_err(),
+        "a DATA stream must not accept a DATAGRAM frame"
+    );
+}

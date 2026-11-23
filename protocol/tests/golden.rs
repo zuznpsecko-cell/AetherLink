@@ -81,36 +81,89 @@ fn test_golden_hkdf_key_derivation() {
     assert_eq!(rx_key, rx_key2);
 }
 
-/// Test vector for frame encoding/decoding
+/// Test vector for frame encoding/decoding (protocol v2).
+///
+/// The nonce is derived by the sender from `(id, generation, seq, type)` and
+/// is not part of the frame, so this vector passes an explicit generation.
 #[test]
 fn test_golden_frame_codec() {
     use aetherlink_frame::{codec, types::Frame};
 
     let key = [0xABu8; AEAD_KEY_SIZE];
-    let nonce = [0xCDu8; AEAD_NONCE_SIZE];
+    let generation = 9u32;
+    let nonce = build_nonce(1, generation, 100, FrameType::Data);
 
     // Test DATA frame
     let frame = Frame::data(1, 100, b"test payload data".to_vec());
-    let encoded = codec::encode_frame(&frame, &key, &nonce, DEFAULT_PAD_MULTIPLE)
+    let encoded = codec::encode_frame(&frame, &key, generation, &nonce, DEFAULT_PAD_MULTIPLE)
         .expect("Encoding should succeed");
 
-    let decoded = codec::decode_frame(&encoded, &key, &nonce).expect("Decoding should succeed");
+    let (decoded, framed_generation) =
+        codec::decode_frame(&encoded, &key, &nonce).expect("Decoding should succeed");
     assert_eq!(decoded.frame_type, FrameType::Data);
     assert_eq!(decoded.stream_id, 1);
     assert_eq!(decoded.sequence, 100);
+    assert_eq!(framed_generation, generation, "generation survives the wire");
     assert_eq!(
         decoded.payload,
         aetherlink_frame::types::FramePayload::Data(b"test payload data".to_vec())
     );
 
-    // Test OPEN_TCP frame
+    // Test OPEN_TCP frame (seq 0: the generation is the only differentiator)
+    let open_nonce = build_nonce(3, generation, 0, FrameType::OpenTcp);
     let frame = Frame::open_tcp(3, 1, "example.com".to_string(), 443);
-    let encoded = codec::encode_frame(&frame, &key, &nonce, DEFAULT_PAD_MULTIPLE)
+    let encoded = codec::encode_frame(&frame, &key, generation, &open_nonce, DEFAULT_PAD_MULTIPLE)
         .expect("Encoding should succeed");
 
-    let decoded = codec::decode_frame(&encoded, &key, &nonce).expect("Decoding should succeed");
+    let (decoded, _) = codec::decode_frame(&encoded, &key, &open_nonce)
+        .expect("Decoding should succeed");
     assert_eq!(decoded.frame_type, FrameType::OpenTcp);
     assert_eq!(decoded.stream_id, 3);
+
+    // A nonce built for another generation must not open the frame: this is
+    // exactly the guarantee that a recycled id cannot be decrypted with the
+    // previous incarnation's nonce.
+    let wrong = build_nonce(3, generation + 1, 0, FrameType::OpenTcp);
+    assert!(
+        codec::decode_frame(&encoded, &key, &wrong).is_err(),
+        "generation is authenticated by the nonce"
+    );
+}
+
+/// The header layout is the part two independent implementations must agree
+/// on, so pin the bytes, not just the roundtrip.
+#[test]
+fn test_golden_header_layout_v2() {
+    use aetherlink_frame::codec::FrameHeader;
+
+    let header = FrameHeader {
+        length: 0x010203,
+        frame_type: FrameType::OpenTcp,
+        flags: 0xAB,
+        stream_id: 0x0405,
+        sequence: 0x0607_0809,
+        generation: 0x0A0B_0C0D,
+    };
+    let mut buf = bytes::BytesMut::new();
+    header.encode(&mut buf);
+    assert_eq!(buf.len(), FRAME_HEADER_SIZE, "header stays 24 bytes");
+    assert_eq!(
+        &buf[..FRAME_HEADER_SIZE - FRAME_HEADER_RANDOM_SIZE],
+        &[
+            0x01, 0x02, 0x03, // length (24-bit)
+            0x01, // type = OpenTcp
+            0xAB, // flags
+            0x04, 0x05, // stream id
+            0x06, 0x07, 0x08, 0x09, // sequence
+            0x0A, 0x0B, 0x0C, 0x0D, // generation
+        ],
+        "v2 header fields must sit at their documented offsets"
+    );
+
+    // And: the reserved tail carries no protocol meaning, so decoding gives
+    // back exactly the fields above.
+    let decoded = FrameHeader::decode(&mut buf).expect("decode");
+    assert_eq!(decoded, header);
 }
 
 /// Test vector for frame types serialization

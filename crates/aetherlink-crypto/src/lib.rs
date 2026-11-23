@@ -34,8 +34,13 @@ pub enum CryptoError {
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
 
-/// Protocol version constant
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Protocol version constant.
+///
+/// Duplicated from `aetherlink_protocol::PROTOCOL_VERSION` (this crate is a
+/// dependency of the spec crate, so the arrow cannot point the other way).
+/// `aetherlink_protocol` has a compile-time assertion that keeps the two
+/// values equal — edit both or neither.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Authentication prefix used in HMAC
 pub const AUTH_PREFIX: &[u8] = b"aetherlink-auth-v1";

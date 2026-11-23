@@ -11,6 +11,7 @@ hex = { workspace = true }
 
 [dev-dependencies]
 aetherlink-crypto = { path = "../crates/aetherlink-crypto" }
+bytes = { workspace = true }
 aetherlink-frame = { path = "../crates/aetherlink-frame" }
 aetherlink-mux = { path = "../crates/aetherlink-mux" }
 pretty_assertions = { workspace = true }

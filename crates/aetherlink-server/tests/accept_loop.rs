@@ -37,6 +37,8 @@ fn ctx() -> ServerCtx {
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
+        live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        max_connections: aetherlink_server::accept::DEFAULT_MAX_CONNECTIONS,
     }
 }
 
@@ -160,6 +162,7 @@ fn bad_auth_gets_static_without_banner() {
         flags: 0,
         stream_id: 0,
         sequence: 0,
+        generation: 0,
     }
     .encode(&mut hb);
     stream.write_all(&hb).expect("header");

@@ -351,3 +351,348 @@ protocol surface and break the thin-host rule.
   `gui_endpoint_list_is_ignored_by_core`.
 - Gates: `scripts/check_gui_endpoints.ps1`, `scripts/check_thin_hosts.ps1`.
 - Log: `docs/WINDOWS_GUI.md`.
+
+---
+
+## DEC-014: Per-frame generation in the header (protocol v2)
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+Protocol v1 derived the AEAD nonce from `(stream_id, sequence, type)` while
+`MuxManager` deliberately recycles stream ids: a session outlives the 16-bit id
+space and `alloc_id` wraps after 32 768 allocations. The OPEN frame always uses
+`sequence = 0`, so the first repeated nonce under the single per-session
+traffic key was `(id, 0, OpenTcp)` — with the dial target inside the sealed
+payload. There is no rekey mechanism anywhere in the tree.
+
+Repeating a ChaCha20-Poly1305 nonce is catastrophic, not degrading: it repeats
+the keystream (XOR of two ciphertexts recovers plaintext) and repeats the
+Poly1305 one-time key (tags become forgeable).
+
+### Alternatives Considered
+1. **Per-stream key** (`HKDF(session_key, dir || id || generation)`) — stronger
+   compartmentalisation, but the generation must be negotiated through the
+   OPEN frame; when an OPEN is skipped server-side (blocklist hit, parse error,
+   `continue` in the accept loop) the two sides desynchronise and the stream
+   breaks.
+2. **Full rekey epochs** — the textbook answer (QUIC/WireGuard), but it needs
+   an epoch-agreement frame or a trigger both sides observe deterministically.
+   Neither exists today; it is a much larger change.
+3. **Random 4-byte nonce prefix** — birthday collisions after ~2^16 frames per
+   session, i.e. minutes of traffic. Rejected.
+
+### Decision
+Carry a 32-bit `generation` in the frame header (offset 11, inside the 13
+reserved bytes v1 already transmitted as zeros, so frames do not grow) and
+derive
+
+```
+nonce12 = id(u16 BE) || generation(u32 BE) || seq(u32 BE) || type(u8) || 0
+```
+
+`generation` is monotonic per `(id, direction)` for the whole session: a
+`last_generation` tombstone survives `close`, and every fresh incarnation of an
+id (local `open_tcp`/`open_udp`, `register_inbound`) claims `last + 1`.
+Exhausting the 32-bit space is a hard error (`MuxError::NonceSpaceExhausted`),
+never a wrap.
+
+The remaining 9 reserved bytes are filled with fresh randomness on every frame.
+They carried no meaning in v1 (constant zeros, a free fingerprinting signal) and
+every reader ignores them, so this costs nothing on the wire.
+
+The layout lives once in `aetherlink_protocol::build_nonce`; the mux wraps it.
+
+### Consequences
+- **Breaking.** `PROTOCOL_VERSION` is 2. A v1 peer is refused at the preface
+  byte (`handshake_server`), which is a clean, explicit failure — v1 would
+  otherwise fail every AEAD open with a misleading "authentication failed".
+- `open` (DATA/UDP) rejects a frame whose generation differs from the live
+  incarnation, before decryption: late frames from a closed life of the id
+  cannot be replayed into the new one, and a peer that re-opened an id it has
+  not registered yet fails closed instead of corrupting the new stream.
+- Ids are still recycled, so the id space stays as large as before; the cost is
+  one `HashMap` entry per id ever used (bounded by 65 536).
+- Non-goal: full per-stream keys and rekey epochs stay open (alternatives 1 and
+  2); `generation` removes the immediate nonce-reuse break, it does not add
+  compartmentalisation or forward secrecy.
+
+### Tests
+- `crates/aetherlink-mux/tests/nonce_generation.rs`: 600 incarnations of one
+  id produce no duplicate OPEN or DATA nonce; generation advances on recycle;
+  stale/newer generations are refused.
+- `crates/aetherlink-frame/src/codec.rs`: generation round-trips at the
+  documented offset; the reserved tail differs per frame and does not disturb
+  decoding.
+- `protocol/tests/golden.rs`: pinned v2 header bytes and nonce layout; a nonce
+  from another generation cannot open the frame.
+
+---
+
+## DEC-015: Server resilience — unwind, pre-auth bounds, connection cap
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+Three independent properties of the server made one unauthenticated peer
+enough to take the process (or a slot) down:
+
+1. `[profile.release] panic = "abort"` made every `catch_unwind` guard dead
+   code in the shipped binary. The guards are the *only* containment between a
+   single malformed flow and the whole host: `serve_background` spawns one
+   thread per connection, `forward_tcp` one per stream, `RelayPool` one per
+   relay job.
+2. `session::handshake_server` read the AUTH frame length out of a clear-text
+   header and did `vec![0u8; header.length]` **before** verifying the token —
+   up to 16 MiB of server RAM per unauthenticated TLS connection.
+3. The accept loop was unbounded (documented as "DoS hardening is a
+   follow-up"), one 4 MiB-stack thread per socket, with no handshake deadline.
+
+### Decision
+1. **`panic = "unwind"` in the release profile.** Panics are contained per
+   connection/stream/job; the containment function logs the event. Chosen over
+   "remove the guards and accept fail-fast" because a VPN server whose entire
+   client base drops when one flow misbehaves is not an acceptable failure
+   mode for a process that also repairs routes and DNS on the way out.
+2. **Fixed AUTH size, checked before allocating.** The AUTH payload is exactly
+   `AUTH_FRAME_LEN` (64 B: nonce + token). Any other declared length fails with
+   `CoreError::FrameTooLarge`. Post-auth frames are bounded the same way by
+   `MAX_WIRE_BODY` (`24 B header + 64 KiB`), which is one TLS record plus
+   slack — the client chunks at 16 KiB, so a larger header is a lying header.
+3. **`server.max_connections`** (default `DEFAULT_MAX_CONNECTIONS = 512`,
+   zero clamped to 1). Enforced twice: a cheap check in the accept loop avoids
+   spawning a thread, and `serve_connection` takes an RAII `ConnectionSlot`
+   so capacity is returned on drop, including on panic. Past the cap sockets
+   are dropped (shed), never queued.
+4. **Handshake deadline.** `tls::accept_tls_with_timeout`
+   (`DEFAULT_HANDSHAKE_TIMEOUT = 10 s`) arms `SO_RCVTIMEO`/`SO_SNDTIMEO` for
+   `complete_io` and **clears them afterwards** — a leftover 10 s read timeout
+   would silently interact with the tunnel's own 5 ms poll.
+
+While in the same code, `server.max_streams` is no longer ignored
+(`MuxManager::set_max` is applied at session start), and `RelayPool` had two
+liveness bugs fixed: `dispatch` reserved its slot only *after* the job became
+visible (a fast worker could make `active` underflow to `usize::MAX`, wedging
+the pool at "busy" forever), and a panicking job never posted a completion, so
+its slot leaked.
+
+### Consequences
+- A panic no longer aborts the process; it costs one connection and a log
+  line. Binary size grows slightly (unwind tables).
+- `Vec`-free handshake: no unauthenticated allocation above 64 B.
+- Capacity is now a config knob; the default 512 connections x 4 MiB stack is
+  ~2 GiB of virtual address space, not resident memory, but it is the number to
+  tune on small VPS instances.
+- Not addressed here: per-IP rate limiting, TLS-handshake-completion
+  accounting, and `max_streams` being per connection rather than per host.
+
+### Tests
+- `crates/aetherlink-server/tests/resilience.rs`: slot release on drop and on
+  panic; over-cap connection shed as `Path::Closed` with no bytes served;
+  handshake deadline fails closed on a silent peer; deadline does not leak into
+  the served stream.
+- `crates/aetherlink-server/tests/relay_pool.rs`: `fast_worker_never_underflows_the_active_counter`,
+  `panicking_job_returns_its_slot`.
+- `crates/aetherlink-core/tests/session_handshake.rs`:
+  `oversized_auth_body_is_refused_before_allocation`,
+  `truncated_auth_body_is_refused`.
+- `crates/aetherlink-server/tests/config_schema.rs`: `max_connections_parses_and_defaults`.
+
+---
+
+## DEC-016: Frame header is AEAD associated data
+
+**Date:** 2026-11-23
+**Status:** Accepted — **breaking wire change** (release this with DEC-014)
+
+### Context
+`encode_frame`/`decode_frame` sealed the payload with `aad = &[]`. The 24-byte
+header travels in clear text inside TLS, so every header field was
+*unauthenticated*: an attacker positioned inside the TLS-terminating layer
+(a compromised client, a hostile TLS terminator, a buggy relay, or simply a
+later refactor that trusts the header) could rewrite it and the ciphertext
+would still decrypt.
+
+The consequences are concrete, not academic:
+
+- `stream_id` selects which TUN flow the plaintext is injected into. Editing
+  it moves bytes between flows — cross-stream injection with a valid AEAD tag.
+- `generation` is the nonce component DEC-014 depends on. Unauthenticated, a
+  peer can claim any generation and steer which key stream position is tried.
+- `length` decides how many bytes are read as ciphertext (already bounded by
+  DEC-015, but the bound was the only check).
+- `flags` is reserved and ignored today — which is precisely why it must be
+  authenticated *before* something starts trusting it.
+
+### Decision
+The AAD is the header without its random tail:
+
+```text
+length(3) || type(1) || flags(1) || stream_id(2) || sequence(4) || generation(4)
+```
+
+15 bytes, produced by `codec::header_aad(&FrameHeader)` and used by both
+directions. The 9 random bytes are excluded on purpose: they carry no meaning,
+and including them would make the AAD depend on bytes the sender regenerates
+per frame (it would still work, but it would authenticate noise).
+
+`encode_frame` now builds the header *before* encrypting, so the length field
+(known: plaintext + fixed 16-byte tag) is part of the committed data.
+
+### Consequences
+- Any header edit fails AEAD authentication: `stream_id`, `sequence`,
+  `generation`, `flags`, `type` and `length` are all protected.
+- **Wires are incompatible with earlier builds of v2.** v2 was never released,
+  so this rides along with it; a v2 peer built before this commit fails
+  decryption, not the preface check. Ship both sides together.
+- Cost: 15 extra bytes of AAD per frame in Poly1305 — no extra RAM, no extra
+  packets, no extra round trip.
+- `header_aad` is duplicated nowhere: both codec directions and both hosts go
+  through `codec::encode_frame`/`decode_frame`, so there is one definition.
+
+### Tests
+`crates/aetherlink-frame/tests/header_auth.rs`:
+`aad_covers_every_meaningful_header_field`, `untampered_frame_still_roundtrips`,
+`tampered_header_is_rejected_by_the_aead`,
+`tampered_reserved_tail_is_accepted`, `frame_cannot_be_moved_to_another_stream_id`.
+
+---
+
+## DEC-017: Replay handling is typed, and the dead `ReplayWindow` is gone
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+Two replay mechanisms existed and neither did its job:
+
+1. `aetherlink_frame::codec::ReplayWindow` (window 1024, `u64` bitmap) was
+   **never constructed anywhere**. Its three unit tests passed against a
+   struct no caller uses, which is worse than having no tests: it advertised
+   replay protection the mux did not implement.
+2. The real window lives in `MuxManager` and did work, but reported every
+   rejection as `MuxError::Internal("replay seq")` / `("stale seq")` —
+   indistinguishable from genuine state corruption, and indistinguishable from
+   `StaleGeneration`. Callers could only log, so a retransmit and a tampered
+   stream looked identical in the logs.
+
+The mux anchor (`max_seen`) was also updated only for `seq > max_seen`, which
+was correct, but the surrounding code made the rule easy to break because the
+`seen` set and the distance check disagreed about what "old" meant.
+
+### Decision
+1. Delete `codec::ReplayWindow` and its tests. The mux owns the only window;
+   a second, unused implementation is a liability. `FrameError::ReplayDetected`
+   stays (published error surface) with a comment saying the mux is the owner.
+2. Add `MuxError::ReplayDetected { stream_id, seq }` and
+   `MuxError::StaleGeneration { stream_id, got, expected }`. Both mean "drop
+   this frame, the stream is fine". `Internal` now means only what it says.
+3. Keep the window semantics but state them explicitly in the code comment:
+   `seen` catches duplicates inside `REPLAY_WINDOW`, the distance check rejects
+   anything older, and an accepted out-of-order frame updates the anchor.
+4. Client: a rejected DATAGRAM no longer propagates as a frame error. UDP is
+   lossy by definition and the caller can only log, so the drop is logged and
+   the flow is kept — the same policy DATA already followed.
+
+### Consequences
+- One replay implementation, exercised by real callers.
+- Errors carry enough data to log the *reason* (duplicate vs stale vs old).
+- Behaviour change: `open_data`/`open_datagram` now return `ReplayDetected`
+  instead of `Internal` for replays. Any host matching on the variant must
+  update; the practical handling (log and continue) is unchanged.
+- Still not done: defending against an attacker who can *delay* frames past the
+  window. That needs a rekey-based bound, not a bitmap.
+
+### Tests
+`crates/aetherlink-mux/tests/replay_window.rs`:
+`duplicate_sequence_is_a_typed_replay_rejection`,
+`stale_generation_is_reported_separately_from_replay`,
+`out_of_order_frame_advances_the_anchor`,
+`sequence_zero_data_frame_is_rejected`,
+`header_that_does_not_match_the_ciphertext_fails_authentication`,
+`unexpected_frame_type_is_not_a_replay`.
+
+---
+
+## DEC-018: Host tuning belongs to the deployment, not the library
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+`accept::serve_connection` called `ensure_linux_wan_tuning()` on the first
+accepted connection: it wrote six `/proc/sys/net/*` files (16 MiB buffers, `fq`,
+`bbr`). `aetherlink-server` is a library as well as a daemon — it is linked
+into the FFI `.so` that .NET hosts, tests and Android load. A library silently
+rewriting host-wide kernel settings on a network event is wrong on three
+counts: it changes state the embedder never asked for, it fails silently
+without `CAP_NET_ADMIN` (the `let _ =` swallowed the error), and the
+`Once` made the failure permanent for the process lifetime.
+
+### Decision
+Replace the writer with `warn_if_wan_tuning_missing()`: read `rmem_max` and
+`wmem_max` once, and log a single hint when they are below 16 MiB, naming the
+file `deploy/linux/install.sh` already installs
+(`/etc/sysctl.d/99-aetherlink.conf`) and the command to apply it. The
+deployment script keeps doing the tuning; the process reports the mismatch.
+
+### Consequences
+- The library no longer mutates `/proc/sys`; embedding it is side-effect free.
+- Operators who never ran `install.sh` get a log line instead of silently poor
+  throughput.
+- `tcp_rmem`/`tcp_wmem`/`default_qdisc`/`congestion_control` are no longer
+  checked: their formats are lists/modules and the diagnosis would be noisy.
+  `install.sh` remains the single source of truth for all six.
+
+---
+
+## DEC-019: FFI handle lock is never held across network I/O
+
+**Date:** 2026-11-23
+**Status:** Accepted
+
+### Context
+The C ABI keeps every client and server handle in one process-global
+`Mutex<HandleMap>`. `aether_client_up`, `aether_client_down`,
+`aether_client_status` and `set_rules` held that mutex for the whole call, so a
+single `aether_client_up` (TLS handshake + route repair + TUN bring-up, easily
+seconds on a bad network) serialised *every* handle operation in the process:
+`aether_server_stop` on an unrelated server, and the `status` poll a GUI runs on
+its UI thread, both blocked behind it. A slow connect froze the whole host
+application — a lock-ordering bug that only shows up under real network
+conditions, which is why it survived.
+
+### Decision
+Split the map operation from the work:
+
+1. `take_client(handle)` removes the client under the lock (O(1), microseconds).
+2. The network call runs with **no** lock held.
+3. `return_client(handle, client)` re-inserts under the lock.
+
+`return_client` uses `entry(handle).or_insert(client)`: if the handle was
+`aether_client_free`d while the call was in flight, the entry is gone and the
+returned client is dropped, which runs exactly the teardown `free` would have
+run. Re-inserting would resurrect a freed handle — worse than dropping.
+
+`aether_client_free` removes the client and runs `down()` outside the lock too.
+
+### Consequences
+- One slow connect no longer blocks unrelated handles or the GUI thread.
+- While a client is checked out, a concurrent `aether_client_free` on the same
+  handle sees "invalid handle" and does nothing. The client is then dropped
+  when the in-flight call returns, so no leak — but the *caller* sees a
+  misleading error code in that narrow window.
+- `servers` intentionally still run `request_stop`/`join` under the lock: a
+  server handle is a `ServerGuard` whose stop is bounded and never re-enters
+  the map, so the deadlock risk that motivated the client change is absent.
+  This asymmetry is deliberate and documented at the call site.
+- A per-handle lock would remove the remaining window; it is not worth a
+  new dependency (or a hand-rolled `Arc<Mutex<Client>>` plumbing) until a host
+  actually reports the race.
+
+### Tests
+Covered indirectly: the FFI surface is exercised by the .NET host and has no
+Rust integration test for lock behaviour (the race needs a real embedding).
+Upstream gate: the existing FFI compile check in CI.

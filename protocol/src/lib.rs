@@ -7,8 +7,16 @@
 //! Golden vectors live in `tests/golden.rs` (integration) so the spec crate
 //! itself stays dependency-free of implementor crates.
 
-/// Protocol version
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Protocol version.
+///
+/// v2 adds the per-frame `generation` field that makes AEAD nonces unique
+/// across recycled stream ids (see [`FRAME_GENERATION_SIZE`] and
+/// `aetherlink_mux::manager::build_nonce`). Nonces in v1 were derived from
+/// `(stream_id, sequence, type)` while the id space is explicitly recycled,
+/// so a long-lived session eventually re-used `(id, 0, OpenTcp)` under one
+/// traffic key — a catastrophic AEAD nonce reuse. v1 peers are refused at
+/// the preface byte instead of silently failing frame authentication.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Authentication constants
 pub const AUTH_PREFIX: &[u8] = b"aetherlink-auth-v1";
@@ -22,8 +30,79 @@ pub const AEAD_TAG_SIZE: usize = 16;
 
 /// Frame constants
 pub const FRAME_HEADER_SIZE: usize = 24;
+
+/// Wire layout of the 24-byte frame header (protocol v2).
+///
+/// ```text
+///   offset  size  field
+///   0       3     length      (24-bit BE, payload + padding + AEAD tag)
+///   3       1     frame type
+///   4       1     flags
+///   5       2     stream id   (u16 BE)
+///   7       4     sequence    (u32 BE)
+///   11      4     generation  (u32 BE, v2)
+///   15      9     reserved    (v2: fresh random, ignored on read)
+/// ```
+///
+/// `generation` is what makes the AEAD nonce unique: ids are recycled once a
+/// session outlives the 16-bit id space, so `(stream_id, sequence, type)`
+/// alone repeats. The random tail carries no protocol meaning; it only keeps
+/// the clear-text header from fingerprinting while the reserved bytes are
+/// already on the wire (they were 13 zero bytes in v1, so v2 grows nothing).
+pub const FRAME_GENERATION_OFFSET: usize = 11;
+pub const FRAME_GENERATION_SIZE: usize = 4;
+/// Reserved trailer: 4 bytes of `generation` + 9 random bytes.
+pub const FRAME_RESERVED_SIZE: usize = FRAME_HEADER_SIZE - FRAME_GENERATION_OFFSET;
+/// Random-only part of the reserved trailer.
+pub const FRAME_HEADER_RANDOM_SIZE: usize = FRAME_RESERVED_SIZE - FRAME_GENERATION_SIZE;
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 pub const DEFAULT_PAD_MULTIPLE: usize = 128;
+
+/// Largest stream-id generation ever carried on the wire.
+///
+/// Generations are handed out per `(stream id, direction)` and stored as a
+/// `u32`. Reaching this bound means one direction of one session recycled the
+/// whole 16-bit id space 4 billion times, so the honest answer is to refuse
+/// rather than wrap into a repeated nonce; the mux reports it as
+/// `MuxError::NonceSpaceExhausted`, whose remedy is a rekey/reconnect.
+pub const MAX_STREAM_GENERATION: u32 = u32::MAX - 1;
+
+/// Build the 12-byte AEAD nonce for a frame under one traffic key.
+///
+/// ```text
+///   offset size field
+///   0      2    stream id  (u16 BE)
+///   2      4    generation (u32 BE)
+///   6      4    sequence   (u32 BE)
+///   10     1    frame type
+///   11     1    zero
+/// ```
+///
+/// Uniqueness argument: the traffic key is fixed per session and direction,
+/// `sequence` never repeats for a live `(id, generation)` because the sender
+/// only ever increments it, and `generation` is strictly monotonic per
+/// `(id, direction)` — it is bumped exactly when an id is re-registered after
+/// being closed (`MuxManager::claim_generation`). Therefore no
+/// `(id, generation, sequence, type)` tuple can be sealed twice, including the
+/// OPEN frames that always use `sequence = 0`.
+///
+/// This lives in the spec crate on purpose: both sides derive the nonce here,
+/// so the invariant is defined once instead of being re-implemented next to
+/// each codec.
+#[must_use]
+pub fn build_nonce(
+    id: u16,
+    generation: u32,
+    seq: u32,
+    frame_type: FrameType,
+) -> [u8; AEAD_NONCE_SIZE] {
+    let mut n = [0u8; AEAD_NONCE_SIZE];
+    n[0..2].copy_from_slice(&id.to_be_bytes());
+    n[2..6].copy_from_slice(&generation.to_be_bytes());
+    n[6..10].copy_from_slice(&seq.to_be_bytes());
+    n[10] = frame_type as u8;
+    n
+}
 
 /// Address type for OPEN_TCP/OPEN_UDP frames
 #[repr(u8)]
@@ -208,6 +287,18 @@ mod tests {
         assert_eq!(
             AddrType::try_from(255),
             Err(AddrTypeError::UnknownAddrType(255))
+        );
+    }
+
+    /// The crypto crate carries its own copy of the version (it is a
+    /// dependency of this crate, so the arrow cannot point the other way).
+    /// Editing one copy without the other breaks this test.
+    #[test]
+    fn protocol_version_matches_crypto_copy() {
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            aetherlink_crypto::PROTOCOL_VERSION,
+            "aetherlink-protocol and aetherlink-crypto disagree on PROTOCOL_VERSION"
         );
     }
 }

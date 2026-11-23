@@ -41,3 +41,47 @@ fn blocklist_flag_defaults_on_and_parses() {
     assert!(!cfg.blocklist_enabled);
     assert_eq!(cfg.blocked_domains.len(), 2);
 }
+
+/// `max_connections` bounds concurrent sockets (one thread each). It must be
+/// configurable, default sanely, and never be zero — a zero cap would refuse
+/// every connection and look like a dead server.
+#[test]
+fn max_connections_parses_and_defaults() {
+    // Given: an explicit value
+    let doc: serde_json::Value = serde_json::json!({
+        "server": {
+            "listen": "0.0.0.0:443",
+            "psk": "test-psk-32-bytes-long-for-tests!!",
+            "local_static_root": ".",
+            "max_connections": 64,
+        }
+    });
+    let cfg = aetherlink_server::config::ServerConfig::parse(&doc).expect("valid");
+    assert_eq!(cfg.max_connections, 64);
+
+    // And: omitted -> the documented default.
+    let doc: serde_json::Value = serde_json::json!({
+        "server": {
+            "listen": "0.0.0.0:443",
+            "psk": "test-psk-32-bytes-long-for-tests!!",
+            "local_static_root": ".",
+        }
+    });
+    let cfg = aetherlink_server::config::ServerConfig::parse(&doc).expect("valid");
+    assert_eq!(
+        cfg.max_connections,
+        aetherlink_server::accept::DEFAULT_MAX_CONNECTIONS
+    );
+
+    // And: zero is clamped up, never accepted as "refuse everything".
+    let doc: serde_json::Value = serde_json::json!({
+        "server": {
+            "listen": "0.0.0.0:443",
+            "psk": "test-psk-32-bytes-long-for-tests!!",
+            "local_static_root": ".",
+            "max_connections": 0,
+        }
+    });
+    let cfg = aetherlink_server::config::ServerConfig::parse(&doc).expect("valid");
+    assert_eq!(cfg.max_connections, 1, "zero must never disable the server");
+}

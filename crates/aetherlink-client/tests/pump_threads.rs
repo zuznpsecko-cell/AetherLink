@@ -133,6 +133,7 @@ fn tun_packets_reach_the_wire() {
         flags: 0,
         stream_id: tcp.id,
         sequence: h2.sequence,
+        generation: h2.generation,
     };
     assert!(server_mux.open_data(&KEY, &data_hdr, &c2).is_ok());
     let _ = h1;
@@ -160,6 +161,7 @@ fn wire_bytes_land_in_tun() {
         flags: 0,
         stream_id: flow.id,
         sequence: h2.sequence,
+        generation: h2.generation,
     };
     server_mux
         .open_datagram(&KEY, &dh, &c2)

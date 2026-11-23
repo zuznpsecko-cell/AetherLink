@@ -216,6 +216,7 @@ fn bind_serves_static_body_from_file() {
         flags: 0,
         stream_id: 0,
         sequence: 0,
+        generation: 0,
     }
     .encode(&mut hb);
     stream.write_all(&hb).expect("header");

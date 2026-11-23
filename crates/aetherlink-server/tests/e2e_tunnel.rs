@@ -35,6 +35,8 @@ fn ctx() -> ServerCtx {
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
+        live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        max_connections: aetherlink_server::accept::DEFAULT_MAX_CONNECTIONS,
     }
 }
 
@@ -1582,6 +1584,7 @@ fn zero_and_padded_ping_keep_tunnel_alive() {
         flags: 0,
         stream_id: 0,
         sequence: 0,
+        generation: 0,
     };
     wire_help::write_frame(&mut stream, &ping0, &[]);
 
@@ -1592,6 +1595,7 @@ fn zero_and_padded_ping_keep_tunnel_alive() {
         flags: 0,
         stream_id: 0,
         sequence: 0,
+        generation: 0,
     };
     wire_help::write_frame(&mut stream, &ping16, &[0u8; 16]);
 
@@ -1699,6 +1703,7 @@ fn concurrent_upload_close_race_and_stream_rst_keep_session_alive() {
                 flags: 0,
                 stream_id: id,
                 sequence: 0,
+                generation: 0,
             };
             wire_help::write_frame(&mut stream, &rst, &[]);
         }
@@ -1873,6 +1878,7 @@ fn infinite_fast_download_aborted_by_rst_immediately_allows_upload() {
             flags: 0,
             stream_id: id,
             sequence: 0,
+            generation: 0,
         };
         wire_help::write_frame(&mut stream, &rst_hdr, &[0u8; 16]);
         let _ = sess.mux.close(id);

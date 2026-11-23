@@ -8,7 +8,11 @@ server:
   dns_upstream:
     - "1.1.1.1:53"
     - "8.8.8.8:53"
+  # Streams/flows per connection (mux state bound).
   max_streams: 4096
+  # Concurrent connections (each costs a thread with a 4 MiB stack).
+  # Past this the accept loop drops new sockets instead of queueing them.
+  max_connections: 512
   # Domain blocklist (ads/trackers): suffix match, `full:` prefix = exact.
   # Enforced on DNS answers + OPEN targets; fail closed, loop lives.
   # Master switch: blocklist_enabled: false disables everything.

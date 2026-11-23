@@ -25,6 +25,13 @@ use crate::{CoreError, Result};
 /// Handshake status byte meaning "authenticated".
 pub const AUTH_OK: u8 = 0;
 
+/// Exact AUTH payload size: `client_nonce[32] || token[32]`.
+///
+/// The AUTH frame is plaintext (the TLS layer already gives confidentiality),
+/// so its declared length is attacker-controlled. Anything other than this
+/// value is rejected **before** the body is allocated.
+pub const AUTH_FRAME_LEN: usize = 64;
+
 /// Established client session: fresh mux + traffic keys.
 ///
 /// The TLS stream stays with the caller (borrowed mutably during the
@@ -70,12 +77,15 @@ pub fn handshake_client(
     let token = auth::generate_auth_token(psk, nonce);
     let frame = Frame::auth(*nonce, token);
     let plaintext = frame.serialize_payload();
+    // AUTH is plaintext and never AEAD-sealed, so its generation is not a
+    // nonce input: 0 keeps the handshake byte-identical across sessions.
     let header = FrameHeader {
         length: plaintext.len() as u32,
         frame_type: FrameType::Auth,
         flags: 0,
         stream_id: 0,
         sequence: 0,
+        generation: 0,
     };
     stream.write_all(&[PROTOCOL_VERSION])?;
     let mut hb = BytesMut::new();
@@ -126,7 +136,16 @@ pub fn handshake_server(
     if header.frame_type != FrameType::Auth {
         return Err(CoreError::SessionError("expected AUTH frame".to_string()));
     }
-    let mut body = vec![0u8; header.length as usize];
+    // Pre-auth allocation guard: the AUTH body is a fixed 64 bytes, so a
+    // header claiming more is either a bug or an attempt to make the server
+    // reserve memory before proving anything. Check, then allocate.
+    let declared = header.length as usize;
+    if declared != AUTH_FRAME_LEN {
+        // `limit == 0` marks "not an upper bound, an exact size", so the error
+        // reads correctly for both the oversized and the truncated case.
+        return Err(CoreError::FrameTooLarge { declared, limit: 0 });
+    }
+    let mut body = vec![0u8; declared];
     stream.read_exact(&mut body)?;
     let frame = Frame::deserialize_payload(
         FrameType::Auth,

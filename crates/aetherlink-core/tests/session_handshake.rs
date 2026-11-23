@@ -202,3 +202,90 @@ fn bad_preface_version_rejected() {
     stream.flush().expect("flush");
     server.join().expect("server thread");
 }
+
+/// Pre-auth allocation guard: the AUTH frame is plaintext until the token is
+/// verified, so its declared length is attacker-controlled. A header claiming
+/// a huge body must be refused **before** the server allocates it (this used
+/// to be `vec![0u8; header.length]` straight from the wire, i.e. up to 16 MiB
+/// of server RAM per unauthenticated connection).
+#[test]
+fn oversized_auth_body_is_refused_before_allocation() {
+    // Given: TLS-connected pair
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server_cfg = server_tls_config();
+    let cache = NonceCache::new();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut stream = tls::accept_tls(sock, &server_cfg).expect("server tls");
+        // When: the peer declares a 4 MiB AUTH body
+        let err = session::handshake_server(&mut stream, PSK, &cache).expect_err("must refuse");
+        // Then: it is a size rejection, not an allocation + read timeout.
+        match err {
+            aetherlink_core::CoreError::FrameTooLarge { declared, limit } => {
+                assert_eq!(declared, 4 * 1024 * 1024);
+                // `limit == 0`: AUTH is fixed-size, so this is "wrong", not
+                // "too big for this type".
+                assert_eq!(limit, 0);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    });
+
+    let sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let name = tls::server_name("localhost").expect("sni");
+    let mut stream = tls::connect_tls(sock, name, &client_tls_config()).expect("client tls");
+    stream
+        .write_all(&[aetherlink_protocol::PROTOCOL_VERSION])
+        .expect("preface");
+    let lying = FrameHeader {
+        length: 4 * 1024 * 1024,
+        frame_type: aetherlink_protocol::FrameType::Auth,
+        flags: 0,
+        stream_id: 0,
+        sequence: 0,
+        generation: 0,
+    };
+    let mut hb = BytesMut::new();
+    lying.encode(&mut hb);
+    stream.write_all(&hb).expect("header");
+    stream.flush().expect("flush");
+    // No body follows on purpose: the server must not wait for it.
+    server.join().expect("server thread");
+}
+
+/// A short AUTH body is just as wrong as a long one: the handshake is a fixed
+/// 64-byte payload, so anything else is refused at the same check.
+#[test]
+fn truncated_auth_body_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server_cfg = server_tls_config();
+    let cache = NonceCache::new();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut stream = tls::accept_tls(sock, &server_cfg).expect("server tls");
+        assert!(session::handshake_server(&mut stream, PSK, &cache).is_err());
+    });
+
+    let sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let name = tls::server_name("localhost").expect("sni");
+    let mut stream = tls::connect_tls(sock, name, &client_tls_config()).expect("client tls");
+    stream
+        .write_all(&[aetherlink_protocol::PROTOCOL_VERSION])
+        .expect("preface");
+    let short = FrameHeader {
+        length: 8,
+        frame_type: aetherlink_protocol::FrameType::Auth,
+        flags: 0,
+        stream_id: 0,
+        sequence: 0,
+        generation: 0,
+    };
+    let mut hb = BytesMut::new();
+    short.encode(&mut hb);
+    stream.write_all(&hb).expect("header");
+    stream.write_all(&[0u8; 8]).expect("body");
+    stream.flush().expect("flush");
+    server.join().expect("server thread");
+}

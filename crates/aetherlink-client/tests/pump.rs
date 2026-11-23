@@ -121,6 +121,7 @@ fn tcp_handshake_then_data_opens_mux() {
         flags: 0,
         stream_id: tcp.id,
         sequence: frames[1].header.sequence,
+        generation: frames[1].header.generation,
     };
     let pt = server
         .open_data(&KEY, &data_hdr, &frames[1].ciphertext)
@@ -153,6 +154,7 @@ fn udp_dns_becomes_open_plus_datagram() {
         flags: 0,
         stream_id: flow.id,
         sequence: frames[1].header.sequence,
+        generation: frames[1].header.generation,
     };
     let payload = server
         .open_datagram(&KEY, &dgram_hdr, &frames[1].ciphertext)

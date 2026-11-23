@@ -1,8 +1,18 @@
 //! Mux manager: owns TCP streams and UDP flows, seals/opens frames.
 //!
 //! Ids are client-odd (1, 3, 5, …) shared across streams and flows.
-//! Nonce12 = stream(u16 BE) || seq(u32 BE) || type(u8), rest zero —
-//! unique per (id, seq, type) under one traffic key.
+//! Nonce12 = id(u16 BE) || generation(u32 BE) || seq(u32 BE) || type(u8) ||
+//! zero — see [`aetherlink_protocol::build_nonce`], which owns the layout.
+//!
+//! Why `generation`: ids are recycled, so `(id, seq, type)` alone repeats
+//! once a session outlives the 16-bit id space — and the OPEN frame always
+//! uses `seq = 0`, so the first duplicate is `(id, 0, OpenTcp)` with the
+//! target host/port inside. Repeating an AEAD nonce under one key leaks the
+//! keystream and forges Poly1305 tags. `generation` is incremented for an id
+//! every time it is re-registered after being closed (`open_tcp`/`open_udp`
+//! through `claim_generation`, and [`MuxManager::register_inbound`]), which
+//! makes the nonce strictly monotonic per `(id, direction)` for the whole
+//! session.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,7 +20,7 @@ use aetherlink_crypto::aead::AeadKey;
 use aetherlink_frame::codec::{self, FrameHeader};
 use aetherlink_frame::types::{Frame, FramePayload};
 use aetherlink_frame::FRAME_HEADER_SIZE;
-use aetherlink_protocol::FrameType;
+use aetherlink_protocol::{build_nonce, FrameType, MAX_STREAM_GENERATION};
 
 use crate::flow::{self, UdpFlow};
 use crate::stream::{self, TcpStream};
@@ -44,6 +54,10 @@ struct Entry {
     next_seq: u32,
     max_seen: u32,
     seen: HashSet<u32>,
+    /// Nonce generation of the live incarnation of this id. Monotonic per
+    /// `(id, direction)` for the whole session, so a recycled id can never
+    /// repeat a `(generation, sequence)` pair under one traffic key.
+    generation: u32,
 }
 
 /// Session manager: TCP streams + UDP flows.
@@ -53,16 +67,68 @@ pub struct MuxManager {
     /// Max concurrent streams+flows.
     max: usize,
     entries: HashMap<u16, Entry>,
+    /// Highest generation ever used for an id, kept after the id closes.
+    ///
+    /// This is the tombstone that survives recycling: `alloc_id` may hand an
+    /// old id out again, but `claim_generation` then starts the new
+    /// incarnation at `last_generation[id] + 1`, never at 0. Bounded by the
+    /// 16-bit id space, so it cannot outgrow `entries`' possible key set.
+    last_generation: HashMap<u16, u32>,
 }
 
-/// Derive AEAD nonce from (id, seq, type). No allocation.
+/// Derive AEAD nonce from (id, generation, seq, type). No allocation.
+///
+/// Thin alias for [`aetherlink_protocol::build_nonce`]: the layout lives in
+/// the spec crate so both peers cannot drift apart.
 #[must_use]
-pub fn build_nonce(id: u16, seq: u32, frame_type: FrameType) -> [u8; 12] {
-    let mut n = [0u8; 12];
-    n[0..2].copy_from_slice(&id.to_be_bytes());
-    n[2..6].copy_from_slice(&seq.to_be_bytes());
-    n[6] = frame_type as u8;
-    n
+pub fn build_nonce_for(id: u16, generation: u32, seq: u32, frame_type: FrameType) -> [u8; 12] {
+    build_nonce(id, generation, seq, frame_type)
+}
+
+/// Seal one frame with an explicit `(id, generation, sequence)`.
+///
+/// Test/embedding helper: it lets a test produce a frame belonging to a
+/// *specific* incarnation of an id (including a stale or future one) without
+/// owning a manager that holds that state. Production paths always go through
+/// [`MuxManager`], which derives the generation from its own bookkeeping.
+///
+/// # Errors
+/// Bad key length, or a payload/length the codec rejects.
+pub fn seal_frame_with(
+    key: &[u8],
+    id: u16,
+    generation: u32,
+    seq: u32,
+    frame: Frame,
+    pad_multiple: usize,
+) -> Result<SealedFrame> {
+    let frame_type = frame.frame_type;
+    let k = to_key(key)?;
+    let nonce = build_nonce(id, generation, seq, frame_type);
+    let wire = codec::encode_frame(&frame, &k, generation, &nonce, pad_multiple)
+        .map_err(|e| MuxError::Internal(e.to_string()))?;
+    let header = FrameHeader {
+        length: (wire.len() - FRAME_HEADER_SIZE) as u32,
+        frame_type,
+        flags: frame.flags,
+        stream_id: id,
+        sequence: seq,
+        generation,
+    };
+    Ok(SealedFrame {
+        header,
+        ciphertext: wire[FRAME_HEADER_SIZE..].to_vec(),
+    })
+}
+
+/// Next generation for a recycled id: `last + 1`, or a hard error once the
+/// 32-bit space is spent (wrapping would repeat a nonce — fail closed).
+fn next_generation(last: Option<u32>) -> Result<u32> {
+    match last {
+        None => Ok(0),
+        Some(prev) if prev < MAX_STREAM_GENERATION => Ok(prev + 1),
+        Some(_) => Err(MuxError::NonceSpaceExhausted),
+    }
 }
 
 fn to_key(key: &[u8]) -> Result<AeadKey> {
@@ -82,6 +148,7 @@ impl MuxManager {
             next_id: crate::CLIENT_STREAM_ID_START,
             max: 4096,
             entries: HashMap::new(),
+            last_generation: HashMap::new(),
         }
     }
 
@@ -92,7 +159,24 @@ impl MuxManager {
             next_id: crate::CLIENT_STREAM_ID_START,
             max,
             entries: HashMap::new(),
+            last_generation: HashMap::new(),
         }
+    }
+
+    /// Override the concurrent stream/flow limit.
+    ///
+    /// The manager is constructed before the caller knows its configured
+    /// `max_streams` (the session handshake creates it), so the limit is
+    /// applied once the config is in scope. Lowering it below the number of
+    /// live entries is allowed and only affects new allocations.
+    pub fn set_max(&mut self, max: usize) {
+        self.max = max;
+    }
+
+    /// Configured concurrent stream/flow limit.
+    #[must_use]
+    pub fn max(&self) -> usize {
+        self.max
     }
 
     /// Next free id. Ids are recycled once a stream closes (a session
@@ -120,6 +204,7 @@ impl MuxManager {
     pub fn open_tcp(&mut self, addr: &str, port: u16) -> Result<u16> {
         stream::validate_target(addr, port).map_err(|e| MuxError::Internal(e.to_string()))?;
         let id = self.alloc_id()?;
+        let generation = self.claim_generation(id)?;
         self.entries.insert(
             id,
             Entry {
@@ -129,6 +214,7 @@ impl MuxManager {
                 next_seq: 1,
                 max_seen: 0,
                 seen: HashSet::new(),
+                generation,
             },
         );
         Ok(id)
@@ -138,6 +224,7 @@ impl MuxManager {
     pub fn open_udp(&mut self, addr: &str, port: u16) -> Result<u16> {
         flow::validate_target(addr, port).map_err(|e| MuxError::Internal(e.to_string()))?;
         let id = self.alloc_id()?;
+        let generation = self.claim_generation(id)?;
         self.entries.insert(
             id,
             Entry {
@@ -147,6 +234,7 @@ impl MuxManager {
                 next_seq: 1,
                 max_seen: 0,
                 seen: HashSet::new(),
+                generation,
             },
         );
         Ok(id)
@@ -164,6 +252,11 @@ impl MuxManager {
     /// belongs to the accept-loop; this call only books the id so DATA and
     /// datagrams for it pass replay checks. Idempotent: re-registering an
     /// existing id is a no-op.
+    ///
+    /// A recycled id gets the next generation and keeps a per-incarnation
+    /// replay window: it tracks `header.generation` from the peer and refuses
+    /// frames from an older incarnation instead of decrypting them under the
+    /// new one's nonce space.
     pub fn register_inbound(&mut self, id: u16, addr: &str, port: u16, is_udp: bool) -> Result<()> {
         if self.entries.contains_key(&id) {
             return Ok(());
@@ -176,6 +269,7 @@ impl MuxManager {
         } else {
             stream::validate_target(addr, port).map_err(|e| MuxError::Internal(e.to_string()))?;
         }
+        let generation = self.claim_generation(id)?;
         self.entries.insert(
             id,
             Entry {
@@ -185,9 +279,22 @@ impl MuxManager {
                 next_seq: 1,
                 max_seen: 0,
                 seen: HashSet::new(),
+                generation,
             },
         );
         Ok(())
+    }
+
+    /// Reserve the next nonce generation for `id`.
+    ///
+    /// Called on every fresh incarnation of an id (locally opened or inbound).
+    /// The returned value is folded into the AEAD nonce, so it must advance
+    /// monotonically for the lifetime of the session even though the id
+    /// itself is recycled.
+    fn claim_generation(&mut self, id: u16) -> Result<u32> {
+        let generation = next_generation(self.last_generation.get(&id).copied())?;
+        self.last_generation.insert(id, generation);
+        Ok(generation)
     }
 
     /// Dial target of an open id.
@@ -227,9 +334,10 @@ impl MuxManager {
         if entry.next_seq == 0 {
             entry.next_seq = 1;
         }
+        let generation = entry.generation;
         let k = to_key(key)?;
-        let nonce = build_nonce(id, seq, frame_type);
-        let wire = codec::encode_frame(&frame, &k, &nonce, pad_multiple)
+        let nonce = build_nonce(id, generation, seq, frame_type);
+        let wire = codec::encode_frame(&frame, &k, generation, &nonce, pad_multiple)
             .map_err(|e| MuxError::Internal(e.to_string()))?;
         // Split wire back into header + ciphertext for the caller.
         let header = FrameHeader {
@@ -238,6 +346,7 @@ impl MuxManager {
             flags: 0,
             stream_id: id,
             sequence: seq,
+            generation,
         };
         let ciphertext = wire[FRAME_HEADER_SIZE..].to_vec();
         Ok(SealedFrame { header, ciphertext })
@@ -305,9 +414,12 @@ impl MuxManager {
         if entry.is_udp != (frame_type == FrameType::OpenUdp) {
             return Err(MuxError::StreamClosed(id));
         }
+        let generation = entry.generation;
         let k = to_key(key)?;
-        let nonce = build_nonce(id, 0, frame_type);
-        let wire = codec::encode_frame(&frame, &k, &nonce, pad_multiple)
+        // OPEN always uses seq 0, so `generation` is what keeps this nonce
+        // unique when the peer recycles the id (the v1 hole).
+        let nonce = build_nonce(id, generation, 0, frame_type);
+        let wire = codec::encode_frame(&frame, &k, generation, &nonce, pad_multiple)
             .map_err(|e| MuxError::Internal(e.to_string()))?;
         let header = FrameHeader {
             length: (wire.len() - FRAME_HEADER_SIZE) as u32,
@@ -315,6 +427,7 @@ impl MuxManager {
             flags: 0,
             stream_id: id,
             sequence: 0,
+            generation,
         };
         let ciphertext = wire[FRAME_HEADER_SIZE..].to_vec();
         Ok(SealedFrame { header, ciphertext })
@@ -414,7 +527,9 @@ impl MuxManager {
             return Err(MuxError::Internal("open must be seq 0".to_string()));
         }
         let k = to_key(key)?;
-        let nonce = build_nonce(header.stream_id, 0, expect);
+        // The sender's generation rides in the header, so the OPEN nonce is
+        // rebuilt from it — this is what makes a re-opened id decryptable.
+        let nonce = build_nonce(header.stream_id, header.generation, 0, expect);
         let mut wire = Vec::with_capacity(FRAME_HEADER_SIZE + ciphertext.len());
         {
             use bytes::BufMut;
@@ -423,7 +538,9 @@ impl MuxManager {
             wire.extend_from_slice(&hb);
         }
         wire.extend_from_slice(ciphertext);
-        codec::decode_frame(&wire, &k, &nonce).map_err(|e| MuxError::Internal(e.to_string()))
+        codec::decode_frame(&wire, &k, &nonce)
+            .map(|(frame, _generation)| frame)
+            .map_err(|e| MuxError::Internal(e.to_string()))
     }
 
     fn open(
@@ -447,17 +564,45 @@ impl MuxManager {
             return Err(MuxError::StreamClosed(header.stream_id));
         }
         let seq = header.sequence;
+        // A DATA/DATAGRAM frame always carries a non-zero sequence, so zero
+        // can only be a forged or corrupted header. (The AEAD now covers the
+        // header, but keep the check: it is one comparison and states the
+        // invariant explicitly rather than relying on a caller.)
         if seq == 0 {
-            return Err(MuxError::Internal("stale seq".to_string()));
+            return Err(MuxError::Internal("data frame with seq 0".to_string()));
         }
+        // Generation gate: the peer's generation must match the live
+        // incarnation. An older one is a frame from a previous life of this
+        // id (late arrival, replay); a newer one means the peer re-opened the
+        // id and this side has not registered it yet. Either way the payload
+        // must not be decrypted into this incarnation's window.
+        if header.generation != entry.generation {
+            return Err(MuxError::StaleGeneration {
+                stream_id: header.stream_id,
+                got: header.generation,
+                expected: entry.generation,
+            });
+        }
+        // Replay window, newest-last:
+        //  * `seen` catches duplicates inside the window;
+        //  * the distance check rejects anything older than `REPLAY_WINDOW`.
+        // Both are routine on a lossy path, so they are typed as
+        // `ReplayDetected` (drop the frame) rather than `Internal` (which
+        // callers treat as stream state corruption).
         if entry.seen.contains(&seq) {
-            return Err(MuxError::Internal("replay seq".to_string()));
+            return Err(MuxError::ReplayDetected {
+                stream_id: header.stream_id,
+                seq,
+            });
         }
         if seq <= entry.max_seen && entry.max_seen - seq >= REPLAY_WINDOW {
-            return Err(MuxError::Internal("stale seq".to_string()));
+            return Err(MuxError::ReplayDetected {
+                stream_id: header.stream_id,
+                seq,
+            });
         }
         let k = to_key(key)?;
-        let nonce = build_nonce(header.stream_id, seq, expect);
+        let nonce = build_nonce(header.stream_id, header.generation, seq, expect);
         let mut wire = Vec::with_capacity(FRAME_HEADER_SIZE + ciphertext.len());
         {
             use bytes::BufMut;
@@ -466,13 +611,16 @@ impl MuxManager {
             wire.extend_from_slice(&hb);
         }
         wire.extend_from_slice(ciphertext);
-        let frame = codec::decode_frame(&wire, &k, &nonce)
+        let (frame, _framed_generation) = codec::decode_frame(&wire, &k, &nonce)
             .map_err(|e| MuxError::Internal(e.to_string()))?;
         let payload = match frame.payload {
             FramePayload::Data(v) if expect == FrameType::Data => v,
             FramePayload::UdpDatagram(v) if expect == FrameType::UdpDatagram => v,
             _ => return Err(MuxError::Internal("wrong payload".to_string())),
         };
+        // Every accepted frame updates the anchor: an in-window frame that
+        // arrives late (`seq < max_seen`) must still be recorded, otherwise a
+        // replayed older frame looks like "new" after the window drains.
         if seq > entry.max_seen {
             entry.max_seen = seq;
         }
