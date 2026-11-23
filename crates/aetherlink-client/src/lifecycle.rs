@@ -117,8 +117,6 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
     // ifIndex = up-time adapter for egress-bound deletes).
     let mut applied: Vec<AppliedChange> = Vec::new();
     let dns_iface = platform.captured_iface().unwrap_or_default();
-    // Read by every `persist` below, always after the TUN step assigned it.
-    let mut tun_ifindex: Option<u32> = None;
     let persist = |applied: &[AppliedChange], tun_ifindex: Option<u32>| -> Result<()> {
         UpState {
             snapshot: snap.clone(),
@@ -145,7 +143,8 @@ pub fn up(platform: &mut dyn Platform, config: &ClientConfig) -> Result<()> {
         return Err(e);
     }
     applied.push(AppliedChange::TunUp("aether0".to_string()));
-    tun_ifindex = platform.tun_ifindex();
+    // Bound once: every `persist` below reads the same adapter index.
+    let tun_ifindex: Option<u32> = platform.tun_ifindex();
 
     if let Err(e) = persist(&applied, tun_ifindex) {
         failed(platform, &applied);

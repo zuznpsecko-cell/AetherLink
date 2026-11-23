@@ -4,7 +4,6 @@
 //! client's OPEN frames, serves static from the configured root file,
 //! and fails bind fast on bad address or missing static root.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;

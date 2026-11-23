@@ -659,12 +659,10 @@ where
                     // Use the WouldBlock-aware writer (a full send buffer at
                     // idle would otherwise kill the session for no reason).
                     match write_tls_all(&mut stream, &tx_buf, &mut write_stalled_since) {
-                        Ok(remaining) if remaining.is_empty() => {
-                            last_tx = Instant::now();
-                        }
-                        Ok(_) => {
-                            // Partially written — try again next turn.
-                        }
+                        // Empty `remaining` = fully written; a partial write is
+                        // retried next turn.
+                        Ok(remaining) if remaining.is_empty() => last_tx = Instant::now(),
+                        Ok(_) => {}
                         Err(e) => break 'pump format!("tls keepalive write failed: {e}"),
                     }
                 }
