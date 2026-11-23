@@ -38,9 +38,14 @@ jobs:
             echo "::notice::formatting clean"
             exit 0
           fi
-          git diff --stat
-          BODY=$(git diff | head -c 55000 | sed 's/%/%25/g; s/$/%0A/')
-          echo "::error title=rustfmt::$BODY"
+          # GitHub drops oversized annotations silently (the step then reads
+          # only as "exit code 1"), so publish short ones: the file list
+          # first, then the first hunks, chunked.
+          echo "::error title=rustfmt::$(git diff --name-only | tr '\n' ' ')"
+          git diff -U2 | head -80 | split -l 8 - /tmp/hunk.
+          for part in /tmp/hunk.*; do
+            echo "::error title=rustfmt hunk::$(sed 's/%/%25/g; s/$/%0A/' "$part")"
+          done
           exit 1
 
       - name: Clippy (warnings are errors)
@@ -89,11 +94,16 @@ jobs:
         run: |
           cargo fmt --all
           if (git diff --quiet) { "::notice::formatting clean"; exit 0 }
-          git diff --stat
-          $diff = (git diff) -join "`n"
-          if ($diff.Length -gt 55000) { $diff = $diff.Substring(0, 55000) }
-          $body = $diff -replace '%', '%25' -replace "`r?`n", '%0A'
-          "::error title=rustfmt::$body"
+          # Short annotations only: GitHub silently drops oversized ones and
+          # the step then reads as a bare "exit code 1".
+          $files = (git diff --name-only) -join ' '
+          "::error title=rustfmt::$files"
+          $hunks = @(git diff -U2 | Select-Object -First 80)
+          for ($i = 0; $i -lt $hunks.Count; $i += 8) {
+            $chunk = ($hunks[$i..([Math]::Min($i + 7, $hunks.Count - 1))] -join "`n")
+            $body = $chunk -replace '%', '%25' -replace "`r?`n", '%0A'
+            "::error title=rustfmt hunk::$body"
+          }
           exit 1
 
       - name: Clippy (warnings are errors)
