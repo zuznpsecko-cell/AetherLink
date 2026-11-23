@@ -216,10 +216,10 @@ pub extern "C" fn aether_last_error() -> *const c_char {
     })
 }
 
-    /// # Safety
-    ///
-    /// `config_json` must be a valid NUL-terminated C string that stays alive
-    /// for the duration of the call; ownership is not taken.
+/// # Safety
+///
+/// `config_json` must be a valid NUL-terminated C string that stays alive
+/// for the duration of the call; ownership is not taken.
 #[no_mangle]
 pub unsafe extern "C" fn aether_server_start(config_json: *const c_char) -> AetherHandle {
     if config_json.is_null() {
@@ -278,10 +278,10 @@ pub extern "C" fn aether_server_stop(handle: AetherHandle) -> c_int {
     }
 }
 
-    /// # Safety
-    ///
-    /// `config_json` must be a valid NUL-terminated C string that stays alive
-    /// for the duration of the call; ownership is not taken.
+/// # Safety
+///
+/// `config_json` must be a valid NUL-terminated C string that stays alive
+/// for the duration of the call; ownership is not taken.
 #[no_mangle]
 pub unsafe extern "C" fn aether_client_create(config_json: *const c_char) -> AetherHandle {
     if config_json.is_null() {
@@ -384,10 +384,10 @@ pub extern "C" fn aether_client_down(handle: AetherHandle) -> c_int {
     code
 }
 
-    /// # Safety
-    ///
-    /// `out_json` must point to a writable buffer of at least `out_len`
-    /// bytes; the returned length tells the caller how much was filled.
+/// # Safety
+///
+/// `out_json` must point to a writable buffer of at least `out_len`
+/// bytes; the returned length tells the caller how much was filled.
 #[no_mangle]
 pub unsafe extern "C" fn aether_client_status(
     handle: AetherHandle,
@@ -440,10 +440,10 @@ pub extern "C" fn aether_client_force_cleanup() -> c_int {
     }
 }
 
-    /// # Safety
-    ///
-    /// `out_json` must point to a writable buffer of at least `out_len`
-    /// bytes; the returned length tells the caller how much was filled.
+/// # Safety
+///
+/// `out_json` must point to a writable buffer of at least `out_len`
+/// bytes; the returned length tells the caller how much was filled.
 #[no_mangle]
 pub unsafe extern "C" fn aether_client_rules_list(
     handle: AetherHandle,
@@ -484,10 +484,10 @@ pub unsafe extern "C" fn aether_client_rules_list(
     AetherError::Success as c_int
 }
 
-    /// # Safety
-    ///
-    /// `rules_json` must be a valid NUL-terminated C string that stays alive
-    /// for the duration of the call; ownership is not taken.
+/// # Safety
+///
+/// `rules_json` must be a valid NUL-terminated C string that stays alive
+/// for the duration of the call; ownership is not taken.
 #[no_mangle]
 pub unsafe extern "C" fn aether_client_rules_set(
     handle: AetherHandle,
@@ -568,10 +568,10 @@ pub extern "C" fn aether_client_android_set_tun_fd(
     AetherError::Success as c_int
 }
 
-    /// # Safety
-    ///
-    /// `split_json` must be a valid NUL-terminated C string that stays alive
-    /// for the duration of the call; ownership is not taken.
+/// # Safety
+///
+/// `split_json` must be a valid NUL-terminated C string that stays alive
+/// for the duration of the call; ownership is not taken.
 #[no_mangle]
 pub unsafe extern "C" fn aether_client_set_split_config(
     handle: AetherHandle,
