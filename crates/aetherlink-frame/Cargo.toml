@@ -16,7 +16,6 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
-hex = { workspace = true }
 
 [lib]
 name = "aetherlink_frame"
