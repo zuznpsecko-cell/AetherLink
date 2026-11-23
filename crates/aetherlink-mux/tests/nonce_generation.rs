@@ -72,22 +72,43 @@ fn data_nonces_never_repeat_across_recycled_ids() {
 
 #[test]
 fn recycled_id_gets_a_fresh_generation() {
-    // Given: an id that was opened and closed
+    // Given: an id that was opened and closed. `alloc_id` is a monotonic
+    // cursor (it skips live ids rather than reusing the lowest free one), so
+    // the same id only comes back after the cursor wraps the 16-bit odd
+    // space — 32768 allocations. Recycling a *few* ids is not enough, which
+    // is exactly why the v1 nonce hole was so slow to appear in the field.
     let mut mux = MuxManager::with_max(1);
     let first = mux.open_tcp("10.0.0.9", 80).expect("open");
     let g1 = mux
         .seal_open_tcp(&KEY, first, 128)
         .expect("open frame")
-        .header.generation;
+        .header
+        .generation;
     mux.close(first).expect("close");
-    // When: the allocator recycles it
-    let second = mux.open_tcp("10.0.0.9", 80).expect("reopen");
+
+    // When: the allocator runs out of fresh ids and hands this one out again.
+    // The cursor steps by 2 through the odd ids (1..=65535, 32768 of them),
+    // so the wrap happens on the 32769th allocation. The matched id is left
+    // *open*: closing it here would make the seal below fail with
+    // StreamClosed instead of testing the generation.
+    let mut second = None;
+    for _ in 0..=u16::MAX {
+        let id = mux.open_tcp("10.0.0.9", 80).expect("reopen");
+        if id == first {
+            second = Some(id);
+            break;
+        }
+        mux.close(id).expect("close");
+    }
+    let second = second.expect("test premise: the cursor eventually wraps");
+    assert_eq!(first, second, "test premise: the id was recycled");
+
+    // Then: the recycled incarnation starts at a strictly newer generation.
     let g2 = mux
         .seal_open_tcp(&KEY, second, 128)
         .expect("second open frame")
-        .header.generation;
-    // Then: same id, strictly newer generation.
-    assert_eq!(first, second, "test premise: the id was recycled");
+        .header
+        .generation;
     assert_eq!(g1, 0, "the first incarnation starts at generation 0");
     assert!(
         g2 > g1,
