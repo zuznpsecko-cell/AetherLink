@@ -117,19 +117,32 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $fail = 0
-          # Each entry: script name + the arguments to pass. Written out
-          # explicitly (no array-of-hashtable splatting) so a typo cannot turn
-          # this step into a silent exit-1 with no evidence.
+          # Scripts are invoked one by one, and the switch is spelled out per
+          # call (see the NOTE below) so a typo cannot turn this step into a
+          # silent exit-1 with no evidence.
           #
           # -SkipArtifacts: the staged Android .so files are build outputs and
           # .gitignore excludes them, so a source gate cannot assert them.
           $names = @("check_thin_hosts.ps1", "check_gui_endpoints.ps1", "check_quickstart.ps1")
           foreach ($name in $names) {
-            $argList = @()
-            if ($name -eq "check_thin_hosts.ps1") { $argList = @("-SkipArtifacts") }
-            "::notice::running $name $($argList -join ' ')"
-            $out = & "./scripts/$name" @argList 2>&1
+            # NOTE: an array of strings splatted with `@argList` passes each
+            # element *positionally* -- "-SkipArtifacts" arrives as a value, not
+            # as a switch, and binding fails with a terminating error (empty
+            # exit code, no FAIL lines). Invoke the two forms explicitly.
+            $skip = ($name -eq "check_thin_hosts.ps1")
+            "::notice::running $name$(if ($skip) { ' -SkipArtifacts' } else { '' })"
+            if ($skip) {
+              $out = & "./scripts/$name" -SkipArtifacts 2>&1
+            } else {
+              $out = & "./scripts/$name" 2>&1
+            }
             $code = $LASTEXITCODE
+            # A terminating error leaves $LASTEXITCODE unset; treat that as a
+            # failure and surface the exception text, never a blank exit code.
+            if ($null -eq $code) {
+              $code = "terminating-error"
+              $out = @($out) + @($Error | Select-Object -Last 5 | ForEach-Object { "PS: $_" })
+            }
             $text = ($out | Out-String)
             Write-Output "----- $name (exit $code) -----"
             # -notmatch on FAIL lines is not enough: a script can die before
