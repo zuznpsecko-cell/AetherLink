@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aetherlink_netstack::tun::{previous_gateway, RestoreOp};
-use aetherlink_netstack::tun::{rollback_plan, AppliedChange, Route, Snapshot};
+use aetherlink_netstack::tun::{rollback_plan, Route, Snapshot};
 
 use crate::{ClientError, Result};
 

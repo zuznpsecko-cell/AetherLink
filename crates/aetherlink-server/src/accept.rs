@@ -426,21 +426,31 @@ enum WorkerMsg {
 /// never stalls the other direction and upload bursts do not pause 10ms
 /// per read timeout. Reports once on socket error/EOF, then exits; silent
 /// exit when the loop is gone.
-fn stream_worker(
+/// Everything a stream worker needs to start: its flow identity, the payload
+/// already received, and the channels back to the loop.
+struct WorkerStart {
     id: u16,
-    ip: String,
-    port: u16,
+    target: (String, u16),
     first: Vec<u8>,
     inbox: mpsc::Receiver<WorkerMsg>,
     out: mpsc::SyncSender<StreamReply>,
     aborted: Arc<AtomicBool>,
-    egress: crate::egress::EgressPolicy,
-) {
+}
+
+fn stream_worker(start: WorkerStart, egress: &crate::egress::EgressPolicy) {
+    let WorkerStart {
+        id,
+        target: (ip, port),
+        first,
+        inbox,
+        out,
+        aborted,
+    } = start;
     use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
     use std::net::Shutdown;
     let target = (ip.clone(), port);
     // Resolution + egress check happen here, off the tunnel loop (DEC-021/022).
-    let mut sock = match relay::dial_tcp(&ip, port, &egress) {
+    let mut sock = match relay::dial_tcp(&ip, port, egress) {
         Ok(s) => s,
         Err(kind) => {
             debug_log(&format!(
@@ -681,7 +691,17 @@ fn forward_tcp(
         .stack_size(WORKER_STACK)
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                stream_worker(id, tip, tport, pt, rx, out, aborted_worker, egress);
+                stream_worker(
+                    WorkerStart {
+                        id,
+                        target: (tip, tport),
+                        first: pt,
+                        inbox: rx,
+                        out,
+                        aborted: aborted_worker,
+                    },
+                    &egress,
+                );
             }));
         }) {
         Ok(_) => {
