@@ -126,3 +126,4 @@ Check "server cfg static root" (Has-Text $serverCfg "local_static_root")
 
 if ($fail -gt 0) { Write-Output "$fail checks failed"; exit 1 }
 Write-Output "all thin-host checks passed"
+exit 0

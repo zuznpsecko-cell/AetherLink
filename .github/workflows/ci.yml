@@ -137,10 +137,15 @@ jobs:
               $out = & "./scripts/$name" 2>&1
             }
             $code = $LASTEXITCODE
-            # A terminating error leaves $LASTEXITCODE unset; treat that as a
-            # failure and surface the exception text, never a blank exit code.
-            if ($null -eq $code) {
-              $code = "terminating-error"
+            # `$LASTEXITCODE` only exists once a native process ran; a pure
+            # pwsh script that never calls `exit` leaves it $null (and
+            # `$null -ne 0` is *true* in PowerShell, which used to turn a
+            # passing script into a red gate). The scripts now end with an
+            # explicit `exit 0`, and an unset code is normalised here so the
+            # verdict rests on the FAIL lines and on PowerShell errors.
+            if ($null -eq $code) { $code = 0 }
+            if ($Error.Count -gt 0) {
+              $code = "error"
               $out = @($out) + @($Error | Select-Object -Last 5 | ForEach-Object { "PS: $_" })
             }
             $text = ($out | Out-String)

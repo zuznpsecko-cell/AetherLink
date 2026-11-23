@@ -98,3 +98,4 @@ if (Test-Path -LiteralPath $stageScript) {
 
 if ($fail -gt 0) { Write-Output "$fail checks failed"; exit 1 }
 Write-Output "all gui endpoint checks passed"
+exit 0
