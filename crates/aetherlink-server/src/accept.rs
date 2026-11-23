@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc,
 };
 use std::time::{Duration, Instant};
@@ -60,6 +60,71 @@ pub struct ServerCtx {
     pub dns_upstream: Vec<String>,
     /// Domain blocklist (ads/trackers): DNS answers and OPEN targets.
     pub blocklist: crate::blocklist::Blocklist,
+    /// Live connection count: a DoS bound, not a capacity target.
+    ///
+    /// Every accepted socket costs a thread with a 4 MiB stack plus a rustls
+    /// session, so an unbounded accept loop is a trivial resource-exhaustion
+    /// primitive (and pre-auth connections are cheap for an attacker). At the
+    /// limit the loop drops new sockets immediately instead of spawning.
+    pub live_connections: Arc<AtomicUsize>,
+    /// Hard cap on concurrently served connections.
+    pub max_connections: usize,
+    /// Max concurrent streams/flows per connection (mux state bound).
+    ///
+    /// Applied to the session's mux once the handshake succeeds
+    /// (`MuxManager::set_max`): the mux is created before the config is in
+    /// scope, and until now the configured value was silently ignored.
+    pub max_streams: usize,
+}
+
+/// Default cap when a context is built without an explicit one.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
+/// Default stream/flow cap per connection, matching `config::ServerConfig`.
+pub const DEFAULT_MAX_STREAMS: usize = 4096;
+
+impl ServerCtx {
+    /// Claim a connection slot, or `None` when the cap is already reached.
+    #[must_use]
+    pub fn try_acquire_connection(&self) -> Option<ConnectionSlot> {
+        let mut current = self.live_connections.load(Ordering::Relaxed);
+        loop {
+            if current >= self.max_connections {
+                return None;
+            }
+            match self.live_connections.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionSlot(Arc::clone(&self.live_connections)));
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Current number of served connections (tests / metrics).
+    #[must_use]
+    pub fn live_connections(&self) -> usize {
+        self.live_connections.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII guard for one in-flight connection: releases the slot on drop, so a
+/// panicking connection handler cannot leak capacity.
+pub struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        // Saturating: a double release would otherwise wrap to usize::MAX and
+        // wedge the server at "full" forever.
+        let _ = self
+            .0
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
 }
 
 /// Relay read timeout: a silent target burns one worker for this long;
@@ -71,6 +136,18 @@ const READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// Bound for one frame body across stalls (fail closed eventually).
 const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest frame body the server will buffer inside an authenticated tunnel.
+///
+/// Bodies are ciphertext (padded plaintext + 16-byte tag), and the padding
+/// granularity is `DEFAULT_PAD_MULTIPLE` (128 B), so a legitimate body is at
+/// most the largest payload the client seals plus one padding block and the
+/// tag. The old literal (`65535 + 1024`) was both smaller than the protocol
+/// allows and unrelated to any protocol constant — a large legitimate frame
+/// would have been killed as "absurd". Tie the bound to the codec instead.
+const MAX_WIRE_BODY: usize = aetherlink_crypto::MAX_FRAME_PAYLOAD
+    + aetherlink_crypto::DEFAULT_PAD_MULTIPLE
+    + aetherlink_crypto::AEAD_TAG_LEN;
 
 /// Pool workers: blocking dials/relays run here so one slow target never
 /// serially stalls the loop (seen live: 11s backlog, client gone by reply).
@@ -849,23 +926,37 @@ fn close_quietly(stream: &mut tls::ServerTlsStream) {
     let _ = flush_tls_writes(stream);
 }
 
-/// Best-effort one-shot Linux kernel WAN tuning when `aetherlink-server` runs
-/// as root (the systemd unit default). Raises auto-tuned TCP buffer ceilings
-/// from Ubuntu's default 208 KiB (`rmem_max`/`wmem_max`) to 16 MiB and enables
-/// `fq` + `bbr` while silently no-oping in unprivileged tests/containers.
+/// Read-only check that the WAN tuning from `deploy/linux/install.sh` is in
+/// place; logs one hint if not.
+///
+/// This used to *write* `/proc/sys/net/*` from inside the library on the first
+/// accepted connection. That is the wrong layer twice over: a library must not
+/// change host-wide kernel settings behind its embedder's back (the FFI is
+/// loaded by .NET apps, tests and the Android .so), and the write is silently
+/// lost or racy when several servers start at once. `install.sh` already
+/// installs `/etc/sysctl.d/99-aetherlink.conf`, so the honest thing to do here
+/// is report the mismatch and let the operator fix it with `sysctl --system`.
 #[cfg(target_os = "linux")]
-fn ensure_linux_wan_tuning() {
+fn warn_if_wan_tuning_missing() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        for (path, val) in [
-            ("/proc/sys/net/core/rmem_max", "16777216\n"),
-            ("/proc/sys/net/core/wmem_max", "16777216\n"),
-            ("/proc/sys/net/ipv4/tcp_rmem", "4096 131072 16777216\n"),
-            ("/proc/sys/net/ipv4/tcp_wmem", "4096 65536 16777216\n"),
-            ("/proc/sys/net/core/default_qdisc", "fq\n"),
-            ("/proc/sys/net/ipv4/tcp_congestion_control", "bbr\n"),
+        for (path, minimum) in [
+            ("/proc/sys/net/core/rmem_max", 16 * 1024 * 1024),
+            ("/proc/sys/net/core/wmem_max", 16 * 1024 * 1024),
         ] {
-            let _ = std::fs::write(path, val);
+            let Ok(raw) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            match raw.trim().parse::<u64>() {
+                Ok(value) if value >= minimum => {}
+                Ok(value) => debug_log(&format!(
+                    "server: {path}={value} (< {minimum}) caps throughput; \
+                     deploy/linux/install.sh writes \
+                     /etc/sysctl.d/99-aetherlink.conf, apply it with \
+                     `sysctl --system`"
+                )),
+                Err(_) => {}
+            }
         }
     });
 }
@@ -922,8 +1013,16 @@ pub fn serve_connection(
     ctx: &ServerCtx,
     routes: &mut HashMap<u16, SocketAddr>,
 ) -> Path {
+    // DoS bound: the slot lives for the whole connection and is released on
+    // drop, including on panic. Over the cap the socket is dropped unserved
+    // (a TCP RST) rather than queued, so an attacker cannot rent memory by
+    // holding half-open connections.
+    let Some(_slot) = ctx.try_acquire_connection() else {
+        debug_log("accept: connection cap reached, dropping socket");
+        return Path::Closed;
+    };
     #[cfg(target_os = "linux")]
-    ensure_linux_wan_tuning();
+    warn_if_wan_tuning_missing();
     #[cfg(target_os = "linux")]
     enable_linux_tcp_keepalive(&sock);
 
@@ -946,13 +1045,42 @@ pub fn serve_connection(
             return Path::Closed;
         }
     };
-    let sess = match session::handshake_server(&mut stream, &ctx.psk, &ctx.cache) {
+    // The AUTH exchange is the second half of the handshake and has the same
+    // slowloris shape as the TLS one: a peer can complete TLS and then send
+    // nothing. `accept_tls` cleared the handshake timeouts, so arm one here
+    // and clear it again before the tunnel loop takes the socket.
+    let auth = {
+        let _ = stream.get_ref().set_read_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
+        let _ = stream.get_ref().set_write_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
+        let outcome = session::handshake_server(&mut stream, &ctx.psk, &ctx.cache);
+        let _ = stream.get_ref().set_read_timeout(None);
+        let _ = stream.get_ref().set_write_timeout(None);
+        outcome
+    };
+    let sess = match auth {
         Ok(s) => {
             debug_log("accept: auth ok, tunnel");
             s
         }
         Err(e) => {
             debug_log(&format!("accept: auth failed ({e}), static fallback"));
+            // A peer that never finished AUTH is not a browser: a truncated
+            // or oversized AUTH, or one that stalled past the deadline, is
+            // hostile by construction. Close instead of serving it a page
+            // (the page would just hold the slot for the whole download).
+            let hostile = match &e {
+                aetherlink_core::CoreError::FrameTooLarge { .. } => true,
+                aetherlink_core::CoreError::Io(io) => matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                _ => false,
+            };
+            if hostile {
+                return Path::Closed;
+            }
             serve_static(&mut stream, &ctx.static_body);
             return Path::Static;
         }
@@ -999,6 +1127,10 @@ fn tunnel_loop(
     let mut dead: HashMap<(String, u16), Instant> = HashMap::new();
     let pool: RelayPool<FlowKey, Result<RelayOut, ()>> =
         RelayPool::new(POOL_WORKERS, POOL_WORKERS + POOL_QUEUE);
+    // Honour `server.max_streams`: the session mux was built with the default
+    // before the config was known, so resize it here (same shape, empty state
+    // at this point — the handshake just finished).
+    sess.mux.set_max(ctx.max_streams);
     // Best-effort: without a timeout an idle peer wedges completion
     // draining; failure keeps the old blocking behaviour. Keep writes
     // unbounded (`set_write_timeout(None)`) so large downstream bursts
@@ -1057,14 +1189,20 @@ fn tunnel_loop(
             Ok(h) => h,
             Err(e) => return format!("bad frame header: {e}"),
         };
-        if header.length as usize > 65535 + 1024 {
-            return format!("absurd frame length: {}", header.length);
+        // Allocation guard: the header is clear-text inside TLS but the peer
+        // is authenticated at this point, so a lying length is a bug or a
+        // compromised client, not an anonymous DoS. Still bound it: one frame
+        // may never reserve more than the wire maximum, and the sender caps
+        // chunks at 16 KiB.
+        let body_len = header.length as usize;
+        if body_len > MAX_WIRE_BODY {
+            return format!("absurd frame length: {body_len} > {MAX_WIRE_BODY}");
         }
         // Body: tolerate stalls past the read quantum and EINTR signals from
         // the host runtime (e.g. .NET CoreCLR GC suspension on Linux, which
         // never auto-restarts `recv` when `SO_RCVTIMEO` is set). Drain worker
         // completions during inter-segment gaps so replies never stall.
-        let mut ct = vec![0u8; header.length as usize];
+        let mut ct = vec![0u8; body_len];
         let body_start = Instant::now();
         let mut filled = 0;
         let mut body_err: Option<String> = None;
@@ -1365,6 +1503,19 @@ fn tunnel_loop(
                     ));
                     continue;
                 }
+                if let Some(live) = sess.mux.generation(header.stream_id) {
+                    if live == header.generation {
+                        // Retransmitted OPEN for the incarnation that is
+                        // already running: the flow, its replay window and
+                        // its relay are current, so touching them would drop
+                        // live data (DEC-020). Ignore the duplicate.
+                        debug_log(&format!(
+                            "tunnel: open_tcp id={} duplicate for live generation {live}, ignoring",
+                            header.stream_id
+                        ));
+                        continue;
+                    }
+                }
                 if workers.remove(&header.stream_id).is_some() {
                     // The peer recycles ids, so this is a new flow on a
                     // fresh id: dropping the sender ends the stale relay
@@ -1375,8 +1526,9 @@ fn tunnel_loop(
                     ));
                 }
                 // Re-register: a recycled id carries the old flow's replay
-                // window, which would reject the new flow's first 1024
-                // frames as stale. OPEN means "new stream", so reset it.
+                // window, which would reject the new flow's first
+                // REPLAY_WINDOW frames as stale. Only a *new generation* is a
+                // new stream; a retransmit was returned above.
                 let _ = sess.mux.close(header.stream_id);
                 debug_log(&format!(
                     "tunnel: open_tcp id={} -> {}:{}",
@@ -1445,7 +1597,18 @@ fn tunnel_loop(
                     ));
                     (flow.addr.clone(), flow.port)
                 };
-                // Same as OPEN_TCP: ids are recycled, so reset the window.
+                // Same as OPEN_TCP: a *new generation* means a recycled id
+                // that needs a fresh replay window, but a retransmitted OPEN
+                // for the live generation must leave the flow alone (DEC-020).
+                if let Some(live) = sess.mux.generation(header.stream_id) {
+                    if live == header.generation {
+                        debug_log(&format!(
+                            "tunnel: open_udp id={} duplicate for live generation {live}, ignoring",
+                            header.stream_id
+                        ));
+                        continue;
+                    }
+                }
                 let _ = sess.mux.close(header.stream_id);
                 let sock = match dial_addr(&addr, port) {
                     Some(sock) => sock,

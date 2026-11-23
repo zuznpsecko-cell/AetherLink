@@ -1,26 +1,38 @@
 //! Frame encoding and decoding
 //!
-//! Implements the AetherLink frame wire format:
+//! Implements the AetherLink frame wire format (protocol v2, 24-byte header):
 //! ```text
 //!   0                   1                   2                   3
 //!   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 //!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//!  |          Length (24-bit)      | Type |  Flags  |   Stream ID   
+//!  |          Length (24-bit)      | Type |  Flags  |   Stream ID
 //!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //!      (16-bit)      |         Sequence (32-bit)                    |
+//!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//!  |          Generation (32-bit)  |     Reserved (9 random bytes)
 //!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //!  |                    Encrypted Payload + Tag                     |
 //!  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
+//!
+//! `generation` is what keeps the AEAD nonce unique once a stream id is
+//! recycled; the reserved tail is fresh random per frame and ignored on read
+//! (see [`aetherlink_protocol::build_nonce`]).
 
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::{FrameError, Result, FRAME_HEADER_SIZE};
 use aetherlink_crypto::aead::{self, AeadKey, AeadNonce};
-use aetherlink_crypto::{AEAD_NONCE_LEN, AEAD_TAG_LEN, DEFAULT_PAD_MULTIPLE, MAX_FRAME_PAYLOAD};
-use aetherlink_protocol::FrameType;
+use aetherlink_crypto::{AEAD_TAG_LEN, DEFAULT_PAD_MULTIPLE, MAX_FRAME_PAYLOAD};
+use aetherlink_protocol::{FrameType, FRAME_HEADER_RANDOM_SIZE};
+use rand::RngCore;
 
 /// Frame header (unencrypted, 24 bytes)
+///
+/// The reserved trailer is deliberately **not** part of the value: it carries
+/// no protocol meaning (random anti-fingerprint bytes) and the peer ignores
+/// it, so comparing headers by their meaningful fields is the useful
+/// comparison. `encode` regenerates a fresh random tail on every call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
     /// Payload length (including padding and AEAD tag), 24-bit
@@ -33,10 +45,17 @@ pub struct FrameHeader {
     pub stream_id: u16,
     /// Sequence number
     pub sequence: u32,
+    /// Stream generation: bumped every time an id is re-registered after
+    /// being closed. Feeds the AEAD nonce, so a recycled id never repeats one.
+    pub generation: u32,
 }
 
 impl FrameHeader {
-    /// Encode header to 24 bytes (11 used + 13 reserved zeros).
+    /// Encode header to 24 bytes (11 fields + 4 generation + 9 random).
+    ///
+    /// The 9 reserved bytes are filled with fresh randomness on every call:
+    /// they were constant zero in v1, which made every header trivially
+    /// fingerprintable, and every reader ignores them by design.
     pub fn encode(&self, buf: &mut BytesMut) {
         // Length (24-bit, big-endian)
         let len = self.length;
@@ -56,8 +75,13 @@ impl FrameHeader {
         // Sequence (32 bits, big-endian)
         buf.put_u32(self.sequence);
 
-        // Reserved (13 bytes, must be zero)
-        buf.put_bytes(0, FRAME_HEADER_SIZE - 11);
+        // Generation (32 bits, big-endian): feeds the AEAD nonce.
+        buf.put_u32(self.generation);
+
+        // Reserved (9 random bytes, ignored on read).
+        let mut tail = [0u8; FRAME_HEADER_RANDOM_SIZE];
+        rand::thread_rng().fill_bytes(&mut tail);
+        buf.put_slice(&tail);
     }
 
     /// Decode header from 24 bytes
@@ -87,8 +111,11 @@ impl FrameHeader {
         // Sequence (32-bit)
         let sequence = buf.get_u32();
 
-        // Reserved (13 bytes, ignored on read for forward compat)
-        buf.advance(FRAME_HEADER_SIZE - 11);
+        // Generation (32 bits): nonce input, never skipped.
+        let generation = buf.get_u32();
+
+        // Reserved (9 random bytes, ignored on read by design)
+        buf.advance(FRAME_HEADER_RANDOM_SIZE);
 
         Ok(Self {
             length: len,
@@ -96,9 +123,50 @@ impl FrameHeader {
             flags,
             stream_id,
             sequence,
+            generation,
         })
     }
 }
+
+/// Associated data for one frame: the header fields that must not change.
+///
+/// The header travels in clear text and used to be excluded from the AEAD
+/// (`aad = &[]`), which made it unauthenticated: `length`, `stream_id`,
+/// `sequence`, `flags` and `generation` could be edited in flight and the
+/// frame would still decrypt. That is not a theoretical gap — `stream_id`
+/// decides which TUN flow the plaintext is injected into, and `generation`
+/// is the nonce component DEC-014 exists to protect.
+///
+/// The layout is the wire layout minus the random tail:
+/// `length(3) || type(1) || flags(1) || stream_id(2) || sequence(4) || generation(4)`
+///
+/// The 9 random bytes are deliberately **not** authenticated: they carry no
+/// meaning, and excluding them keeps the AAD a pure function of the fields a
+/// decoder has already validated.
+#[must_use]
+pub fn header_aad(header: &FrameHeader) -> [u8; AAD_HEADER_LEN] {
+    let len = header.length;
+    [
+        (len >> 16) as u8,
+        (len >> 8) as u8,
+        len as u8,
+        header.frame_type as u8,
+        header.flags,
+        (header.stream_id >> 8) as u8,
+        header.stream_id as u8,
+        (header.sequence >> 24) as u8,
+        (header.sequence >> 16) as u8,
+        (header.sequence >> 8) as u8,
+        header.sequence as u8,
+        (header.generation >> 24) as u8,
+        (header.generation >> 16) as u8,
+        (header.generation >> 8) as u8,
+        header.generation as u8,
+    ]
+}
+
+/// Length of [`header_aad`]: every header field except the random tail.
+pub const AAD_HEADER_LEN: usize = FRAME_HEADER_SIZE - FRAME_HEADER_RANDOM_SIZE;
 
 /// Complete frame (header + encrypted payload)
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +212,7 @@ fn calculate_padding(plaintext_len: usize, pad_multiple: usize) -> usize {
 pub fn encode_frame(
     frame: &crate::types::Frame,
     key: &AeadKey,
+    generation: u32,
     nonce: &AeadNonce,
     pad_multiple: usize,
 ) -> Result<Vec<u8>> {
@@ -172,17 +241,19 @@ pub fn encode_frame(
     padded.extend_from_slice(&framed);
     padded.extend(vec![0u8; padding_len]); // Zero padding
 
-    // Encrypt with AEAD (no AAD for frames - header is not authenticated)
-    let ciphertext = aead::encrypt(*key, *nonce, &padded, &[]);
-
-    // Build header
+    // Build header first: its fields are the AEAD associated data, so the
+    // ciphertext commits to `stream_id`/`sequence`/`generation`/`flags`. The
+    // length is known here because ChaCha20-Poly1305 appends a fixed tag.
     let header = FrameHeader {
-        length: ciphertext.len() as u32, // Includes AEAD tag
+        length: (padded.len() + AEAD_TAG_LEN) as u32,
         frame_type: frame.frame_type,
         flags: frame.flags,
         stream_id: frame.stream_id,
         sequence: frame.sequence,
+        generation,
     };
+    // Encrypt with the header as AAD (the random tail is excluded).
+    let ciphertext = aead::encrypt(*key, *nonce, &padded, &header_aad(&header));
 
     // Encode header + ciphertext
     let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + ciphertext.len());
@@ -193,7 +264,11 @@ pub fn encode_frame(
 }
 
 /// Decode a frame: read header -> decrypt -> verify -> deserialize
-pub fn decode_frame(data: &[u8], key: &AeadKey, nonce: &AeadNonce) -> Result<crate::types::Frame> {
+pub fn decode_frame(
+    data: &[u8],
+    key: &AeadKey,
+    nonce: &AeadNonce,
+) -> Result<(crate::types::Frame, u32)> {
     let mut buf = BytesMut::from(data);
 
     // Decode header
@@ -211,8 +286,9 @@ pub fn decode_frame(data: &[u8], key: &AeadKey, nonce: &AeadNonce) -> Result<cra
     // Extract ciphertext
     let ciphertext = buf.split_to(ciphertext_len).to_vec();
 
-    // Decrypt
-    let padded = aead::decrypt(*key, *nonce, &ciphertext, &[])?;
+    // Decrypt: the header is authenticated, so a flipped `stream_id` or
+    // `generation` fails here instead of routing plaintext to another flow.
+    let padded = aead::decrypt(*key, *nonce, &ciphertext, &header_aad(&header))?;
     let mut padded_buf = BytesMut::from(padded.as_slice());
 
     // Strip length prefix: [len u32 BE][payload][zero pad]
@@ -238,102 +314,7 @@ pub fn decode_frame(data: &[u8], key: &AeadKey, nonce: &AeadNonce) -> Result<cra
         header.flags,
     )?;
 
-    Ok(frame)
-}
-
-/// Anti-replay protection for incoming frames
-///
-/// Tracks sequence numbers per stream and rejects duplicates/out-of-order.
-#[derive(Clone, Debug)]
-pub struct ReplayWindow {
-    /// Highest sequence number seen per stream
-    highest_seq: std::collections::HashMap<u16, u32>,
-    /// Bitmap of recent sequences (for out-of-order detection)
-    bitmaps: std::collections::HashMap<u16, u64>,
-    /// Window size (power of 2, e.g., 1024)
-    window_size: u32,
-}
-
-impl ReplayWindow {
-    pub fn new(window_size: u32) -> Self {
-        assert!(
-            window_size.is_power_of_two(),
-            "Window size must be power of 2"
-        );
-        Self {
-            highest_seq: std::collections::HashMap::new(),
-            bitmaps: std::collections::HashMap::new(),
-            window_size,
-        }
-    }
-
-    /// Check and record a sequence number for a stream
-    ///
-    /// Returns Ok(()) if sequence is acceptable (new and within window),
-    /// Err(FrameError::ReplayDetected) if duplicate or too old.
-    pub fn check(&mut self, stream_id: u16, sequence: u32) -> Result<()> {
-        let highest = self.highest_seq.entry(stream_id).or_insert(0);
-        let bitmap = self.bitmaps.entry(stream_id).or_insert(0);
-
-        if sequence > *highest {
-            // New highest sequence
-            let advance = sequence - *highest;
-            if advance < 64 {
-                *bitmap <<= advance;
-            } else {
-                *bitmap = 0;
-            }
-            *bitmap |= 1; // Mark current sequence as seen
-            *highest = sequence;
-            Ok(())
-        } else if sequence == *highest {
-            // Duplicate of highest
-            Err(FrameError::ReplayDetected {
-                stream_id,
-                seq: sequence,
-            })
-        } else {
-            // Out of order - check if within window.
-            // Bit 0 is the highest seq; bit N is highest-N.
-            let diff = *highest - sequence;
-            // u64 bitmap tracks 64 back; anything older is unverifiable.
-            if diff >= self.window_size || diff >= 64 {
-                // Too old
-                return Err(FrameError::ReplayDetected {
-                    stream_id,
-                    seq: sequence,
-                });
-            }
-            let bit_pos = diff;
-            if (*bitmap >> bit_pos) & 1 == 1 {
-                // Already seen
-                return Err(FrameError::ReplayDetected {
-                    stream_id,
-                    seq: sequence,
-                });
-            }
-            // Mark as seen
-            *bitmap |= 1 << bit_pos;
-            Ok(())
-        }
-    }
-
-    /// Get current highest sequence for a stream
-    pub fn highest(&self, stream_id: u16) -> Option<u32> {
-        self.highest_seq.get(&stream_id).copied()
-    }
-
-    /// Reset window for a stream (e.g., on stream close)
-    pub fn reset_stream(&mut self, stream_id: u16) {
-        self.highest_seq.remove(&stream_id);
-        self.bitmaps.remove(&stream_id);
-    }
-}
-
-impl Default for ReplayWindow {
-    fn default() -> Self {
-        Self::new(1024) // Default anti-replay window ≥ 1024
-    }
+    Ok((frame, header.generation))
 }
 
 #[cfg(test)]
@@ -349,6 +330,7 @@ mod tests {
             flags: 0,
             stream_id: 42,
             sequence: 1000,
+            generation: 7,
         };
 
         let mut buf = BytesMut::new();
@@ -360,13 +342,82 @@ mod tests {
     }
 
     #[test]
+    fn header_carries_generation_on_the_wire() {
+        // Given: a header with a non-zero generation
+        let header = FrameHeader {
+            length: 9,
+            frame_type: FrameType::OpenTcp,
+            flags: 0,
+            stream_id: 0x0102,
+            sequence: 0,
+            generation: 0x0A0B_0C0D,
+        };
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        // Then: it sits at the documented offset, big-endian.
+        assert_eq!(
+            &buf[aetherlink_protocol::FRAME_GENERATION_OFFSET
+                ..aetherlink_protocol::FRAME_GENERATION_OFFSET
+                    + aetherlink_protocol::FRAME_GENERATION_SIZE],
+            &[0x0A, 0x0B, 0x0C, 0x0D]
+        );
+    }
+
+    #[test]
+    fn reserved_tail_is_fresh_random_per_frame() {
+        // Given: the same header encoded twice
+        let header = FrameHeader {
+            length: 16,
+            frame_type: FrameType::Ping,
+            flags: 0,
+            stream_id: 0,
+            sequence: 0,
+            generation: 0,
+        };
+        let (mut a, mut b) = (BytesMut::new(), BytesMut::new());
+        header.encode(&mut a);
+        header.encode(&mut b);
+        // Then: the reserved tail differs (v1 sent 13 constant zero bytes,
+        // which made every header trivially fingerprintable) ...
+        let start = FRAME_HEADER_SIZE - FRAME_HEADER_RANDOM_SIZE;
+        assert_ne!(
+            &a[start..], &b[start..],
+            "reserved tail must not be a constant"
+        );
+        // ... and both still decode to the same meaningful header.
+        assert_eq!(
+            FrameHeader::decode(&mut a).unwrap(),
+            FrameHeader::decode(&mut b).unwrap()
+        );
+    }
+
+    #[test]
+    fn decode_without_generation_would_misparse_the_tail() {
+        // Documents why v1 and v2 cannot interoperate: a v1 header puts its
+        // first reserved byte where v2 expects generation byte 0.
+        let header = FrameHeader {
+            length: 1,
+            frame_type: FrameType::Data,
+            flags: 0,
+            stream_id: 3,
+            sequence: 4,
+            generation: 0xDEAD_BEEF,
+        };
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        let decoded = FrameHeader::decode(&mut buf).unwrap();
+        assert_eq!(decoded.generation, 0xDEAD_BEEF);
+        assert_ne!(decoded.generation, 0, "v1 peers would read zeros here");
+    }
+
+    #[test]
     fn test_encode_decode_data_frame() {
         let key = [0x42u8; 32];
         let nonce = [0x24u8; 12];
         let frame = Frame::data(1, 100, b"test payload".to_vec());
 
-        let encoded = encode_frame(&frame, &key, &nonce, DEFAULT_PAD_MULTIPLE).unwrap();
-        let decoded = decode_frame(&encoded, &key, &nonce).unwrap();
+        let encoded = encode_frame(&frame, &key, 0, &nonce, DEFAULT_PAD_MULTIPLE).unwrap();
+        let (decoded, _) = decode_frame(&encoded, &key, &nonce).unwrap();
 
         assert_eq!(decoded.frame_type, FrameType::Data);
         assert_eq!(decoded.stream_id, 1);
@@ -383,8 +434,8 @@ mod tests {
         let nonce = [0x24u8; 12];
         let frame = Frame::open_tcp(3, 1, "example.com".to_string(), 443);
 
-        let encoded = encode_frame(&frame, &key, &nonce, DEFAULT_PAD_MULTIPLE).unwrap();
-        let decoded = decode_frame(&encoded, &key, &nonce).unwrap();
+        let encoded = encode_frame(&frame, &key, 0, &nonce, DEFAULT_PAD_MULTIPLE).unwrap();
+        let (decoded, _) = decode_frame(&encoded, &key, &nonce).unwrap();
 
         assert_eq!(decoded.frame_type, FrameType::OpenTcp);
         assert_eq!(decoded.stream_id, 3);
@@ -399,48 +450,7 @@ mod tests {
         let large_payload = vec![0u8; MAX_FRAME_PAYLOAD + 100];
         let frame = Frame::data(1, 1, large_payload);
 
-        let result = encode_frame(&frame, &key, &nonce, DEFAULT_PAD_MULTIPLE);
+        let result = encode_frame(&frame, &key, 0, &nonce, DEFAULT_PAD_MULTIPLE);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_replay_window_basic() {
-        let mut window = ReplayWindow::new(1024);
-
-        // First sequence should be accepted
-        assert!(window.check(1, 100).is_ok());
-
-        // Duplicate should be rejected
-        assert!(window.check(1, 100).is_err());
-
-        // Higher sequence should be accepted
-        assert!(window.check(1, 101).is_ok());
-
-        // Out of order but within window should be accepted
-        assert!(window.check(1, 99).is_ok()); // 101 - 99 = 2 < 1024
-
-        // Duplicate of out-of-order should be rejected
-        assert!(window.check(1, 99).is_err());
-    }
-
-    #[test]
-    fn test_replay_window_too_old() {
-        let mut window = ReplayWindow::new(1024);
-
-        assert!(window.check(1, 1000).is_ok());
-
-        // Too old (diff >= 1024)
-        assert!(window.check(1, 500).is_err());
-    }
-
-    #[test]
-    fn test_replay_window_per_stream() {
-        let mut window = ReplayWindow::new(1024);
-
-        assert!(window.check(1, 100).is_ok());
-        assert!(window.check(2, 100).is_ok()); // Different stream, same sequence OK
-
-        assert!(window.check(1, 100).is_err()); // Stream 1 duplicate
-        assert!(window.check(2, 100).is_err()); // Stream 2 duplicate
     }
 }

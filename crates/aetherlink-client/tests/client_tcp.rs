@@ -161,6 +161,7 @@ fn established_data_opens_mux_once() {
         flags: 0,
         stream_id: tcp.id,
         sequence: frames[1].header.sequence,
+        generation: frames[1].header.generation,
     };
     let pt = server
         .open_data(&KEY, &data_hdr, &frames[1].ciphertext)

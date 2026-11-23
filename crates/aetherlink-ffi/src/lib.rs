@@ -58,29 +58,55 @@ impl HandleMap {
         }
     }
 
-    fn insert_client(&mut self, client: Client) -> usize {
+    pub(crate) fn insert_client(&mut self, client: Client) -> usize {
         let id = self.next_id;
         self.next_id += 1;
         self.clients.insert(id, client);
         id
     }
 
-    fn insert_server(&mut self, guard: ServerGuard) -> usize {
+    pub(crate) fn insert_server(&mut self, guard: ServerGuard) -> usize {
         let id = self.next_id;
         self.next_id += 1;
         self.servers.insert(id, guard);
         id
     }
 
-    fn get_client(&mut self, handle: usize) -> Option<&mut Client> {
-        self.clients.get_mut(&handle)
+    /// Membership probe: does this handle exist right now?
+    ///
+    /// Needed because a checked-out client is *absent* from the map, so
+    /// "exists" and "is currently in a call" are the same observation.
+    pub(crate) fn contains_client(&self, handle: usize) -> bool {
+        self.clients.contains_key(&handle)
     }
 
-    fn remove_client(&mut self, handle: usize) -> Option<Client> {
+    /// Take a client out of the map for the duration of one call.
+    ///
+    /// Callers must put it back with [`HandleMap::return_client`]. Taking it
+    /// out is what lets the network work happen **without** the global lock:
+    /// `up_full`/`down` block for seconds (TLS handshake, route repair, TUN
+    /// detach), and holding `HANDLES` for that long serialised every other
+    /// handle — including `aether_server_stop` on a different handle and the
+    /// status calls a GUI polls from its UI thread.
+    pub(crate) fn take_client(&mut self, handle: usize) -> Option<Client> {
         self.clients.remove(&handle)
     }
 
-    fn remove_server(&mut self, handle: usize) -> Option<ServerGuard> {
+    /// Put a client back after a successful call.
+    ///
+    /// If the caller freed the handle while the call was in flight (the only
+    /// way `free` can race a removal), the handle is already gone: dropping
+    /// the returned client is correct — `Drop` runs the same teardown `free`
+    /// would have run, and re-inserting would resurrect a freed handle.
+    pub(crate) fn return_client(&mut self, handle: usize, client: Client) {
+        self.clients.entry(handle).or_insert(client);
+    }
+
+    pub(crate) fn remove_client(&mut self, handle: usize) -> Option<Client> {
+        self.clients.remove(&handle)
+    }
+
+    pub(crate) fn remove_server(&mut self, handle: usize) -> Option<ServerGuard> {
         self.servers.remove(&handle)
     }
 }
@@ -281,16 +307,16 @@ pub unsafe extern "C" fn aether_client_create(config_json: *const c_char) -> Aet
 
 #[no_mangle]
 pub extern "C" fn aether_client_up(handle: AetherHandle) -> c_int {
-    let mut handles = HANDLES.lock().unwrap();
-    let client = match handles.get_client(handle) {
-        Some(c) => c,
-        None => {
-            set_last_error("Invalid client handle");
-            return AetherError::InvalidHandle as c_int;
-        }
+    // Take the client out of the map first: `up_full` runs a TLS handshake,
+    // route repair and TUN bring-up (seconds). Holding the global `HANDLES`
+    // lock for that long blocked every other handle, so one slow connect froze
+    // unrelated `aether_server_stop`/status calls in the same process.
+    let Some(mut client) = HANDLES.lock().unwrap().take_client(handle) else {
+        set_last_error("Invalid client handle");
+        return AetherError::InvalidHandle as c_int;
     };
 
-    match client.up_full(None) {
+    let code = match client.up_full(None) {
         Ok(_) => AetherError::Success as c_int,
         Err(ClientError::StaleState(msg)) => {
             // Distinct code so hosts can auto-recover (force_cleanup + retry)
@@ -299,10 +325,15 @@ pub extern "C" fn aether_client_up(handle: AetherHandle) -> c_int {
             AetherError::StaleState as c_int
         }
         Err(e) => {
-            set_last_error(&format!("Client up failed: {}", e));
+            set_last_error(&format!("Client up failed: {e}"));
             AetherError::NetworkError as c_int
         }
-    }
+    };
+    // Re-acquire briefly. `take_client` removed the entry, so a concurrent
+    // `aether_client_free` saw "invalid handle" — it cannot have torn the
+    // client down while we held it.
+    HANDLES.lock().unwrap().return_client(handle, client);
+    code
 }
 
 /// Release a client handle: best-effort `down` (idempotent) + drop from the
@@ -327,22 +358,22 @@ pub extern "C" fn aether_client_free(handle: AetherHandle) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn aether_client_down(handle: AetherHandle) -> c_int {
-    let mut handles = HANDLES.lock().unwrap();
-    let client = match handles.get_client(handle) {
-        Some(c) => c,
-        None => {
-            set_last_error("Invalid client handle");
-            return AetherError::InvalidHandle as c_int;
-        }
+    // Same reasoning as `aether_client_up`: teardown restores DNS/routes and
+    // detaches the TUN device, so it must not run under the global lock.
+    let Some(mut client) = HANDLES.lock().unwrap().take_client(handle) else {
+        set_last_error("Invalid client handle");
+        return AetherError::InvalidHandle as c_int;
     };
 
-    match client.down() {
+    let code = match client.down() {
         Ok(_) => AetherError::Success as c_int,
         Err(e) => {
-            set_last_error(&format!("Client down failed: {}", e));
+            set_last_error(&format!("Client down failed: {e}"));
             AetherError::NetworkError as c_int
         }
-    }
+    };
+    HANDLES.lock().unwrap().return_client(handle, client);
+    code
 }
 
 #[no_mangle]
@@ -355,16 +386,16 @@ pub unsafe extern "C" fn aether_client_status(
         return AetherError::InvalidArgument as c_int;
     }
 
-    let mut handles = HANDLES.lock().unwrap();
-    let client = match handles.get_client(handle) {
-        Some(c) => c,
-        None => {
-            set_last_error("Invalid client handle");
-            return AetherError::InvalidHandle as c_int;
-        }
+    // `status()` reads the TUN/route state and can touch the filesystem; it
+    // must not hold the handle lock (GUIs poll this from the UI thread).
+    let Some(client) = HANDLES.lock().unwrap().take_client(handle) else {
+        set_last_error("Invalid client handle");
+        return AetherError::InvalidHandle as c_int;
     };
+    let outcome = client.status();
+    HANDLES.lock().unwrap().return_client(handle, client);
 
-    let json = match client.status() {
+    let json = match outcome {
         Ok(j) => j,
         Err(e) => {
             set_last_error(&format!("Status failed: {}", e));
@@ -456,16 +487,13 @@ pub unsafe extern "C" fn aether_client_rules_set(
         }
     };
 
-    let mut handles = HANDLES.lock().unwrap();
-    let client = match handles.get_client(handle) {
-        Some(c) => c,
-        None => {
-            set_last_error("Invalid client handle");
-            return AetherError::InvalidHandle as c_int;
-        }
+    // `set_rules` may rebuild the split-tunnel list; keep it off the lock.
+    let Some(mut client) = HANDLES.lock().unwrap().take_client(handle) else {
+        set_last_error("Invalid client handle");
+        return AetherError::InvalidHandle as c_int;
     };
 
-    match client.set_rules(&doc) {
+    let code = match client.set_rules(&doc) {
         Ok(()) => {
             ffi_log(0, "client rules set ok");
             AetherError::Success as c_int
@@ -474,27 +502,28 @@ pub unsafe extern "C" fn aether_client_rules_set(
             set_last_error(&format!("Rules set failed: {e}"));
             AetherError::InvalidArgument as c_int
         }
-    }
+    };
+    HANDLES.lock().unwrap().return_client(handle, client);
+    code
 }
 
 #[no_mangle]
 pub extern "C" fn aether_client_rules_reload(handle: AetherHandle) -> c_int {
-    let handles = HANDLES.lock().unwrap();
-    let client = match handles.clients.get(&handle) {
-        Some(c) => c,
-        None => {
-            set_last_error("Invalid client handle");
-            return AetherError::InvalidHandle as c_int;
-        }
+    // `reload_rules` touches the filesystem (rule file re-read); keep it off
+    // the handle lock like the other mutating calls.
+    let Some(client) = HANDLES.lock().unwrap().take_client(handle) else {
+        set_last_error("Invalid client handle");
+        return AetherError::InvalidHandle as c_int;
     };
-
-    match client.reload_rules() {
+    let code = match client.reload_rules() {
         Ok(()) => AetherError::Success as c_int,
         Err(e) => {
             set_last_error(&format!("Rules reload failed: {e}"));
             AetherError::InternalError as c_int
         }
-    }
+    };
+    HANDLES.lock().unwrap().return_client(handle, client);
+    code
 }
 
 #[no_mangle]

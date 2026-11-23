@@ -20,8 +20,10 @@ pub struct ServerConfig {
     pub local_static_root: String,
     /// DNS upstreams, primary first.
     pub dns_upstream: Vec<String>,
-    /// Max concurrent streams.
+    /// Max concurrent streams per connection.
     pub max_streams: usize,
+    /// Max concurrently served connections (DoS bound: one thread each).
+    pub max_connections: usize,
     /// Inline blocked suffixes (`full:` prefix = exact host).
     pub blocked_domains: Vec<String>,
     /// Optional path to a flat blocklist file (category-ads-all format).
@@ -99,10 +101,17 @@ impl ServerConfig {
             blocked_domains,
             blocked_domains_file,
             blocklist_enabled,
-            max_streams: doc
+            // Zero would refuse every stream; clamp like `max_connections`.
+            max_streams: (doc
                 .get("max_streams")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(4096) as usize,
+                .unwrap_or(crate::accept::DEFAULT_MAX_STREAMS as u64) as usize)
+                .max(1),
+            max_connections: doc
+                .get("max_connections")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(crate::accept::DEFAULT_MAX_CONNECTIONS as u64)
+                .max(1) as usize,
         })
     }
 }

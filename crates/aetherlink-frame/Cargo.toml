@@ -9,6 +9,7 @@ description = "AetherLink frame codec: encoding/decoding of protocol frames"
 aetherlink-crypto = { path = "../aetherlink-crypto" }
 aetherlink-protocol = { path = "../../protocol" }
 bytes = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 zeroize = { workspace = true }

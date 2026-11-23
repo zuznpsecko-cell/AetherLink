@@ -41,6 +41,17 @@ pub enum CoreError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A frame declared a body size its type does not permit.
+    ///
+    /// Checked **before** allocating the body, so an unauthenticated peer
+    /// cannot make the server reserve memory by lying in a clear-text header
+    /// (the AUTH body is fixed-size; the tunnel caps at the wire maximum).
+    ///
+    /// `limit == 0` means the frame type is fixed-size and `declared` is
+    /// simply wrong, rather than "too large".
+    #[error("frame body size {declared} bytes rejected (limit {limit}, 0 = exact size)")]
+    FrameTooLarge { declared: usize, limit: usize },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

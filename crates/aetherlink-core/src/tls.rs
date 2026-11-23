@@ -153,20 +153,49 @@ pub fn server_name(host: &str) -> Result<ServerName<'static>> {
         .map_err(|e| CoreError::TlsError(format!("bad sni: {e}")))
 }
 
-/// Accept a TCP socket into a server TLS stream (handshake eager).
+/// Deadline for one server-side TLS handshake.
+///
+/// Without it a slowloris connection that sends a ClientHello one byte at a
+/// time holds its connection slot (thread + rustls buffers) indefinitely.
+/// `complete_io` observes `SO_RCVTIMEO`/`SO_SNDTIMEO`, so the timeouts below
+/// make `accept_tls` fail closed instead of blocking forever.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Accept a TCP socket into a server TLS stream (handshake eager), bounded by
+/// [`DEFAULT_HANDSHAKE_TIMEOUT`].
 pub fn accept_tls(sock: TcpStream, cfg: &Arc<ServerConfig>) -> Result<ServerTlsStream> {
+    accept_tls_with_timeout(sock, cfg, DEFAULT_HANDSHAKE_TIMEOUT)
+}
+
+/// Accept with an explicit handshake deadline (tests shrink it).
+///
+/// The timeout applies only to the handshake: the caller re-arms the socket
+/// for its own read/write pattern afterwards (`accept.rs` sets a 5 ms poll).
+pub fn accept_tls_with_timeout(
+    sock: TcpStream,
+    cfg: &Arc<ServerConfig>,
+    handshake_timeout: std::time::Duration,
+) -> Result<ServerTlsStream> {
     let mut conn =
         ServerConnection::new(Arc::clone(cfg)).map_err(|e| CoreError::TlsError(e.to_string()))?;
     conn.set_buffer_limit(Some(256 * 1024));
+    let _ = sock.set_read_timeout(Some(handshake_timeout));
+    let _ = sock.set_write_timeout(Some(handshake_timeout));
     let mut stream = StreamOwned::new(conn, sock);
-    stream
-        .conn
-        .complete_io(&mut stream.sock)
-        .map_err(|e| CoreError::TlsError(format!("server handshake: {e}")))?;
+    let outcome = stream.conn.complete_io(&mut stream.sock);
+    // Reset before handing the socket over: a leftover handshake timeout
+    // would shorten (or resurrect) later reads in the tunnel loop.
+    let _ = stream.get_ref().set_read_timeout(None);
+    let _ = stream.get_ref().set_write_timeout(None);
+    outcome.map_err(|e| CoreError::TlsError(format!("server handshake: {e}")))?;
     Ok(stream)
 }
 
 /// Connect a TCP socket into a client TLS stream (handshake eager).
+///
+/// The caller has already armed `connect`/`read`/`write` timeouts on the
+/// socket (`lifecycle::connect_inner`), so a peer that accepts TCP and then
+/// goes silent fails the handshake instead of blocking forever.
 pub fn connect_tls(
     sock: TcpStream,
     name: ServerName<'static>,

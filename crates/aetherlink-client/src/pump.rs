@@ -532,6 +532,8 @@ impl DataPump {
                 // tears down its upstream relay worker & socket instead of merely
                 // half-closing `Shutdown::Write` (which left aborted 25 MB Speedtest
                 // downloads flooding the outer TLS link throughout the Upload phase).
+                // RST carries no AEAD body (the ciphertext is zeroed filler and
+                // the server never opens it), so its generation is inert: 0.
                 let rst = SealedFrame {
                     header: FrameHeader {
                         length: 16,
@@ -539,6 +541,7 @@ impl DataPump {
                         flags: 0,
                         stream_id: id,
                         sequence: 0,
+                        generation: 0,
                     },
                     ciphertext: vec![0u8; 16],
                 };
@@ -1033,7 +1036,19 @@ impl DataPump {
                         header.stream_id
                     )));
                 }
-                let payload = self.mux.open_datagram(&self.rx, header, ciphertext)?;
+                let payload = match self.mux.open_datagram(&self.rx, header, ciphertext) {
+                    Ok(payload) => payload,
+                    // Losing a UDP datagram is normal: the peer may resend,
+                    // and UDP itself is lossy. Log and keep the flow instead
+                    // of propagating, which the caller can only report.
+                    Err(e) => {
+                        aetherlink_netstack::debug_log(&format!(
+                            "pump: datagram id={} open failed: {e}, flow kept",
+                            header.stream_id
+                        ));
+                        return Ok(());
+                    }
+                };
                 let pkt = build_udp_packet(
                     flow.server_ip,
                     flow.client_ip,

@@ -135,6 +135,9 @@ impl Server {
                     }
                     crate::blocklist::Blocklist::from_entries(entries)
                 },
+                live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_connections: self.config.max_connections,
+                max_streams: self.config.max_streams,
             },
         })
     }
@@ -164,8 +167,12 @@ impl ServerListener {
 
     /// Serve in background: accept loop on a worker thread, one thread per
     /// connection. Returns immediately with a guard; `request_stop` + `join`
-    /// shuts it down. Connection count is unbounded (DoS hardening is a
-    /// follow-up; `max_streams` bounds mux state per connection).
+    /// shuts it down.
+    ///
+    /// Concurrency is bounded twice on purpose: `server.max_connections` caps
+    /// live connections (each costs a 4 MiB stack thread), and `max_streams`
+    /// caps mux state per connection. Past the connection cap new sockets are
+    /// dropped immediately — shedding, never queueing.
     pub fn serve_background(self) -> ServerGuard {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -182,17 +189,36 @@ impl ServerListener {
                         // Accepted sockets inherit nonblocking mode: restore
                         // blocking I/O, the whole serve path depends on it.
                         sock.set_nonblocking(false).ok();
+                        // Shed before spawning a thread: the cap is enforced
+                        // again inside `serve_connection` (which owns the RAII
+                        // slot), this early check just avoids spawning a
+                        // thread only to have it bounce.
+                        if ctx.live_connections() >= ctx.max_connections {
+                            drop(sock);
+                            continue;
+                        }
                         let ctx = Arc::clone(&ctx);
                         let _ = std::thread::Builder::new()
                             .name("tunnel-conn".to_string())
                             .stack_size(4 * 1024 * 1024)
                             .spawn(move || {
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                    move || {
+                                // Containment, not error handling: a panic in
+                                // ONE connection must not take the process.
+                                // This only works because the release profile
+                                // unwinds (see `panic = "unwind"` in the root
+                                // Cargo.toml) — with `panic = "abort"` this
+                                // guard is dead code and the server dies.
+                                let contained = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(move || {
                                         let mut routes = HashMap::new();
                                         accept::serve_connection(sock, &ctx, &mut routes);
-                                    },
-                                ));
+                                    }),
+                                );
+                                if contained.is_err() {
+                                    crate::debug::debug_log(
+                                        "accept: connection panicked, socket dropped",
+                                    );
+                                }
                             });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

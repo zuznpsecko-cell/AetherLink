@@ -640,12 +640,15 @@ where
                     && last_tx.elapsed() >= TLS_KEEPALIVE_INTERVAL
                 {
                     tx_buf.clear();
+                    // Keepalive PING has an empty, unsealed body: generation
+                    // is not a nonce input here, 0 is correct.
                     FrameHeader {
                         length: 16,
                         frame_type: FrameType::Ping,
                         flags: 0,
                         stream_id: 0,
                         sequence: 0,
+                        generation: 0,
                     }
                     .encode(&mut tx_buf);
                     tx_buf.extend_from_slice(&[0u8; 16]);
@@ -924,6 +927,7 @@ mod read_tests {
             flags: 0,
             stream_id: 7,
             sequence: 1,
+            generation: 0,
         };
         let mut hb = BytesMut::new();
         header.encode(&mut hb);

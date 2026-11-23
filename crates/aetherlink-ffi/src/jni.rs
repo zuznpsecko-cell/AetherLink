@@ -58,11 +58,9 @@ pub fn staged_split(handle: usize) -> Option<String> {
 }
 
 fn client_exists(handle: usize) -> bool {
-    HANDLES
-        .lock()
-        .expect("handles")
-        .get_client(handle)
-        .is_some()
+    // A probe, not an accessor: `contains` needs no exclusive borrow and so
+    // does not take the client out of the map (nothing to put back).
+    HANDLES.lock().expect("handles").contains_client(handle)
 }
 
 /// `AetherCore.clientCreate(configJson): Long` — 0 on error, like C ABI.
@@ -178,17 +176,23 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientUp<'local>(
     _cls: JClass<'local>,
     handle: jlong,
 ) -> jint {
-    let mut handles = HANDLES.lock().expect("handles");
-    match handles.get_client(handle as usize) {
-        Some(c) => match c.up() {
-            Ok(()) => crate::AetherError::Success as jint,
-            Err(aetherlink_client::ClientError::StaleState(_)) => {
-                crate::AetherError::StaleState as jint
-            }
-            Err(_) => crate::AetherError::NetworkError as jint,
-        },
-        None => crate::AetherError::InvalidHandle as jint,
-    }
+    // `up()` brings the tunnel up (handshake, routes, TUN): keep it off the
+    // handle lock so a slow connect cannot stall unrelated handles.
+    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle as usize) else {
+        return crate::AetherError::InvalidHandle as jint;
+    };
+    let code = match client.up() {
+        Ok(()) => crate::AetherError::Success as jint,
+        Err(aetherlink_client::ClientError::StaleState(_)) => {
+            crate::AetherError::StaleState as jint
+        }
+        Err(_) => crate::AetherError::NetworkError as jint,
+    };
+    HANDLES
+        .lock()
+        .expect("handles")
+        .return_client(handle as usize, client);
+    code
 }
 
 /// `AetherCore.clientDown(handle): Int`.
@@ -198,14 +202,18 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientDown<'local>(
     _cls: JClass<'local>,
     handle: jlong,
 ) -> jint {
-    let mut handles = HANDLES.lock().expect("handles");
-    match handles.get_client(handle as usize) {
-        Some(c) => match c.down() {
-            Ok(()) => crate::AetherError::Success as jint,
-            Err(_) => crate::AetherError::NetworkError as jint,
-        },
-        None => crate::AetherError::InvalidHandle as jint,
-    }
+    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle as usize) else {
+        return crate::AetherError::InvalidHandle as jint;
+    };
+    let code = match client.down() {
+        Ok(()) => crate::AetherError::Success as jint,
+        Err(_) => crate::AetherError::NetworkError as jint,
+    };
+    HANDLES
+        .lock()
+        .expect("handles")
+        .return_client(handle as usize, client);
+    code
 }
 
 /// `AetherCore.setTunFd(handle, fd, mtu): Int` — validates + stages.

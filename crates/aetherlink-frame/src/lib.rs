@@ -46,6 +46,9 @@ pub enum FrameError {
     #[error("Padding error: {0}")]
     PaddingError(String),
 
+    /// Replay-window rejection. Unused by the codec itself (the mux owns the
+    /// per-stream window, `MuxError::ReplayDetected`); kept because it is part
+    /// of the published error surface hosts match on.
     #[error("Replay detected: sequence {seq} for stream {stream_id}")]
     ReplayDetected { stream_id: u16, seq: u32 },
 }

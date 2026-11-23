@@ -35,6 +35,9 @@ fn ctx() -> ServerCtx {
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
+        live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        max_connections: aetherlink_server::accept::DEFAULT_MAX_CONNECTIONS,
+        max_streams: aetherlink_server::accept::DEFAULT_MAX_STREAMS,
     }
 }
 
@@ -1500,6 +1503,113 @@ fn closed_stream_ignores_trailing_frames_without_redial() {
 }
 
 #[test]
+fn retransmitted_open_keeps_the_live_flow() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Given: a target that counts how many connections it sees
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let target_listener = TcpListener::bind("127.0.0.1:0").expect("target bind");
+    let target_port = target_listener.local_addr().expect("addr").port();
+    {
+        let accepts = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = target_listener.accept() {
+                accepts.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if s.write_all(&buf[..n]).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut routes = HashMap::new();
+        assert_eq!(serve_connection(sock, &ctx(), &mut routes), Path::Tunnel);
+    });
+
+    let mut stream = client_tls(port);
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("timeout");
+    let nonce = [0xF1u8; 32];
+    let mut sess =
+        aetherlink_core::session::handshake_client(&mut stream, PSK, &nonce).expect("client hs");
+
+    // When: OPEN, payload, then the OPEN again (a retransmit whose ACK was
+    // lost) followed by more payload on the same incarnation.
+    let id = sess
+        .mux
+        .open_tcp("127.0.0.1", target_port)
+        .expect("open tcp");
+    let open = sess
+        .mux
+        .seal_open_tcp(sess.keys.tx_key(), id, 128)
+        .expect("seal open");
+    wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+    let first = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), id, b"before", 128)
+        .expect("seal first");
+    wire_help::write_frame(&mut stream, &first.header, &first.ciphertext);
+
+    // Then: the first echo proves the flow is up before the duplicate lands.
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.stream_id, id);
+    assert_eq!(
+        sess.mux
+            .open_data(sess.keys.rx_key(), &h, &c)
+            .expect("first echo"),
+        b"before"
+    );
+
+    // Duplicate OPEN with the *same* generation (identical bytes, as a
+    // retransmit would be): it must not reset the live flow. A reset would
+    // bump the server's generation, tag every later echo with it and make
+    // the client reject the reply (stale generation) — the old hang.
+    wire_help::write_frame(&mut stream, &open.header, &open.ciphertext);
+    let second = sess
+        .mux
+        .seal_data(sess.keys.tx_key(), id, b"after", 128)
+        .expect("seal second");
+    wire_help::write_frame(&mut stream, &second.header, &second.ciphertext);
+
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(h.stream_id, id);
+    assert_eq!(
+        h.generation, open.header.generation,
+        "retransmitted OPEN must not restart the stream's nonce generation"
+    );
+    assert_eq!(
+        sess.mux
+            .open_data(sess.keys.rx_key(), &h, &c)
+            .expect("echo after duplicate open"),
+        b"after"
+    );
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "a retransmitted OPEN must not re-dial the target"
+    );
+
+    drop(stream);
+    server.join().expect("server thread");
+}
+
+#[test]
 fn dribbled_frame_header_still_processed() {
     let echo = tcp_echo();
     let mut routes = HashMap::new();
@@ -1582,6 +1692,7 @@ fn zero_and_padded_ping_keep_tunnel_alive() {
         flags: 0,
         stream_id: 0,
         sequence: 0,
+        generation: 0,
     };
     wire_help::write_frame(&mut stream, &ping0, &[]);
 
@@ -1592,6 +1703,7 @@ fn zero_and_padded_ping_keep_tunnel_alive() {
         flags: 0,
         stream_id: 0,
         sequence: 0,
+        generation: 0,
     };
     wire_help::write_frame(&mut stream, &ping16, &[0u8; 16]);
 
@@ -1699,6 +1811,7 @@ fn concurrent_upload_close_race_and_stream_rst_keep_session_alive() {
                 flags: 0,
                 stream_id: id,
                 sequence: 0,
+                generation: 0,
             };
             wire_help::write_frame(&mut stream, &rst, &[]);
         }
@@ -1873,6 +1986,7 @@ fn infinite_fast_download_aborted_by_rst_immediately_allows_upload() {
             flags: 0,
             stream_id: id,
             sequence: 0,
+            generation: 0,
         };
         wire_help::write_frame(&mut stream, &rst_hdr, &[0u8; 16]);
         let _ = sess.mux.close(id);

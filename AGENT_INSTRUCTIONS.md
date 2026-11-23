@@ -187,7 +187,14 @@ Types:
 7 OPEN_UDP: addr_type, addr, port (UDP flow open)
 8 UDP_DATAGRAM: payload for UDP flow (или DATA+flags — зафиксировать один стиль)
 9 DNS_QUERY / DNS_RESPONSE — опционально, если DNS только как UDP flow к virtual DNS; тогда 9 не нужен. Предпочтительно DNS = обычный UDP flow к virtual resolver.
-Version byte в первом AUTH или отдельный PREFACE — PROTOCOL_VERSION=1.
+Version byte в первом AUTH или отдельный PREFACE — PROTOCOL_VERSION=2.
+
+v2 (breaking): заголовок кадра несёт `generation: u32` (offset 11..15), из
+которого строится AEAD nonce. В v1 nonce = `id||seq||type`, а id
+переиспользуются, поэтому в долгой сессии неизбежно повторялась пара
+`(id, 0, OpenTcp)` под одним ключом — повтор nonce в ChaCha20-Poly1305.
+v2 nonce = `id(u16) || generation(u32) || seq(u32) || type(u8) || 0`.
+Оставшиеся 9 байт заголовка — случайные (в v1 были нулями).
 
 4.4 Key schedule
 HKDF-SHA256 как в v1.4; anti-replay window ≥ 1024.

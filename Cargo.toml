@@ -59,7 +59,12 @@ pretty_assertions = "1.4"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# Unwind, NOT abort: the server contains panics per connection
+# (`catch_unwind` in the accept loop, per stream worker and per relay-pool
+# job). With `panic = "abort"` those guards are dead code in release, so one
+# malformed flow would take down every tunnel on the host. The cost is a
+# slightly larger binary; the process now survives a single bad connection.
+panic = "unwind"
 strip = true
 
 [profile.dev]
