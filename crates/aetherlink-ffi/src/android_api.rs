@@ -48,12 +48,18 @@ pub fn create(config_json: &str) -> usize {
 /// `clientPlan`: the `VpnService.Builder` document for a live handle.
 pub fn plan(handle: usize) -> Result<String, Code> {
     crate::clear_last_error();
-    let mut handles = HANDLES.lock().expect("handles");
-    let client = match handles.get_client(handle) {
-        Some(client) => client,
-        None => return Err(invalid_handle("clientPlan")),
+    // Out of the map for the duration of the call: the plan document reads
+    // platform state, and holding `HANDLES` across it would serialise every
+    // other handle in the process (see DEC-019).
+    let Some(client) = HANDLES.lock().expect("handles").take_client(handle) else {
+        return Err(invalid_handle("clientPlan"));
     };
-    client.android_plan().map_err(|e| {
+    let outcome = client.android_plan();
+    HANDLES
+        .lock()
+        .expect("handles")
+        .return_client(handle, client);
+    outcome.map_err(|e| {
         crate::set_last_error(&format!("clientPlan: {e}"));
         AetherError::InternalError as Code
     })
@@ -62,12 +68,15 @@ pub fn plan(handle: usize) -> Result<String, Code> {
 /// `clientStatus`: the status document for a live handle.
 pub fn status(handle: usize) -> Result<String, Code> {
     crate::clear_last_error();
-    let mut handles = HANDLES.lock().expect("handles");
-    let client = match handles.get_client(handle) {
-        Some(client) => client,
-        None => return Err(invalid_handle("clientStatus")),
+    let Some(client) = HANDLES.lock().expect("handles").take_client(handle) else {
+        return Err(invalid_handle("clientStatus"));
     };
-    client.android_status().map_err(|e| {
+    let outcome = client.android_status();
+    HANDLES
+        .lock()
+        .expect("handles")
+        .return_client(handle, client);
+    outcome.map_err(|e| {
         crate::set_last_error(&format!("clientStatus: {e}"));
         AetherError::InternalError as Code
     })
@@ -86,12 +95,18 @@ pub fn connect(handle: usize, protector: Option<Protector<'_>>) -> Code {
         );
         return AetherError::PermissionDenied as Code;
     };
-    let mut handles = HANDLES.lock().expect("handles");
-    let client = match handles.get_client(handle) {
-        Some(client) => client,
-        None => return invalid_handle("clientConnect"),
+    // This runs TCP connect + TLS handshake + AUTH with the server. Holding
+    // the global handle lock across it used to freeze every other handle in
+    // the host process for the duration of the network round trip.
+    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle) else {
+        return invalid_handle("clientConnect");
     };
-    match client.android_connect(None, |raw| protect_with(protector, raw)) {
+    let outcome = client.android_connect(None, |raw| protect_with(protector, raw));
+    HANDLES
+        .lock()
+        .expect("handles")
+        .return_client(handle, client);
+    match outcome {
         Ok(()) => AetherError::Success as Code,
         Err(e) => {
             crate::set_last_error(&format!("clientConnect: {e}"));
@@ -107,11 +122,7 @@ pub fn connect(handle: usize, protector: Option<Protector<'_>>) -> Code {
 /// dangling.
 pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
     crate::clear_last_error();
-    let mut handles = HANDLES.lock().expect("handles");
-    let client = match handles.get_client(handle) {
-        Some(client) => client,
-        None => return invalid_handle("clientAttachTun"),
-    };
+    // Validate first: these rejections must not disturb the handle map.
     if fd <= 0 {
         crate::set_last_error(&format!("clientAttachTun: invalid tun fd {fd}"));
         return AetherError::InvalidArgument as Code;
@@ -120,7 +131,15 @@ pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
         crate::set_last_error(&format!("clientAttachTun: invalid mtu {mtu}"));
         return AetherError::InvalidArgument as Code;
     }
-    match attach_tun(client, fd, mtu) {
+    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle) else {
+        return invalid_handle("clientAttachTun");
+    };
+    let outcome = attach_tun(&mut client, fd, mtu);
+    HANDLES
+        .lock()
+        .expect("handles")
+        .return_client(handle, client);
+    match outcome {
         Ok(()) => AetherError::Success as Code,
         Err(msg) => {
             crate::set_last_error(&format!("clientAttachTun: {msg}"));
@@ -132,12 +151,15 @@ pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
 /// `clientDisconnect`: stop the pump and release the transport.
 pub fn disconnect(handle: usize) -> Code {
     crate::clear_last_error();
-    let mut handles = HANDLES.lock().expect("handles");
-    let client = match handles.get_client(handle) {
-        Some(client) => client,
-        None => return invalid_handle("clientDisconnect"),
+    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle) else {
+        return invalid_handle("clientDisconnect");
     };
-    match client.android_disconnect() {
+    let outcome = client.android_disconnect();
+    HANDLES
+        .lock()
+        .expect("handles")
+        .return_client(handle, client);
+    match outcome {
         Ok(()) => AetherError::Success as Code,
         Err(e) => {
             crate::set_last_error(&format!("clientDisconnect: {e}"));

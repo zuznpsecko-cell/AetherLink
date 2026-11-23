@@ -47,6 +47,10 @@ pub struct RelayPool<K, R> {
     /// completion (a panicking job). Emptying `active` for a job that has no
     /// result must be decoupled from the result channel, because `R` has no
     /// synthesizable value.
+    /// Keep-alive for the release channel: it is never read here, but dropping
+    /// it would disconnect `released_rx` and make `try_recv` report
+    /// `Disconnected` instead of `Empty`.
+    #[allow(dead_code)]
     released_tx: Sender<()>,
     released_rx: Receiver<()>,
     cap: usize,

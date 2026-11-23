@@ -58,18 +58,26 @@ impl HandleMap {
         }
     }
 
-    fn insert_client(&mut self, client: Client) -> usize {
+    pub(crate) fn insert_client(&mut self, client: Client) -> usize {
         let id = self.next_id;
         self.next_id += 1;
         self.clients.insert(id, client);
         id
     }
 
-    fn insert_server(&mut self, guard: ServerGuard) -> usize {
+    pub(crate) fn insert_server(&mut self, guard: ServerGuard) -> usize {
         let id = self.next_id;
         self.next_id += 1;
         self.servers.insert(id, guard);
         id
+    }
+
+    /// Membership probe: does this handle exist right now?
+    ///
+    /// Needed because a checked-out client is *absent* from the map, so
+    /// "exists" and "is currently in a call" are the same observation.
+    pub(crate) fn contains_client(&self, handle: usize) -> bool {
+        self.clients.contains_key(&handle)
     }
 
     /// Take a client out of the map for the duration of one call.
@@ -80,7 +88,7 @@ impl HandleMap {
     /// detach), and holding `HANDLES` for that long serialised every other
     /// handle — including `aether_server_stop` on a different handle and the
     /// status calls a GUI polls from its UI thread.
-    fn take_client(&mut self, handle: usize) -> Option<Client> {
+    pub(crate) fn take_client(&mut self, handle: usize) -> Option<Client> {
         self.clients.remove(&handle)
     }
 
@@ -90,15 +98,15 @@ impl HandleMap {
     /// way `free` can race a removal), the handle is already gone: dropping
     /// the returned client is correct — `Drop` runs the same teardown `free`
     /// would have run, and re-inserting would resurrect a freed handle.
-    fn return_client(&mut self, handle: usize, client: Client) {
+    pub(crate) fn return_client(&mut self, handle: usize, client: Client) {
         self.clients.entry(handle).or_insert(client);
     }
 
-    fn remove_client(&mut self, handle: usize) -> Option<Client> {
+    pub(crate) fn remove_client(&mut self, handle: usize) -> Option<Client> {
         self.clients.remove(&handle)
     }
 
-    fn remove_server(&mut self, handle: usize) -> Option<ServerGuard> {
+    pub(crate) fn remove_server(&mut self, handle: usize) -> Option<ServerGuard> {
         self.servers.remove(&handle)
     }
 }
@@ -503,7 +511,7 @@ pub unsafe extern "C" fn aether_client_rules_set(
 pub extern "C" fn aether_client_rules_reload(handle: AetherHandle) -> c_int {
     // `reload_rules` touches the filesystem (rule file re-read); keep it off
     // the handle lock like the other mutating calls.
-    let Some(mut client) = HANDLES.lock().unwrap().take_client(handle) else {
+    let Some(client) = HANDLES.lock().unwrap().take_client(handle) else {
         set_last_error("Invalid client handle");
         return AetherError::InvalidHandle as c_int;
     };

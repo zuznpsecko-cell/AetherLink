@@ -16,7 +16,6 @@ use std::sync::Arc;
 use aetherlink_core::{session, tls};
 use aetherlink_crypto::auth::NonceCache;
 use aetherlink_frame::codec::FrameHeader;
-use bytes::BufMut;
 use bytes::BytesMut;
 
 mod tls_common;
@@ -219,7 +218,12 @@ fn oversized_auth_body_is_refused_before_allocation() {
         let (sock, _) = listener.accept().expect("accept");
         let mut stream = tls::accept_tls(sock, &server_cfg).expect("server tls");
         // When: the peer declares a 4 MiB AUTH body
-        let err = session::handshake_server(&mut stream, PSK, &cache).expect_err("must refuse");
+        // (no `expect_err`: `ServerSession` holds key material and has no
+        // `Debug` impl, so the Ok side cannot be formatted)
+        let err = match session::handshake_server(&mut stream, PSK, &cache) {
+            Err(e) => e,
+            Ok(_) => panic!("a 4 MiB AUTH body must be refused"),
+        };
         // Then: it is a size rejection, not an allocation + read timeout.
         match err {
             aetherlink_core::CoreError::FrameTooLarge { declared, limit } => {
