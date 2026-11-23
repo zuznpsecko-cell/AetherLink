@@ -125,9 +125,15 @@ jobs:
           )
           foreach ($s in $scripts) {
             $out = & "./scripts/$($s.name)" @s.args 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            $code = $LASTEXITCODE
+            # -notmatch on FAIL lines is not enough: a script can die before
+            # printing any (missing Android SDK path, pwsh error). Always
+            # surface the tail so the annotation carries evidence.
+            $bad = $out | Where-Object { $_ -match '^FAIL' }
+            if ($code -ne 0 -or $bad) {
               $fail++
-              $out | Where-Object { $_ -match '^FAIL' } | Select-Object -First 10 | ForEach-Object { "::error::$_" }
+              "::error::$($s.name) failed (exit $code)"
+              ($out | Select-Object -Last 12) | ForEach-Object { "::error::  $_" }
             }
           }
           if ($fail -ne 0) { throw "$fail contract script(s) failed" }
