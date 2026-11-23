@@ -70,12 +70,12 @@ fn ffi_server_start_stop_lifecycle() {
         "start must not block on serving"
     );
     assert_eq!(
-        unsafe { aether_server_stop(h) },
+        aether_server_stop(h),
         AetherError::Success as i32
     );
     // Then: handle is gone
     assert_eq!(
-        unsafe { aether_server_stop(h) },
+        aether_server_stop(h),
         AetherError::InvalidHandle as i32
     );
 }
@@ -117,7 +117,7 @@ fn ffi_accepts_yaml_configs() {
     let sh = unsafe { aether_server_start(c(&server_yaml).as_ptr()) };
     assert_ne!(sh, 0, "server must accept yaml config");
     assert_eq!(
-        unsafe { aether_server_stop(sh) },
+        aether_server_stop(sh),
         AetherError::Success as i32
     );
 }
@@ -131,11 +131,11 @@ fn ffi_client_create_and_invalid_handle() {
     assert_ne!(h, 0, "create must yield a handle");
     // Then: unknown handles are rejected, not crashed on
     assert_eq!(
-        unsafe { aether_client_up(usize::MAX) },
+        aether_client_up(usize::MAX),
         AetherError::InvalidHandle as i32
     );
     assert_eq!(
-        unsafe { aether_client_down(usize::MAX) },
+        aether_client_down(usize::MAX),
         AetherError::InvalidHandle as i32
     );
     assert_eq!(
@@ -157,7 +157,7 @@ fn ffi_client_free_releases_handle() {
     assert_ne!(h, 0, "create must yield a handle");
     // When: freeing it
     assert_eq!(
-        unsafe { aether_client_free(h) },
+        aether_client_free(h),
         AetherError::Success as i32
     );
     // Then: the handle is gone — status/down/free all report InvalidHandle.
@@ -169,11 +169,11 @@ fn ffi_client_free_releases_handle() {
         AetherError::InvalidHandle as i32
     );
     assert_eq!(
-        unsafe { aether_client_down(h) },
+        aether_client_down(h),
         AetherError::InvalidHandle as i32
     );
     assert_eq!(
-        unsafe { aether_client_free(h) },
+        aether_client_free(h),
         AetherError::InvalidHandle as i32
     );
 }
@@ -188,7 +188,7 @@ fn ffi_last_error_is_global_and_copyable() {
     for _ in 0..200 {
         // When: a call fails with a known exact message
         assert_eq!(
-            unsafe { aether_client_up(usize::MAX) },
+            aether_client_up(usize::MAX),
             AetherError::InvalidHandle as i32
         );
         // Then: the C ABI hands out a NUL-terminated copy — a Rust String has
