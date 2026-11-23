@@ -32,6 +32,8 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings are errors)
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           set +e
           cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
@@ -74,6 +76,8 @@ jobs:
 
       - name: Clippy (warnings are errors)
         shell: pwsh
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
           $code = $LASTEXITCODE
