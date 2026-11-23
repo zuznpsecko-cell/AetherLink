@@ -94,6 +94,9 @@ pub fn build_nonce_for(id: u16, generation: u32, seq: u32, frame_type: FrameType
 ///
 /// # Errors
 /// Bad key length, or a payload/length the codec rejects.
+///
+/// `seq` is authoritative: it is stamped into the sealed frame, so the
+/// caller's `Frame::sequence` cannot disagree with the AEAD AAD.
 pub fn seal_frame_with(
     key: &[u8],
     id: u16,
@@ -103,6 +106,10 @@ pub fn seal_frame_with(
     pad_multiple: usize,
 ) -> Result<SealedFrame> {
     let frame_type = frame.frame_type;
+    // The sealed frame must carry the sequence the nonce was built from,
+    // because that sequence is authenticated (DEC-016 AAD).
+    let mut frame = frame;
+    frame.sequence = seq;
     let k = to_key(key)?;
     let nonce = build_nonce(id, generation, seq, frame_type);
     let wire = codec::encode_frame(&frame, &k, generation, &nonce, pad_multiple)
@@ -335,6 +342,14 @@ impl MuxManager {
             entry.next_seq = 1;
         }
         let generation = entry.generation;
+        // The header sequence must travel *inside* the sealed frame too: it is
+        // AEAD associated data (DEC-016), so a `Frame` carrying a different
+        // `sequence` than the nonce would make the receiver rebuild a
+        // different AAD and fail authentication. `Frame::udp_datagram` sets
+        // `sequence: 0` while the nonce uses `next_seq`; that mismatch was
+        // invisible only while the header was unauthenticated.
+        let mut frame = frame;
+        frame.sequence = seq;
         let k = to_key(key)?;
         let nonce = build_nonce(id, generation, seq, frame_type);
         let wire = codec::encode_frame(&frame, &k, generation, &nonce, pad_multiple)
@@ -417,7 +432,11 @@ impl MuxManager {
         let generation = entry.generation;
         let k = to_key(key)?;
         // OPEN always uses seq 0, so `generation` is what keeps this nonce
-        // unique when the peer recycles the id (the v1 hole).
+        // unique when the peer recycles the id (the v1 hole). The frame must
+        // agree: `Frame::open_udp` sets 0 too, but stamp it so the AAD can
+        // never drift from the nonce.
+        let mut frame = frame;
+        frame.sequence = 0;
         let nonce = build_nonce(id, generation, 0, frame_type);
         let wire = codec::encode_frame(&frame, &k, generation, &nonce, pad_multiple)
             .map_err(|e| MuxError::Internal(e.to_string()))?;

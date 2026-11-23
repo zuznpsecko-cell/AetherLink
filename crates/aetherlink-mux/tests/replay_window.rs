@@ -149,6 +149,56 @@ fn header_that_does_not_match_the_ciphertext_fails_authentication() {
     assert!(mux.open_data(&KEY, &frame.header, &frame.ciphertext).is_ok());
 }
 
+/// Regression: a sealed datagram must open on the peer side.
+///
+/// `seal_datagram` builds the nonce from `entry.next_seq` but seals a
+/// `Frame::udp_datagram`, whose constructor hard-codes `sequence: 0`. The two
+/// disagreed, which was harmless (and therefore invisible) while the header
+/// was unauthenticated — once the header became AAD (DEC-016) the receiver
+/// rebuilt a different AAD and every datagram failed with "Authentication
+/// failed". This is the coverage that was missing: the old UDP test asserted
+/// only that the *pump* emitted two frames, never that a peer could open them.
+#[test]
+fn sealed_datagram_opens_on_the_peer() {
+    // Given: a live UDP flow on the sender, mirrored on the receiver
+    let mut sender = MuxManager::with_max(4);
+    let id = sender.open_udp("1.1.1.1", 53).expect("open udp");
+    sender.seal_open_udp(&KEY, id, PAD).expect("open frame");
+    let mut receiver = MuxManager::with_max(4);
+    receiver
+        .register_inbound(id, "1.1.1.1", 53, true)
+        .expect("register");
+    // When: the sender seals a payload
+    let sealed = sender
+        .seal_datagram(&KEY, id, b"dns query", PAD)
+        .expect("seal");
+    // Then: the peer opens exactly those bytes.
+    let payload = receiver
+        .open_datagram(&KEY, &sealed.header, &sealed.ciphertext)
+        .expect("datagram must authenticate");
+    assert_eq!(payload, b"dns query");
+}
+
+#[test]
+fn sealed_tcp_data_opens_on_the_peer() {
+    // Same invariant for the TCP path (DATA frames carried the right sequence
+    // already; pin it so a future constructor change cannot regress silently).
+    let mut sender = MuxManager::with_max(4);
+    let id = sender.open_tcp("93.184.216.34", 443).expect("open tcp");
+    sender.seal_open_tcp(&KEY, id, PAD).expect("open frame");
+    let mut receiver = MuxManager::with_max(4);
+    receiver
+        .register_inbound(id, "93.184.216.34", 443, false)
+        .expect("register");
+    for chunk in [b"first".as_slice(), b"second".as_slice()] {
+        let sealed = sender.seal_data(&KEY, id, chunk, PAD).expect("seal");
+        let payload = receiver
+            .open_data(&KEY, &sealed.header, &sealed.ciphertext)
+            .expect("data must authenticate");
+        assert_eq!(payload, chunk);
+    }
+}
+
 #[test]
 fn unexpected_frame_type_is_not_a_replay() {
     let (mut mux, id, generation) = live_stream();
