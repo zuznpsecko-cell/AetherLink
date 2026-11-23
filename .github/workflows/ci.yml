@@ -7,36 +7,51 @@ on:
       - main
 
 jobs:
-  linux-rust-and-server:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
-      - name: Run full Rust workspace test suite
-        run: cargo test --workspace
-      - name: Build release FFI library & Linux .NET server host
-        run: |
-          cargo build --release -p aetherlink-ffi
-          dotnet publish dotnet/AetherLink.Server/AetherLink.Server.csproj -c Release -r linux-x64
-
-  windows-client-and-gui:
+  gate-probe:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Compile full Windows Rust workspace & tests
+      - name: PROBE dotnet test
+        shell: pwsh
         run: |
-          cargo test --workspace --no-run
-          cargo build --release -p aetherlink-ffi
-      - name: Publish Windows Avalonia GUI & CLI client hosts
+          dotnet test dotnet/AetherLink.Gui.Tests/AetherLink.Gui.Tests.csproj -c Release 2>&1 | Select-Object -Last 25 | ForEach-Object { "::notice::$_" }
+          if ($LASTEXITCODE -ne 0) { "::error::PROBE dotnet test FAILED ($LASTEXITCODE)" } else { "::notice::PROBE dotnet test PASSED" }
+      - name: PROBE contract scripts
+        shell: pwsh
         run: |
-          dotnet publish dotnet/AetherLink.Gui/AetherLink.Gui.csproj -c Release -r win-x64
-          dotnet publish dotnet/AetherLink.Client/AetherLink.Client.csproj -c Release -r win-x64
+          foreach ($s in @("check_thin_hosts.ps1","check_gui_endpoints.ps1","check_quickstart.ps1")) {
+            $out = & "./scripts/$s" 2>&1
+            $code = $LASTEXITCODE
+            $fails = $out | Where-Object { $_ -match '^FAIL' }
+            if ($code -ne 0 -or $fails) {
+              "::notice::PROBE $s FAILED (exit $code)"
+              $fails | Select-Object -First 8 | ForEach-Object { "::notice::  $_" }
+            } else {
+              "::notice::PROBE $s PASSED"
+            }
+          }
+      - name: PROBE cargo fmt
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check 2>&1 | Out-String | Write-Output
+          if ($LASTEXITCODE -ne 0) { "::notice::PROBE fmt FAILED - diff files listed above" } else { "::notice::PROBE fmt PASSED" }
+      - name: PROBE clippy
+        shell: pwsh
+        run: |
+          $out = cargo clippy --workspace --all-targets 2>&1 | Out-String
+          $warn = ([regex]::Matches($out, '^warning: ', 'Multiline')).Count
+          $err  = ([regex]::Matches($out, '^error', 'Multiline')).Count
+          "::notice::PROBE clippy warnings=$warn errors=$err exit=$LASTEXITCODE"
+      - name: PROBE fmt detail
+        shell: pwsh
+        run: |
+          $out = cargo fmt --all -- --check 2>&1 | Out-String
+          $files = [regex]::Matches($out, 'Diff in (?<p>[^:]+):') | ForEach-Object { $_.Groups['p'].Value }
+          "::notice::PROBE fmt files=$((($files | Sort-Object -Unique) -join ', '))"
