@@ -291,10 +291,10 @@ impl SocketPump {
                     }
                 }
             }
-            tcp::State::Closed => {
-                if self.established.remove(&handle) {
-                    out.push(PumpEvent::TcpClosed { handle });
-                }
+            // A socket that closes without ever being reported as
+            // established produced no TcpClosed, so it reports none now.
+            tcp::State::Closed if self.established.remove(&handle) => {
+                out.push(PumpEvent::TcpClosed { handle });
             }
             _ => {}
         }
