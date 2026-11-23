@@ -151,11 +151,16 @@ jobs:
             $bad = $out | Where-Object { "$_" -match '^\s*FAIL' }
             if ($code -ne 0 -or $bad) {
               $fail++
-              "::error::$name failed (exit $code)"
-              ($text -split "`n" | Select-Object -Last 20) | ForEach-Object {
-                $line = $_.TrimEnd()
-                if ($line) { "::error::  $line" }
-              }
+              # One annotation, not one per line: GitHub keeps only ~10
+              # annotations per step, so a burst of single-line ones loses the
+              # tail -- which is exactly where the evidence is. Newlines inside
+              # an annotation must be percent-encoded as %0A.
+              $tail = @($text -split "`n" |
+                ForEach-Object { $_.TrimEnd() } |
+                Where-Object { $_ -ne "" } |
+                Select-Object -Last 25)
+              $body = ($tail -join "%0A") -replace "%(?!0A)", "%25"
+              "::error title=$name::$name failed (exit $code)%0A$body"
             }
           }
           if ($fail -ne 0) {
