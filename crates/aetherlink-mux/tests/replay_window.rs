@@ -65,13 +65,34 @@ fn duplicate_sequence_is_a_typed_replay_rejection() {
 
 #[test]
 fn stale_generation_is_reported_separately_from_replay() {
-    let (mut mux, id, generation) = live_stream();
-    // A frame from a previous life of this id: same seq, older generation.
-    let old_generation = generation.saturating_sub(1);
+    // Given: a second incarnation of an id, so a strictly older generation
+    // exists. The first incarnation starts at 0, so `generation - 1` is only
+    // meaningful once the id has been recycled — computing it on a fresh id
+    // (as this test first did) just yields the same 0 and asserts nothing.
+    let mut mux = MuxManager::with_max(4);
+    let id = mux.open_tcp("93.184.216.34", 443).expect("open");
+    mux.seal_open_tcp(&KEY, id, PAD).expect("first open frame");
+    mux.close(id).expect("close first incarnation");
+
+    // When: the id comes back (here via the inbound path the accept loop
+    // uses, which is what re-registers a recycled id in practice)
+    mux.register_inbound(id, "93.184.216.34", 443, false)
+        .expect("re-register");
+    let generation = mux
+        .seal_open_tcp(&KEY, id, PAD)
+        .expect("open frame of the new incarnation")
+        .header
+        .generation;
+    assert_eq!(generation, 1, "premise: the recycled id advanced");
+
+    // And: a frame sealed under the *previous* incarnation's generation
+    let old_generation = generation - 1;
     let frame = seal_at(id, old_generation, 1, b"from the past");
     let err = mux
         .open_data(&KEY, &frame.header, &frame.ciphertext)
         .expect_err("stale incarnation must be rejected");
+
+    // Then: the error names the incarnation mismatch, distinct from a replay.
     match err {
         MuxError::StaleGeneration {
             stream_id,
