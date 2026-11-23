@@ -176,7 +176,11 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
         || ip.is_private()
         || ip.is_link_local() // 169.254.0.0/16 incl. 169.254.169.254
         || ip.is_broadcast()
-        || ip.is_documentation()
+        // `is_documentation` is unstable too: 192.0.2.0/24, 198.51.100.0/24,
+        // 203.0.113.0/24 (RFC 5737) must not be relay targets either.
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)
         || ip.is_unspecified()
         || o[0] == 0 // 0.0.0.0/8 "this network"
         || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64.0.0/10 CGNAT
@@ -187,10 +191,14 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
 
 fn is_private_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
+    // `is_unique_local` / `is_unicast_link_local` are still unstable in std,
+    // so the two ranges are matched by hand: fc00::/7 and fe80::/10.
+    let unique_local = (s[0] & 0xfe00) == 0xfc00;
+    let link_local = (s[0] & 0xffc0) == 0xfe80;
     ip.is_loopback()
         || ip.is_unspecified()
-        || ip.is_unique_local() // fc00::/7
-        || ip.is_unicast_link_local() // fe80::/10
+        || unique_local
+        || link_local
         || s[0] == 0x2001 && s[1] == 0x0db8 // documentation
         || s[0] == 0x2002 // 6to4: embeds an arbitrary v4, refuses to reason
         || s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 // 100::/64 discard
