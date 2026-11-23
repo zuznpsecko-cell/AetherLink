@@ -1,4 +1,4 @@
-name: CI
+name: FMT-DIAG
 
 on:
   pull_request:
@@ -6,27 +6,26 @@ on:
     branches:
       - main
 
-permissions:
-  contents: write
-
 jobs:
-  fmt-commit:
+  fmt-diag:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Apply rustfmt and commit
+      - name: Show what rustfmt would change
         run: |
-          cargo fmt --all
+          cargo fmt --all 2>&1 | head -40
+          echo "----- exit: $? -----"
           if git diff --quiet; then echo "::notice::NOTHING_TO_FORMAT"; exit 0; fi
-          git config user.name "aetherlink-fmt-bot"
-          git config user.email "fmt-bot@users.noreply.github.com"
-          git add -A
-          git commit -m "style: cargo fmt --all (rustfmt default config)"
-          git push origin HEAD:refs/heads/${{ github.head_ref }}
-          echo "::notice::FMT_COMMITTED"
+          git diff > /tmp/fmt.diff || true
+          echo "=== files ==="
+          git diff --stat
+          # One annotation with percent-encoded newlines: GitHub clips at ~10
+          # annotations per step, and the whole point here is the full hunk list.
+          BODY=$(head -c 60000 /tmp/fmt.diff | sed 's/%/%25/g; s/$/%0A/')
+          echo "::error title=rustfmt-diff::$BODY"
+          exit 1

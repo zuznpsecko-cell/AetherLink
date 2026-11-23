@@ -1,0 +1,25 @@
+name: FMT-DIAG
+
+on:
+  pull_request:
+
+jobs:
+  fmt-diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Show what rustfmt would change
+        run: |
+          cargo fmt --all
+          if git diff --quiet; then echo "::notice::NOTHING_TO_FORMAT"; exit 0; fi
+          git diff > /tmp/fmt.diff
+          echo "=== files ==="
+          git diff --stat
+          BODY=$(head -c 55000 /tmp/fmt.diff | sed 's/%/%25/g; s/$/%0A/')
+          echo "::error title=rustfmt-diff::$BODY"
+          exit 1
