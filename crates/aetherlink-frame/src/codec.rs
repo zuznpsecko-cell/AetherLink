@@ -381,7 +381,8 @@ mod tests {
         // which made every header trivially fingerprintable) ...
         let start = FRAME_HEADER_SIZE - FRAME_HEADER_RANDOM_SIZE;
         assert_ne!(
-            &a[start..], &b[start..],
+            &a[start..],
+            &b[start..],
             "reserved tail must not be a constant"
         );
         // ... and both still decode to the same meaningful header.

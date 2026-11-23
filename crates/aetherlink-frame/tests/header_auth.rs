@@ -10,7 +10,9 @@
 
 use aetherlink_crypto::aead::AeadKey;
 use aetherlink_crypto::DEFAULT_PAD_MULTIPLE;
-use aetherlink_frame::codec::{decode_frame, encode_frame, header_aad, FrameHeader, AAD_HEADER_LEN};
+use aetherlink_frame::codec::{
+    decode_frame, encode_frame, header_aad, FrameHeader, AAD_HEADER_LEN,
+};
 use aetherlink_frame::types::Frame;
 use aetherlink_protocol::{build_nonce, FrameType, FRAME_HEADER_SIZE};
 

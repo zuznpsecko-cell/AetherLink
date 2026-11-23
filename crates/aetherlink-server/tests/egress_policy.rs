@@ -13,9 +13,7 @@ fn ip(s: &str) -> IpAddr {
 
 fn policy(deny_private: bool, allow: &[&str], deny: &[&str]) -> EgressPolicy {
     let parse = |list: &[&str]| -> Vec<Cidr> {
-        list.iter()
-            .map(|s| Cidr::parse(s).expect("cidr"))
-            .collect()
+        list.iter().map(|s| Cidr::parse(s).expect("cidr")).collect()
     };
     EgressPolicy::new(deny_private, parse(allow), parse(deny))
 }
@@ -27,17 +25,17 @@ fn default_policy_blocks_loopback_lan_and_metadata() {
 
     // Then: everything that lives inside a host or datacenter is refused
     for target in [
-        "127.0.0.1",       // loopback
-        "10.0.0.5",        // RFC1918
-        "172.16.0.1",      // RFC1918
-        "192.168.1.1",     // RFC1918
-        "169.254.169.254", // cloud metadata
-        "169.254.1.1",     // link local
-        "100.64.0.1",      // CGNAT
-        "0.0.0.0",         // unspecified
-        "::1",             // v6 loopback
-        "fc00::1",         // v6 ULA
-        "fe80::1",         // v6 link local
+        "127.0.0.1",        // loopback
+        "10.0.0.5",         // RFC1918
+        "172.16.0.1",       // RFC1918
+        "192.168.1.1",      // RFC1918
+        "169.254.169.254",  // cloud metadata
+        "169.254.1.1",      // link local
+        "100.64.0.1",       // CGNAT
+        "0.0.0.0",          // unspecified
+        "::1",              // v6 loopback
+        "fc00::1",          // v6 ULA
+        "fe80::1",          // v6 link local
         "::ffff:127.0.0.1", // v4-mapped loopback must not sneak past
     ] {
         assert_eq!(
@@ -101,7 +99,16 @@ fn adjacent_private_ranges_are_not_swept_up() {
     let p = policy(true, &[], &[]);
     // Then: neighbours of private ranges stay reachable. These are the
     // off-by-one cases a hand-written octet check gets wrong.
-    for target in ["9.255.255.255", "11.0.0.0", "172.15.255.255", "172.32.0.0", "192.167.255.255", "192.169.0.0", "100.63.255.255", "100.128.0.0"] {
+    for target in [
+        "9.255.255.255",
+        "11.0.0.0",
+        "172.15.255.255",
+        "172.32.0.0",
+        "192.167.255.255",
+        "192.169.0.0",
+        "100.63.255.255",
+        "100.128.0.0",
+    ] {
         assert_eq!(p.check(ip(target)), Ok(()), "{target} is public");
     }
 }
@@ -109,6 +116,9 @@ fn adjacent_private_ranges_are_not_swept_up() {
 #[test]
 fn denied_reason_is_stable_for_logs() {
     // Then: the two reasons stay distinguishable in operator-facing logs
-    assert_eq!(EgressDenied::Private.as_str(), "private or metadata address");
+    assert_eq!(
+        EgressDenied::Private.as_str(),
+        "private or metadata address"
+    );
     assert_eq!(EgressDenied::Denied.as_str(), "denied by egress policy");
 }

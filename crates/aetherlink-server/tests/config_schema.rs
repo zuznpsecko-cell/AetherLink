@@ -128,7 +128,10 @@ fn egress_defaults_on_and_parses_overrides() {
     assert!(!cfg.egress.denies_private());
     assert!(cfg.egress.check("10.0.0.1".parse().expect("ip")).is_ok());
     assert!(cfg.egress.check("10.1.2.3".parse().expect("ip")).is_ok());
-    assert!(cfg.egress.check("198.51.99.9".parse().expect("ip")).is_err());
+    assert!(cfg
+        .egress
+        .check("198.51.99.9".parse().expect("ip"))
+        .is_err());
 }
 
 #[test]

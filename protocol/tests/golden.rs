@@ -103,7 +103,10 @@ fn test_golden_frame_codec() {
     assert_eq!(decoded.frame_type, FrameType::Data);
     assert_eq!(decoded.stream_id, 1);
     assert_eq!(decoded.sequence, 100);
-    assert_eq!(framed_generation, generation, "generation survives the wire");
+    assert_eq!(
+        framed_generation, generation,
+        "generation survives the wire"
+    );
     assert_eq!(
         decoded.payload,
         aetherlink_frame::types::FramePayload::Data(b"test payload data".to_vec())
@@ -115,8 +118,8 @@ fn test_golden_frame_codec() {
     let encoded = codec::encode_frame(&frame, &key, generation, &open_nonce, DEFAULT_PAD_MULTIPLE)
         .expect("Encoding should succeed");
 
-    let (decoded, _) = codec::decode_frame(&encoded, &key, &open_nonce)
-        .expect("Decoding should succeed");
+    let (decoded, _) =
+        codec::decode_frame(&encoded, &key, &open_nonce).expect("Decoding should succeed");
     assert_eq!(decoded.frame_type, FrameType::OpenTcp);
     assert_eq!(decoded.stream_id, 3);
 

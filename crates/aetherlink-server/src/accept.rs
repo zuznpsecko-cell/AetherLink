@@ -683,8 +683,7 @@ fn forward_tcp(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 stream_worker(id, tip, tport, pt, rx, out, aborted_worker, egress);
             }));
-        })
-    {
+        }) {
         Ok(_) => {
             workers.insert(id, WorkerHandle { tx, aborted });
             ForwardOutcome::Delivered
@@ -1034,11 +1033,7 @@ fn enable_linux_tcp_keepalive(sock: &TcpStream) {
 ///
 /// `routes` starts empty on a live listener and is filled from the peer's
 /// OPEN frames; tests may pre-register entries instead.
-pub fn serve_connection(
-    sock: TcpStream,
-    ctx: &ServerCtx,
-    routes: &mut RouteTable,
-) -> Path {
+pub fn serve_connection(sock: TcpStream, ctx: &ServerCtx, routes: &mut RouteTable) -> Path {
     // DoS bound: the slot lives for the whole connection and is released on
     // drop, including on panic. Over the cap the socket is dropped unserved
     // (a TCP RST) rather than queued, so an attacker cannot rent memory by
@@ -1076,8 +1071,12 @@ pub fn serve_connection(
     // nothing. `accept_tls` cleared the handshake timeouts, so arm one here
     // and clear it again before the tunnel loop takes the socket.
     let auth = {
-        let _ = stream.get_ref().set_read_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
-        let _ = stream.get_ref().set_write_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
+        let _ = stream
+            .get_ref()
+            .set_read_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
+        let _ = stream
+            .get_ref()
+            .set_write_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
         let outcome = session::handshake_server(&mut stream, &ctx.psk, &ctx.cache);
         let _ = stream.get_ref().set_read_timeout(None);
         let _ = stream.get_ref().set_write_timeout(None);
@@ -1697,9 +1696,7 @@ fn send_chunked(
         let sealed = match seal_one(sess, payload) {
             Ok(s) => s,
             Err(e) => {
-                debug_log(&format!(
-                    "tunnel: skip reply on closed flow id={id}: {e}"
-                ));
+                debug_log(&format!("tunnel: skip reply on closed flow id={id}: {e}"));
                 return Ok(());
             }
         };
@@ -1711,9 +1708,7 @@ fn send_chunked(
         let sealed = match seal_one(sess, chunk) {
             Ok(s) => s,
             Err(e) => {
-                debug_log(&format!(
-                    "tunnel: skip reply on closed stream id={id}: {e}"
-                ));
+                debug_log(&format!("tunnel: skip reply on closed stream id={id}: {e}"));
                 return Ok(());
             }
         };

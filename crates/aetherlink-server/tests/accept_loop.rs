@@ -307,7 +307,10 @@ fn unresolvable_target_does_not_stall_the_session() {
         .expect("seal data");
     wire_help::write_frame(&mut stream, &sealed.header, &sealed.ciphertext);
 
-    let live = sess.mux.open_tcp("127.0.0.1", echo_port).expect("open live");
+    let live = sess
+        .mux
+        .open_tcp("127.0.0.1", echo_port)
+        .expect("open live");
     let sealed = sess
         .mux
         .seal_open_tcp(sess.keys.tx_key(), live, 128)

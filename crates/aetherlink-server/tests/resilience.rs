@@ -22,9 +22,7 @@ use std::time::{Duration, Instant};
 use aetherlink_core::tls;
 use aetherlink_crypto::auth::NonceCache;
 use aetherlink_server::accept::{serve_connection, Path, ServerCtx};
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
@@ -202,7 +200,10 @@ fn handshake_deadline_rejects_a_silent_peer() {
     let elapsed = started.elapsed();
     // Then: it fails closed instead of blocking forever, and it does so on the
     // deadline (generous bound: CI machines are slow).
-    assert!(result.is_err(), "a silent peer must not complete a handshake");
+    assert!(
+        result.is_err(),
+        "a silent peer must not complete a handshake"
+    );
     assert!(
         elapsed < Duration::from_secs(3),
         "handshake must honour the deadline, took {elapsed:?}"

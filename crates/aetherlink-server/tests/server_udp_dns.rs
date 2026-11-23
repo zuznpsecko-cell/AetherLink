@@ -33,7 +33,8 @@ fn udp_relay_echoes_payload() {
     // Given: local UDP echo target
     let (port, h) = echo_server();
     // When: relaying one datagram
-    let back = relay::relay_udp("127.0.0.1", port, b"datagram-1", TIMEOUT, &permissive()).expect("relay");
+    let back =
+        relay::relay_udp("127.0.0.1", port, b"datagram-1", TIMEOUT, &permissive()).expect("relay");
     // Then: transparent roundtrip
     assert_eq!(back, b"datagram-1");
     h.join().expect("echo thread");
@@ -44,7 +45,13 @@ fn udp_relay_times_out_on_silence() {
     // Given: unroutable TEST-NET target (RFC 5737, nothing answers)
     // When: relaying with a short timeout
     // Then: bounded Err, never hangs the mux
-    let err = relay::relay_udp("192.0.2.1", 53, b"q", Duration::from_millis(200), &permissive());
+    let err = relay::relay_udp(
+        "192.0.2.1",
+        53,
+        b"q",
+        Duration::from_millis(200),
+        &permissive(),
+    );
     assert!(err.is_err());
 }
 
