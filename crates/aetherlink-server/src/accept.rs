@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc,
@@ -69,6 +69,11 @@ pub struct ServerCtx {
     pub live_connections: Arc<AtomicUsize>,
     /// Hard cap on concurrently served connections.
     pub max_connections: usize,
+    /// Which resolved addresses the relay may dial (DEC-021).
+    ///
+    /// Applied in `relay::dial_tcp` / `relay::relay_udp` **after** resolution:
+    /// the client chooses the target name, so only the address is evidence.
+    pub egress: crate::egress::EgressPolicy,
     /// Max concurrent streams/flows per connection (mux state bound).
     ///
     /// Applied to the session's mux once the handshake succeeds
@@ -172,6 +177,14 @@ enum RelayOut {
 }
 
 /// Pool key: carried through for logging and cooldown decisions.
+/// Learned dial targets, keyed by stream id: `(host, port)`.
+///
+/// Deliberately **not** a `SocketAddr`: filling this table happens on the
+/// single-threaded tunnel loop, and resolving a client-supplied name there
+/// would block every flow of the session (DEC-022). Resolution belongs to the
+/// worker that dials.
+pub type RouteTable = HashMap<u16, (String, u16)>;
+
 struct FlowKey {
     id: u16,
     target: (String, u16),
@@ -325,7 +338,7 @@ fn send_hold(
     stream_rx: &mpsc::Receiver<StreamReply>,
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
-    routes: &mut HashMap<u16, SocketAddr>,
+    routes: &mut RouteTable,
     workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
 ) -> Result<(), SendHoldFail> {
@@ -421,11 +434,13 @@ fn stream_worker(
     inbox: mpsc::Receiver<WorkerMsg>,
     out: mpsc::SyncSender<StreamReply>,
     aborted: Arc<AtomicBool>,
+    egress: crate::egress::EgressPolicy,
 ) {
     use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
     use std::net::Shutdown;
     let target = (ip.clone(), port);
-    let mut sock = match relay::dial_tcp(&ip, port) {
+    // Resolution + egress check happen here, off the tunnel loop (DEC-021/022).
+    let mut sock = match relay::dial_tcp(&ip, port, &egress) {
         Ok(s) => s,
         Err(kind) => {
             debug_log(&format!(
@@ -594,11 +609,12 @@ enum ForwardOutcome {
 /// application stream. Instead `CloseStream` notifies the peer cleanly.
 #[allow(clippy::too_many_arguments)]
 fn forward_tcp(
+    ctx: &ServerCtx,
     pool: &RelayPool<FlowKey, Result<RelayOut, ()>>,
     stream_rx: &mpsc::Receiver<StreamReply>,
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
-    routes: &mut HashMap<u16, SocketAddr>,
+    routes: &mut RouteTable,
     workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
     stream_tx: &mpsc::SyncSender<StreamReply>,
@@ -659,12 +675,13 @@ fn forward_tcp(
     let aborted_worker = Arc::clone(&aborted);
     let out = stream_tx.clone();
     let (tip, tport) = target;
+    let egress = ctx.egress.clone();
     match std::thread::Builder::new()
         .name(format!("relay-{id}"))
         .stack_size(WORKER_STACK)
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                stream_worker(id, tip, tport, pt, rx, out, aborted_worker);
+                stream_worker(id, tip, tport, pt, rx, out, aborted_worker, egress);
             }));
         })
     {
@@ -721,7 +738,7 @@ fn handle_completion(
 fn close_stream(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
-    routes: &mut HashMap<u16, SocketAddr>,
+    routes: &mut RouteTable,
     id: u16,
 ) -> bool {
     let sealed = match sess.mux.seal_data(sess.keys.tx_key(), id, &[], 128) {
@@ -761,7 +778,7 @@ fn close_stream(
 fn handle_stream_reply(
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
-    routes: &mut HashMap<u16, SocketAddr>,
+    routes: &mut RouteTable,
     workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
     r: StreamReply,
@@ -869,7 +886,7 @@ fn drain_completions(
     stream_rx: &mpsc::Receiver<StreamReply>,
     sess: &mut session::ServerSession,
     stream: &mut tls::ServerTlsStream,
-    routes: &mut HashMap<u16, SocketAddr>,
+    routes: &mut RouteTable,
     workers: &mut HashMap<u16, WorkerHandle>,
     dead: &mut HashMap<(String, u16), Instant>,
 ) -> bool {
@@ -902,10 +919,19 @@ fn drain_completions(
     true
 }
 
-fn is_unroutable_target(target: &SocketAddr) -> bool {
-    match target.ip() {
-        std::net::IpAddr::V4(v4) => v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified(),
-        std::net::IpAddr::V6(_) => false,
+/// Multicast/broadcast/unspecified targets are not dialable.
+///
+/// Takes the learned host, not a `SocketAddr`: only a **literal** can be
+/// classified this way, and resolving a name here would put `getaddrinfo` back
+/// on the tunnel loop (DEC-022). Names are judged by the egress policy after
+/// the worker resolves them (DEC-021).
+fn is_unroutable_target(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified()
+        }
+        // An IPv6 literal is skipped as before (dial targets are IPv4-only).
+        Ok(std::net::IpAddr::V6(_)) | Err(_) => false,
     }
 }
 
@@ -1011,7 +1037,7 @@ fn enable_linux_tcp_keepalive(sock: &TcpStream) {
 pub fn serve_connection(
     sock: TcpStream,
     ctx: &ServerCtx,
-    routes: &mut HashMap<u16, SocketAddr>,
+    routes: &mut RouteTable,
 ) -> Path {
     // DoS bound: the slot lives for the whole connection and is released on
     // drop, including on panic. Over the cap the socket is dropped unserved
@@ -1115,7 +1141,7 @@ fn tunnel_loop(
     stream: &mut tls::ServerTlsStream,
     mut sess: session::ServerSession,
     ctx: &ServerCtx,
-    routes: &mut HashMap<u16, SocketAddr>,
+    routes: &mut RouteTable,
 ) -> String {
     let _ = take_end();
     TRAFFIC.with(|t| t.set((0, 0)));
@@ -1262,7 +1288,7 @@ fn tunnel_loop(
         }
         match header.frame_type {
             FrameType::Data => {
-                let Some(&target) = routes.get(&header.stream_id) else {
+                let Some(target) = routes.get(&header.stream_id).cloned() else {
                     // One stray stream (its OPEN was skipped, or the stream
                     // already closed) must not take the whole tunnel down —
                     // skip the flow cleanly.
@@ -1274,12 +1300,7 @@ fn tunnel_loop(
                 };
                 if sess
                     .mux
-                    .register_inbound(
-                        header.stream_id,
-                        &target.ip().to_string(),
-                        target.port(),
-                        false,
-                    )
+                    .register_inbound(header.stream_id, &target.0, target.1, false)
                     .is_err()
                 {
                     debug_log(&format!(
@@ -1311,6 +1332,7 @@ fn tunnel_loop(
                 // writes and reads interleave with no pairing or tails.
                 let id = header.stream_id;
                 match forward_tcp(
+                    ctx,
                     &pool,
                     &stream_rx,
                     &mut sess,
@@ -1320,7 +1342,7 @@ fn tunnel_loop(
                     &mut dead,
                     &stream_tx,
                     id,
-                    (target.ip().to_string(), target.port()),
+                    (target.0, target.1),
                     pt,
                 ) {
                     ForwardOutcome::Delivered => {}
@@ -1346,7 +1368,7 @@ fn tunnel_loop(
                 }
             }
             FrameType::UdpDatagram => {
-                let Some(&target) = routes.get(&header.stream_id) else {
+                let Some(target) = routes.get(&header.stream_id).cloned() else {
                     // Parity with FrameType::Data: a UDP datagram whose OPEN
                     // was skipped (blocklist, transient DNS error, QUIC/STUN
                     // race during upload) must skip the flow, never kill the
@@ -1359,12 +1381,7 @@ fn tunnel_loop(
                 };
                 if sess
                     .mux
-                    .register_inbound(
-                        header.stream_id,
-                        &target.ip().to_string(),
-                        target.port(),
-                        true,
-                    )
+                    .register_inbound(header.stream_id, &target.0, target.1, true)
                     .is_err()
                 {
                     debug_log(&format!(
@@ -1376,9 +1393,11 @@ fn tunnel_loop(
                 let pt = match sess.mux.open_datagram(sess.keys.rx_key(), &header, &ct) {
                     Ok(pt) => {
                         debug_log(&format!(
-                            "tunnel: datagram id={} open {}B to {target}",
+                            "tunnel: datagram id={} open {}B to {}:{}",
                             header.stream_id,
-                            pt.len()
+                            pt.len(),
+                            target.0,
+                            target.1
                         ));
                         pt
                     }
@@ -1390,10 +1409,10 @@ fn tunnel_loop(
                         continue;
                     }
                 };
-                if is_unroutable_target(&target) {
+                if is_unroutable_target(&target.0) {
                     debug_log(&format!(
-                        "tunnel: datagram id={} to {target} unroutable, skipping relay",
-                        header.stream_id
+                        "tunnel: datagram id={} to {}:{} unroutable, skipping relay",
+                        header.stream_id, target.0, target.1
                     ));
                     continue;
                 }
@@ -1402,8 +1421,7 @@ fn tunnel_loop(
                 // flows relay to their learned target exactly once.
                 let is_virtual = ctx.dns_upstream.iter().any(|u| {
                     u.rsplit_once(':').is_some_and(|(host, port)| {
-                        host == target.ip().to_string()
-                            && port.parse::<u16>().ok() == Some(target.port())
+                        host == target.0 && port.parse::<u16>().ok() == Some(target.1)
                     })
                 });
                 // Blocked QNAME: answer empty locally, never burn a
@@ -1432,16 +1450,20 @@ fn tunnel_loop(
                 }
                 let key = FlowKey {
                     id: header.stream_id,
-                    target: (target.ip().to_string(), target.port()),
+                    target: target.clone(),
                 };
-                let job_ip = target.ip().to_string();
-                let job_port = target.port();
+                let job_ip = target.0.clone();
+                let job_port = target.1;
                 let upstreams = ctx.dns_upstream.clone();
+                let egress = ctx.egress.clone();
                 if pool.dispatch(key, move || {
+                    // The pool worker resolves and dials; the egress policy
+                    // rides along so the check runs on the resolved address
+                    // (DEC-021) and off the loop (DEC-022).
                     let out = if is_virtual {
                         dns::resolve_any(&pt, &upstreams, UDP_RELAY_TIMEOUT)
                     } else {
-                        relay::relay_udp(&job_ip, job_port, &pt, UDP_RELAY_TIMEOUT)
+                        relay::relay_udp(&job_ip, job_port, &pt, UDP_RELAY_TIMEOUT, &egress)
                     };
                     out.map(RelayOut::Udp).map_err(|_| ())
                 }) {
@@ -1534,16 +1556,8 @@ fn tunnel_loop(
                     "tunnel: open_tcp id={} -> {}:{}",
                     target.id, target.addr, target.port
                 ));
-                let sock = match dial_addr(&target.addr, target.port) {
-                    Some(sock) => sock,
-                    None => {
-                        debug_log(&format!(
-                            "tunnel: open_tcp id={} dial failed, skipping flow",
-                            header.stream_id
-                        ));
-                        continue;
-                    }
-                };
+                // No dial here: the worker dials (DEC-022). Resolving a
+                // client-supplied name on this loop would stall every flow.
                 if sess
                     .mux
                     .register_inbound(header.stream_id, &target.addr, target.port, false)
@@ -1555,7 +1569,7 @@ fn tunnel_loop(
                     ));
                     continue;
                 }
-                routes.insert(header.stream_id, sock);
+                routes.insert(header.stream_id, (target.addr, target.port));
             }
             FrameType::OpenUdp => {
                 let flow = match MuxManager::parse_open_udp(sess.keys.rx_key(), &header, &ct) {
@@ -1610,16 +1624,8 @@ fn tunnel_loop(
                     }
                 }
                 let _ = sess.mux.close(header.stream_id);
-                let sock = match dial_addr(&addr, port) {
-                    Some(sock) => sock,
-                    None => {
-                        debug_log(&format!(
-                            "tunnel: open_udp id={} dial {addr}:{port} failed, skipping flow",
-                            header.stream_id
-                        ));
-                        continue;
-                    }
-                };
+                // Same as OPEN_TCP: the relay pool resolves and dials
+                // (DEC-022); the loop only records where the flow goes.
                 if sess
                     .mux
                     .register_inbound(header.stream_id, &addr, port, true)
@@ -1631,7 +1637,7 @@ fn tunnel_loop(
                     ));
                     continue;
                 }
-                routes.insert(header.stream_id, sock);
+                routes.insert(header.stream_id, (addr, port));
             }
             other => {
                 debug_log("tunnel: unsupported frame type, closing");
@@ -1646,10 +1652,6 @@ fn tunnel_loop(
 }
 
 /// Resolve a dial target announced by the peer (server-side system DNS).
-fn dial_addr(addr: &str, port: u16) -> Option<SocketAddr> {
-    format!("{addr}:{port}").to_socket_addrs().ok()?.next()
-}
-
 /// Max plaintext per TCP reply frame, sized (`16_000` bytes) so
 /// `24B FrameHeader + 4B len + 16_000B payload + 128B pad + 16B tag <= 16_384B`
 /// fits cleanly inside a single 16 KiB TLS 1.3 record without emitting tiny

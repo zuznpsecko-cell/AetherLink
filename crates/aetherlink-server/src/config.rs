@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub blocked_domains_file: Option<String>,
     /// Master switch (default true). False = no blocking at all.
     pub blocklist_enabled: bool,
+    /// Which resolved addresses the relay may dial (DEC-021).
+    pub egress: crate::egress::EgressPolicy,
 }
 
 fn required_str(doc: &serde_json::Value, field: &str) -> Result<String> {
@@ -91,6 +93,7 @@ impl ServerConfig {
             .get("blocklist_enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        let egress = parse_egress(doc.get("egress"))?;
         Ok(Self {
             listen,
             tls_cert,
@@ -101,6 +104,7 @@ impl ServerConfig {
             blocked_domains,
             blocked_domains_file,
             blocklist_enabled,
+            egress,
             // Zero would refuse every stream; clamp like `max_connections`.
             max_streams: (doc
                 .get("max_streams")
@@ -121,4 +125,43 @@ pub fn parse(raw: &str) -> Result<()> {
     let doc = aetherlink_core::config::parse_document(raw)
         .map_err(|e| ServerError::ConfigError(e.to_string()))?;
     ServerConfig::parse(&doc).map(|_| ())
+}
+
+/// Parse the optional `egress` block (DEC-021).
+///
+/// Defaults matter here: a server started from a config that predates this
+/// block must still be protected, so `deny_private` is `true` unless the
+/// operator writes `false`. A malformed CIDR is a hard error — silently
+/// ignoring it would widen the policy without anyone noticing.
+fn parse_egress(doc: Option<&serde_json::Value>) -> Result<crate::egress::EgressPolicy> {
+    let Some(doc) = doc else {
+        return Ok(crate::egress::EgressPolicy::new(
+            true,
+            Vec::new(),
+            Vec::new(),
+        ));
+    };
+    let deny_private = doc
+        .get("deny_private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let allow = parse_cidrs(doc.get("allow"), "egress.allow")?;
+    let deny = parse_cidrs(doc.get("deny"), "egress.deny")?;
+    Ok(crate::egress::EgressPolicy::new(deny_private, allow, deny))
+}
+
+/// Parse a CIDR list; every entry must be a valid range.
+fn parse_cidrs(doc: Option<&serde_json::Value>, field: &str) -> Result<Vec<crate::egress::Cidr>> {
+    let Some(arr) = doc.and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    arr.iter()
+        .map(|v| {
+            let spec = v
+                .as_str()
+                .ok_or_else(|| ServerError::ConfigError(format!("{field}: not a string")))?;
+            crate::egress::Cidr::parse(spec)
+                .ok_or_else(|| ServerError::ConfigError(format!("{field}: bad CIDR {spec:?}")))
+        })
+        .collect()
 }

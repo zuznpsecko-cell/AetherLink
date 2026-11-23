@@ -13,6 +13,15 @@ server:
   # Concurrent connections (each costs a thread with a 4 MiB stack).
   # Past this the accept loop drops new sockets instead of queueing them.
   max_connections: 512
+  # Egress policy: which *resolved* addresses the server may connect to on the
+  # client's behalf (DEC-021). deny_private keeps it off loopback, RFC1918,
+  # link-local, CGNAT, ULA and cloud metadata (169.254.169.254). Turn it off
+  # only if this server is meant to relay to hosts on its own LAN.
+  # allow/deny take CIDRs and are checked in that order (allow wins).
+  egress:
+    deny_private: true
+    allow: []
+    deny: []
   # Domain blocklist (ads/trackers): suffix match, `full:` prefix = exact.
   # Enforced on DNS answers + OPEN targets; fail closed, loop lives.
   # Master switch: blocklist_enabled: false disables everything.

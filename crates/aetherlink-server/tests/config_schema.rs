@@ -10,6 +10,9 @@ fn server_example_parses() {
     assert!(cfg.dns_upstream.iter().any(|u| u == "1.1.1.1:53"));
     assert!(!cfg.psk.is_empty());
     assert_eq!(cfg.max_streams, 4096);
+    // And: the shipped example carries the egress policy (DEC-021).
+    assert!(cfg.egress.denies_private());
+    assert!(cfg.egress.check("127.0.0.1".parse().expect("ip")).is_err());
 }
 
 #[test]
@@ -84,4 +87,61 @@ fn max_connections_parses_and_defaults() {
     });
     let cfg = aetherlink_server::config::ServerConfig::parse(&doc).expect("valid");
     assert_eq!(cfg.max_connections, 1, "zero must never disable the server");
+}
+
+/// Egress policy defaults matter: a config written before DEC-021 must still
+/// be protected, and a typo in a CIDR must fail loudly instead of silently
+/// widening what the relay may reach.
+#[test]
+fn egress_defaults_on_and_parses_overrides() {
+    use std::net::IpAddr;
+    let minimal = serde_json::json!({
+        "server": {
+            "listen": "0.0.0.0:443",
+            "psk": "test-psk-32-bytes-long-for-tests!!",
+            "local_static_root": ".",
+        }
+    });
+    // Given: no `egress` block -> Then: deny_private is on, loopback refused.
+    let cfg = aetherlink_server::config::ServerConfig::parse(&minimal).expect("valid");
+    assert!(cfg.egress.denies_private());
+    assert!(cfg
+        .egress
+        .check("127.0.0.1".parse::<IpAddr>().expect("ip"))
+        .is_err());
+
+    // Given: an explicit opt-out plus CIDRs
+    let doc = serde_json::json!({
+        "server": {
+            "listen": "0.0.0.0:443",
+            "psk": "test-psk-32-bytes-long-for-tests!!",
+            "local_static_root": ".",
+            "egress": {
+                "deny_private": false,
+                "allow": ["10.1.0.0/16"],
+                "deny": ["203.0.113.0/24"],
+            },
+        }
+    });
+    // Then: private targets pass again, deny still applies, allow is honoured.
+    let cfg = aetherlink_server::config::ServerConfig::parse(&doc).expect("valid");
+    assert!(!cfg.egress.denies_private());
+    assert!(cfg.egress.check("10.0.0.1".parse().expect("ip")).is_ok());
+    assert!(cfg.egress.check("10.1.2.3".parse().expect("ip")).is_ok());
+    assert!(cfg.egress.check("203.0.113.9".parse().expect("ip")).is_err());
+}
+
+#[test]
+fn malformed_egress_cidr_is_a_config_error() {
+    // Given: a typo in the allow list
+    let doc = serde_json::json!({
+        "server": {
+            "listen": "0.0.0.0:443",
+            "psk": "test-psk-32-bytes-long-for-tests!!",
+            "local_static_root": ".",
+            "egress": { "allow": ["10.0.0.0/33"] },
+        }
+    });
+    // Then: hard error, never a silently ignored rule.
+    assert!(aetherlink_server::config::ServerConfig::parse(&doc).is_err());
 }

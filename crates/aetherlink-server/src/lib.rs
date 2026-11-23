@@ -9,6 +9,7 @@ pub mod blocklist;
 pub mod config;
 pub mod debug;
 pub mod dns;
+pub mod egress;
 pub mod fallback;
 pub mod pool;
 pub mod relay;
@@ -108,6 +109,7 @@ impl Server {
                     }
                     list
                 },
+                egress: self.config.egress.clone(),
                 blocklist: if !self.config.blocklist_enabled {
                     crate::blocklist::Blocklist::default()
                 } else {

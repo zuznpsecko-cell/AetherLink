@@ -91,11 +91,17 @@ relay. Rationale: DEC-020 in `docs/DECISIONS.md`.
   core; the GUI hosts the YAML keys, the tunnel does not act on them.
 - **Android host is not wired end-to-end** (`AetherVpnService` passes handle 0;
   `clientConnect`/`clientAttachTun` are not called from Kotlin).
-- **Server relays any target**, including loopback/LAN/cloud metadata; there is
-  no egress allowlist.
+- **Egress policy is address-based, not a full allowlist.** `deny_private`
+  (default on) keeps the server off loopback, LAN, link-local and cloud
+  metadata; `allow`/`deny` CIDRs cover the exceptions. It does not restrict
+  which public hosts a client may reach, and it does not filter
+  `dns_upstream` (operator config). Rationale: DEC-021.
 - **No per-IP rate limiting.** `server.max_connections` (default 512) bounds
   concurrent sockets and the TLS handshake has a 10 s deadline, but a single
   peer can still consume all slots.
+- **No DNS cache on the server.** Each new stream resolves its target once, in
+  its own worker; the tunnel loop never resolves (DEC-022), so a slow resolver
+  costs one flow, not the session.
 - **Replay window is sequence-based only.** A peer that can *delay* frames past
   the 1024-frame window is not detected (needs a rekey bound, not a bitmap).
 - **Kernel tuning is the deployment's job.** The server only logs when

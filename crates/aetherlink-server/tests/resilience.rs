@@ -94,6 +94,7 @@ fn ctx_with(max_connections: usize) -> ServerCtx {
         static_body: STATIC_BODY.to_vec(),
         dns_upstream: vec!["1.1.1.1:53".to_string()],
         blocklist: aetherlink_server::blocklist::Blocklist::default(),
+        egress: aetherlink_server::egress::EgressPolicy::permissive(),
         live_connections: Arc::new(AtomicUsize::new(0)),
         max_connections,
         max_streams: aetherlink_server::accept::DEFAULT_MAX_STREAMS,

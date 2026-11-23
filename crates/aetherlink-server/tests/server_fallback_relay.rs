@@ -67,13 +67,18 @@ fn relay_dial_tcp_echo_roundtrip() {
         sock.write_all(&buf).expect("echo");
     });
     // When: server relay dials the target
-    let mut stream = relay::dial_tcp("127.0.0.1", port).expect("dial");
+    let mut stream = relay::dial_tcp("127.0.0.1", port, &permissive()).expect("dial");
     // Then: bytes relayed transparently
     use std::io::{Read, Write};
     stream.write_all(b"hello").expect("write");
     let mut back = [0u8; 5];
     stream.read_exact(&mut back).expect("read");
     assert_eq!(&back, b"hello");
+}
+
+/// Loopback targets are the point of these tests (DEC-021 policy tested elsewhere).
+fn permissive() -> aetherlink_server::egress::EgressPolicy {
+    aetherlink_server::egress::EgressPolicy::permissive()
 }
 
 // ---------- DNS upstream ----------
@@ -115,7 +120,7 @@ fn relay_dial_refused_fails_fast() {
     let port = probe.local_addr().expect("addr").port();
     drop(probe);
     let started = std::time::Instant::now();
-    assert!(relay::dial_tcp("127.0.0.1", port).is_err());
+    assert!(relay::dial_tcp("127.0.0.1", port, &permissive()).is_err());
     assert!(
         started.elapsed() < std::time::Duration::from_secs(15),
         "dial errors must stay bounded"
@@ -132,7 +137,7 @@ fn dial_tcp_disables_nagle() {
         let _ = listener.accept();
     });
     // When: dialing for relay -> Then: NODELAY set
-    let sock = relay::dial_tcp("127.0.0.1", port).expect("dial");
+    let sock = relay::dial_tcp("127.0.0.1", port, &permissive()).expect("dial");
     assert!(sock.nodelay().expect("nodelay readable"));
 }
 
