@@ -920,6 +920,45 @@ formatting slip fails in seconds instead of after a full build.
 - The Android build itself is still not gated (needs an NDK + SDK in the
   runner); see `docs/STATUS.md` "still open".
 
+### Addendum: the gate code is itself a source of false verdicts
+Turning the gates on and then reading only the check-run annotations (CI logs
+were unreachable from the working environment) exposed three failure modes
+that had nothing to do with the code under test. All three produced a *red*
+gate on a green tree, so each is fixed at the root:
+
+1. **A gate must be readable, or it is not a gate.** `cargo fmt --check` prints
+   no file names at all; a failed step showed only "exit code 1". The
+   formatting steps now run `cargo fmt --all`, then annotate one `::error::`
+   per changed file. Annotations with a `title=` and percent-encoded newlines
+   are silently dropped on this repository, and oversized messages are dropped
+   too — plain short `::error::` lines are the only form that reliably
+   survives. This is why the clippy step greps `^(error|warning)`.
+2. **A passing script must say so in its exit code.** The three `check_*.ps1`
+   scripts printed "all … checks passed" but never called `exit 0`, leaving
+   `$LASTEXITCODE` as `$null` for the calling step. In PowerShell
+   `$null -ne 0` is *true*, so a green script marked the gate red. The scripts
+   now end with an explicit `exit 0`, and the caller normalises a missing exit
+   code instead of treating it as failure.
+3. **Do not test a command's output when you mean its exit code.** On Windows
+   the formatting gate read `if (git diff --quiet)`, which inspects the
+   command's (always empty) *output*, so it reported "dirty" unconditionally.
+   It now checks `$LASTEXITCODE`, with `core.autocrlf=false` so a CRLF
+   checkout cannot masquerade as a formatting change.
+
+Two real defects were found by the newly enabled Windows test gate, both of the
+same class — the Winsock/Unix split in timeout reporting:
+
+- `read_tls_step` treated only `WouldBlock` as "no data yet". A `SO_RCVTIMEO`
+  expiry is `TimedOut` on Winsock, so on Windows every timed read surfaced as a
+  fatal error. Fixed in `crates/aetherlink-server/src/accept.rs`.
+- The regression test for the same behaviour asserted `WouldBlock` outright and
+  so could only ever pass on Unix (`crates/aetherlink-server/tests/resilience.rs`);
+  it now accepts either spelling, which is what the contract actually is.
+
+The lesson generalises: **when a timeout kind is asserted, it is a platform
+contract, not an implementation detail.** Grep for `WouldBlock` when porting
+socket code, and handle `TimedOut` beside it.
+
 ### Verification
 All numbers above came from a throwaway workflow run against this branch
 (`probe` jobs) that printed `clippy` warnings/errors, the `rustfmt` hunk count,
