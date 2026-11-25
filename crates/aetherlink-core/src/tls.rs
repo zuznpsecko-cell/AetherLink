@@ -44,16 +44,32 @@ pub fn load_cert_key(
     Ok((chain, key))
 }
 
-/// TLS1.3-only server config with ALPN `http/1.1`.
+/// TLS1.3-only server config from a **PKCS#8** DER key (convenience).
 ///
-/// No `h2`: browsers enforce negotiated framing, and the static fallback
-/// answers in raw HTTP/1.1 — offering `h2` would break the decoy page in
-/// every modern browser while gaining nothing (the tunnel ignores ALPN).
+/// `key_der` is always interpreted as PKCS#8. Keys loaded from PEM files can
+/// be PKCS#1 (`BEGIN RSA PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) too —
+/// pass those through [`server_config_with_key`] with the typed
+/// [`PrivateKeyDer`] that [`load_cert_key`] returns. Re-labelling a PKCS#1 or
+/// SEC1 body as PKCS#8 (what the server used to do) makes rustls reject a
+/// perfectly valid key with "bad cert/key".
 pub fn server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key_der: &[u8],
 ) -> Result<ServerConfig> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.to_vec()));
+    server_config_with_key(cert_chain, key)
+}
+
+/// TLS1.3-only server config with ALPN `http/1.1`, for any key encoding
+/// rustls supports (PKCS#8, PKCS#1, SEC1).
+///
+/// No `h2`: browsers enforce negotiated framing, and the static fallback
+/// answers in raw HTTP/1.1 — offering `h2` would break the decoy page in
+/// every modern browser while gaining nothing (the tunnel ignores ALPN).
+pub fn server_config_with_key(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig> {
     let mut cfg = ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)

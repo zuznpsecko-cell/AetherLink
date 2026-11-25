@@ -680,14 +680,18 @@ run. Re-inserting would resurrect a freed handle — worse than dropping.
 
 ### Consequences
 - One slow connect no longer blocks unrelated handles or the GUI thread.
-- While a client is checked out, a concurrent `aether_client_free` on the same
-  handle sees "invalid handle" and does nothing. The client is then dropped
-  when the in-flight call returns, so no leak — but the *caller* sees a
-  misleading error code in that narrow window.
-- `servers` intentionally still run `request_stop`/`join` under the lock: a
-  server handle is a `ServerGuard` whose stop is bounded and never re-enters
-  the map, so the deadlock risk that motivated the client change is absent.
-  This asymmetry is deliberate and documented at the call site.
+- ~~While a client is checked out, a concurrent `aether_client_free` on the
+  same handle sees "invalid handle" and does nothing. The client is then
+  dropped when the in-flight call returns, so no leak.~~ **Wrong, superseded
+  by DEC-024:** `or_insert` *re-inserted* the client (the entry was absent, so
+  `or_insert` inserted), resurrecting the freed handle with its live session;
+  and even a dropped `Client` would only stop its pump threads
+  (`PumpHandle::drop`) — routes and DNS are restored by `down()` alone. Rule 1 above (no lock across
+  network I/O) still stands; the take/return mechanics were replaced.
+- ~~`servers` intentionally still run `request_stop`/`join` under the
+  lock.~~ Since DEC-024 the server is removed under the lock and joined
+  outside it, so a stop never queues other handles behind the accept loop's
+  sleep.
 - A per-handle lock would remove the remaining window; it is not worth a
   new dependency (or a hand-rolled `Arc<Mutex<Client>>` plumbing) until a host
   actually reports the race.
@@ -964,3 +968,96 @@ All numbers above came from a throwaway workflow run against this branch
 (`probe` jobs) that printed `clippy` warnings/errors, the `rustfmt` hunk count,
 `dotnet test` totals and each contract script's exit code. The probe jobs were
 removed before the final commit.
+
+---
+
+## DEC-024: FFI boundary is panic-safe, and `free` racing a call is deferred
+
+**Date:** 2026-11-25
+**Status:** Accepted (supersedes the take/return mechanics of DEC-019)
+
+### Context
+Three defects at the host boundary, all invisible in a happy-path test run:
+
+1. **Free during an in-flight call resurrected the handle.** DEC-019 checks a
+   client *out* of the map (removes it) for the duration of `up`/`down`/
+   `status`. A `free` arriving meanwhile found nothing (C ABI: "invalid
+   handle"; JNI `clientFree`: "success" without doing anything), and the
+   in-flight call then put the client back with `entry().or_insert()` — which
+   inserts precisely because the entry was gone. The host believed the client
+   freed; the core kept a live TLS session (and on desktop, routes/DNS) behind
+   a handle nobody would ever call again.
+2. **A Rust panic crossed `extern "C"`.** Since Rust 1.81 that aborts the
+   *host* process: the GUI, the Android app, the .NET server. Any `unwrap`/
+   index bug in the core became a crash of a foreign process.
+3. **One panic poisoned the global handle mutex**, after which every
+   `HANDLES.lock().unwrap()` panicked too — the whole FFI was dead until
+   restart.
+
+The server side had a sibling problem: the accept loop ended on *any* error
+other than `WouldBlock` (`Err(_) => break`). A single `ECONNABORTED` or an
+`EMFILE` under load stopped accepting forever while the process stayed
+"running", so systemd's `Restart=on-failure` never fired.
+
+### Decision
+- **Slots, not removal** (`crates/aetherlink-ffi/src/handles.rs`). A
+  checked-out client leaves a `Busy` slot behind. A concurrent call on the
+  same handle gets the new code `Busy` (-12) instead of a misleading
+  `InvalidHandle`; a concurrent `free` is *recorded* on the slot (handle is
+  invalid from that moment) and returns `Success`; the call holding the client
+  tears it down when it checks it in (`down()` for desktop hosts,
+  `android_disconnect()` for Android — whichever host freed it). The only
+  borrow API is `Lease`; its `Drop` handles the panic path by discarding the
+  slot and tearing the client down, so no slot stays `Busy` forever.
+- **Every export runs in `ffi_guard`** (`catch_unwind`): a panic becomes
+  `InternalError` (or 0 / null for handle- and string-returning functions)
+  plus `"{op}: internal error (panic: …)"` in `last_error`. JNI exports
+  included. This relies on `panic = "unwind"` in the release profile, which
+  the server already requires (see the root `Cargo.toml`).
+- **All FFI mutexes are poison-tolerant** (`unwrap_or_else(into_inner)`). The
+  table's invariants hold between method calls, so data behind a poisoned
+  lock is still valid.
+- **Invalid UTF-8 in a C string argument is an error** (`InvalidArgument` /
+  0 with "… is not valid UTF-8"), not silently `""`.
+- **The accept loop classifies errors** (`classify_accept_error` in
+  `crates/aetherlink-server/src/lib.rs`): per-peer errors retry (backing off
+  only after a burst of 16), resource exhaustion and unknown errors back off
+  exponentially (10 ms → 1 s), only a broken listener (`EBADF`, `ENOTSOCK`,
+  `EINVAL`) ends the loop. Then `ServerGuard::is_running()` turns false and
+  `failure()` carries the reason; `aether_server_is_running` exposes both,
+  and the .NET server host polls it once a second and exits non-zero, so the
+  supervisor restarts it. A failed connection-thread spawn is logged and
+  paced instead of `let _ =`.
+- **Typed TLS keys.** `tls::server_config_with_key` takes the
+  `PrivateKeyDer` that `load_cert_key` returns; `Server::bind` no longer
+  re-labels PKCS#1 (`BEGIN RSA PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`)
+  bodies as PKCS#8, which made rustls reject valid keys at startup.
+  `server_config(chain, pkcs8_der)` stays as a PKCS#8 convenience for tests.
+
+### Consequences
+- C ABI contract changes, all additive: new code `Busy = -12`; new export
+  `aether_server_is_running`; `aether_client_free` on a busy handle returns
+  `Success` (deferred) where it used to return `InvalidHandle`. Hosts that
+  treat unknown negative codes as generic failure keep working.
+- `status` polled while `up` is in flight now reports `Busy` (the old code
+  reported `InvalidHandle` in the same window).
+- Staged TUN/split configs are dropped when their handle is released (handles
+  are never reused, so they only accumulated).
+- A panicking call loses its client: the state after a panic is unknown, and
+  a tunnel left up without a handle could never be brought down.
+
+### Tests
+- `crates/aetherlink-ffi/src/handles.rs` (unit): busy slot, deferred free,
+  first-free-wins, discard of a lost slot, idle reads.
+- `crates/aetherlink-ffi/src/lib.rs` (unit): panic → `InternalError` + text;
+  panic while leasing releases the handle; poisoned table keeps serving;
+  `status` during a call is `Busy`; free during a call is honoured on return
+  and never resurrects the handle; invalid UTF-8 config is reported.
+- `crates/aetherlink-server/tests/accept_errors.rs`: errno classification
+  (Linux values), survives `ECONNABORTED`, backs off on `EMFILE` and recovers,
+  abort storm backs off after the burst, success resets the streak, a broken
+  listener ends the loop with its error.
+- `crates/aetherlink-server/tests/bind_serve.rs`: `bind` accepts a SEC1 key
+  and completes a real TLS handshake with it; the PEM helper reproduces
+  rcgen's PKCS#8 armour. There is no PKCS#1 test: rcgen (ring backend) cannot
+  generate RSA keys; a fixed RSA PEM fixture would be needed.
