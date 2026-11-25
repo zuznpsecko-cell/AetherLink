@@ -118,7 +118,22 @@ jobs:
           exit $code
 
       - name: Full Rust workspace tests (Windows)
-        run: cargo test --workspace
+        shell: pwsh
+        # A plain `cargo test` exit-1 says nothing about *which* test failed,
+        # and CI logs are not always retrievable. Annotate the failing test
+        # names so the failure is actionable from the check-run alone.
+        run: |
+          cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath /tmp/test.log
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            $fails = @(Select-String -Path /tmp/test.log -Pattern '^\s*---- (\S+) stdout ----' |
+              Select-Object -First 15 | ForEach-Object { $_.Matches[0].Groups[1].Value })
+            if ($fails.Count -eq 0) {
+              "::error::cargo test failed (exit $status); no per-test failure lines found"
+            }
+            foreach ($f in $fails) { "::error::failing test: $f" }
+          }
+          exit $status
 
       - name: Build release FFI library
         run: cargo build --release -p aetherlink-ffi
