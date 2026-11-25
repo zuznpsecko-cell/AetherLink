@@ -139,7 +139,8 @@ fn inbound_registration_advances_generation_too() {
     )
     .expect("seal stale frame");
     assert!(
-        peer.open_data(&KEY, &stale.header, &stale.ciphertext).is_err(),
+        peer.open_data(&KEY, &stale.header, &stale.ciphertext)
+            .is_err(),
         "a frame from a previous incarnation must not open in the new one"
     );
 }
@@ -161,7 +162,9 @@ fn frames_from_a_newer_generation_are_refused_until_registered() {
     )
     .expect("seal future frame");
     // Then: refused, never decrypted into the stale window.
-    assert!(peer.open_data(&KEY, &ahead.header, &ahead.ciphertext).is_err());
+    assert!(peer
+        .open_data(&KEY, &ahead.header, &ahead.ciphertext)
+        .is_err());
 }
 
 #[test]

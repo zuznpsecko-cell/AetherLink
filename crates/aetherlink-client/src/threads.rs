@@ -390,7 +390,10 @@ fn write_tls_all<'a>(
         }
         match stream.conn.writer().write(plain) {
             Ok(0) => {
-                return Err(Error::new(ErrorKind::WriteZero, "tls writer returned 0 after flush"));
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "tls writer returned 0 after flush",
+                ));
             }
             Ok(n) => plain = &plain[n..],
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -509,128 +512,129 @@ where
                     }
                 }
 
-            // 2. Always drain inbound TUN packets into `outbox` and flush
-            //    immediate `RCV.NXT + RCV.WND` ACKs so local `tcpip.sys` streams
-            //    pace smoothly on window updates without false 10ms RTO livelocks
-            //    and interactive flows are never head-of-line blocked in Wintun.
-            match tun.lock() {
-                Ok(mut guard) => match pump.poll_once(&mut *guard) {
-                    Ok(frames) => {
-                        if !frames.is_empty() {
-                            progressed = true;
-                            if aetherlink_netstack::debug::debug_enabled() {
-                                aetherlink_netstack::debug_log(&format!(
-                                    "pump: tls tun->outbox {} frame(s)",
-                                    frames.len()
-                                ));
-                            }
-                            outbox.extend(frames);
-                        }
-                        pump.flush_acks(&mut *guard);
-                    }
-                    Err(e) => {
-                        aetherlink_netstack::debug_log(&format!(
-                            "pump: tls tun drain error: {e}, continuing"
-                        ));
-                        pump.flush_acks(&mut *guard);
-                    }
-                },
-                Err(_) => {
-                    record_exit("tun mutex poisoned".to_string());
-                    break 'session;
-                }
-            }
-
-            // 3. Write queued frames into TLS 1.3 records, coalescing up to
-            //    TLS_BATCH_BYTES per call. Frames are popped from `outbox`
-            //    ONLY after they are fully accepted by the rustls plaintext
-            //    writer; a `WouldBlock` mid-batch (256 KiB rustls buffer full,
-            //    or kernel send buffer full) leaves any partially-processed
-            //    frame reconstructed and requeued, never lost.
-            //
-            //    The previous code called `writer().write_all()` directly
-            //    which treated any `WouldBlock` from rustls as fatal. That
-            //    killed the pump the moment an HTTP response exceeded ~250
-            //    KiB (the exact symptom the user reported: connect goes
-            //    green, egress returns HttpRequestException, every request
-            //    fails because TCP FINs and reply bytes never made it to the
-            //    socket and the peer timed out).
-            let mut sent_frames: usize = 0;
-            for _ in 0..64 {
-                match flush_tls_writes(&mut stream, &mut write_stalled_since) {
-                    Ok(n) if n > 0 => progressed = true,
-                    Err(e) => break 'pump format!("tls socket write failed: {e}"),
-                    _ => {}
-                }
-                if stream.conn.wants_write() || outbox.is_empty() {
-                    break;
-                }
-                tx_buf.clear();
-                let mut frames_in_batch = 0usize;
-                // Peek frames, building a wire batch without popping yet.
-                for f in outbox.iter().take(TLS_BATCH_FRAMES) {
-                    let wire_len = FRAME_HEADER_SIZE + f.ciphertext.len();
-                    if frames_in_batch > 0 && tx_buf.len() + wire_len > TLS_BATCH_BYTES {
-                        break;
-                    }
-                    f.header.encode(&mut tx_buf);
-                    tx_buf.extend_from_slice(&f.ciphertext);
-                    frames_in_batch += 1;
-                }
-                if frames_in_batch == 0 {
-                    break;
-                }
-                // Write the batch with WouldBlock-aware writer; remaining
-                // holds any bytes rustls would not accept.
-                let remaining = match write_tls_all(&mut stream, &tx_buf, &mut write_stalled_since) {
-                    Ok(r) => r,
-                    Err(e) => break 'pump format!("tls plaintext writer failed: {e}"),
-                };
-                let accepted_bytes = tx_buf.len() - remaining.len();
-                // Pop frames whose full wire bytes were accepted, by
-                // walking the original batch and counting frames whose
-                // header+ciphertext fit inside accepted_bytes.
-                let mut accepted_frames = 0usize;
-                let mut acc = 0usize;
-                for _ in 0..frames_in_batch {
-                    let Some(f) = outbox.front() else { break };
-                    let w = FRAME_HEADER_SIZE + f.ciphertext.len();
-                    if acc + w > accepted_bytes {
-                        break;
-                    }
-                    acc += w;
-                    outbox.pop_front();
-                    accepted_frames += 1;
-                }
-                if accepted_frames == 0 {
-                    // Nothing could be accepted even after flushing —
-                    // kernel buffer is full; yield to reads.
-                    break;
-                }
-                sent_frames += accepted_frames;
-                last_tx = Instant::now();
-                progressed = true;
-                if accepted_frames < frames_in_batch {
-                    // Partial batch: stop writing, drain ciphertext below.
-                    break;
-                }
-            }
-            if sent_frames > 0 {
-                let write_res = flush_tls_writes(&mut stream, &mut write_stalled_since);
+                // 2. Always drain inbound TUN packets into `outbox` and flush
+                //    immediate `RCV.NXT + RCV.WND` ACKs so local `tcpip.sys` streams
+                //    pace smoothly on window updates without false 10ms RTO livelocks
+                //    and interactive flows are never head-of-line blocked in Wintun.
                 match tun.lock() {
-                    Ok(mut guard) => {
-                        pump.frames_written(sent_frames);
-                        pump.flush_acks(&mut *guard);
-                    }
+                    Ok(mut guard) => match pump.poll_once(&mut *guard) {
+                        Ok(frames) => {
+                            if !frames.is_empty() {
+                                progressed = true;
+                                if aetherlink_netstack::debug::debug_enabled() {
+                                    aetherlink_netstack::debug_log(&format!(
+                                        "pump: tls tun->outbox {} frame(s)",
+                                        frames.len()
+                                    ));
+                                }
+                                outbox.extend(frames);
+                            }
+                            pump.flush_acks(&mut *guard);
+                        }
+                        Err(e) => {
+                            aetherlink_netstack::debug_log(&format!(
+                                "pump: tls tun drain error: {e}, continuing"
+                            ));
+                            pump.flush_acks(&mut *guard);
+                        }
+                    },
                     Err(_) => {
                         record_exit("tun mutex poisoned".to_string());
                         break 'session;
                     }
                 }
-                if let Err(e) = write_res {
-                    break 'pump format!("tls socket write failed: {e}");
+
+                // 3. Write queued frames into TLS 1.3 records, coalescing up to
+                //    TLS_BATCH_BYTES per call. Frames are popped from `outbox`
+                //    ONLY after they are fully accepted by the rustls plaintext
+                //    writer; a `WouldBlock` mid-batch (256 KiB rustls buffer full,
+                //    or kernel send buffer full) leaves any partially-processed
+                //    frame reconstructed and requeued, never lost.
+                //
+                //    The previous code called `writer().write_all()` directly
+                //    which treated any `WouldBlock` from rustls as fatal. That
+                //    killed the pump the moment an HTTP response exceeded ~250
+                //    KiB (the exact symptom the user reported: connect goes
+                //    green, egress returns HttpRequestException, every request
+                //    fails because TCP FINs and reply bytes never made it to the
+                //    socket and the peer timed out).
+                let mut sent_frames: usize = 0;
+                for _ in 0..64 {
+                    match flush_tls_writes(&mut stream, &mut write_stalled_since) {
+                        Ok(n) if n > 0 => progressed = true,
+                        Err(e) => break 'pump format!("tls socket write failed: {e}"),
+                        _ => {}
+                    }
+                    if stream.conn.wants_write() || outbox.is_empty() {
+                        break;
+                    }
+                    tx_buf.clear();
+                    let mut frames_in_batch = 0usize;
+                    // Peek frames, building a wire batch without popping yet.
+                    for f in outbox.iter().take(TLS_BATCH_FRAMES) {
+                        let wire_len = FRAME_HEADER_SIZE + f.ciphertext.len();
+                        if frames_in_batch > 0 && tx_buf.len() + wire_len > TLS_BATCH_BYTES {
+                            break;
+                        }
+                        f.header.encode(&mut tx_buf);
+                        tx_buf.extend_from_slice(&f.ciphertext);
+                        frames_in_batch += 1;
+                    }
+                    if frames_in_batch == 0 {
+                        break;
+                    }
+                    // Write the batch with WouldBlock-aware writer; remaining
+                    // holds any bytes rustls would not accept.
+                    let remaining =
+                        match write_tls_all(&mut stream, &tx_buf, &mut write_stalled_since) {
+                            Ok(r) => r,
+                            Err(e) => break 'pump format!("tls plaintext writer failed: {e}"),
+                        };
+                    let accepted_bytes = tx_buf.len() - remaining.len();
+                    // Pop frames whose full wire bytes were accepted, by
+                    // walking the original batch and counting frames whose
+                    // header+ciphertext fit inside accepted_bytes.
+                    let mut accepted_frames = 0usize;
+                    let mut acc = 0usize;
+                    for _ in 0..frames_in_batch {
+                        let Some(f) = outbox.front() else { break };
+                        let w = FRAME_HEADER_SIZE + f.ciphertext.len();
+                        if acc + w > accepted_bytes {
+                            break;
+                        }
+                        acc += w;
+                        outbox.pop_front();
+                        accepted_frames += 1;
+                    }
+                    if accepted_frames == 0 {
+                        // Nothing could be accepted even after flushing —
+                        // kernel buffer is full; yield to reads.
+                        break;
+                    }
+                    sent_frames += accepted_frames;
+                    last_tx = Instant::now();
+                    progressed = true;
+                    if accepted_frames < frames_in_batch {
+                        // Partial batch: stop writing, drain ciphertext below.
+                        break;
+                    }
                 }
-            }
+                if sent_frames > 0 {
+                    let write_res = flush_tls_writes(&mut stream, &mut write_stalled_since);
+                    match tun.lock() {
+                        Ok(mut guard) => {
+                            pump.frames_written(sent_frames);
+                            pump.flush_acks(&mut *guard);
+                        }
+                        Err(_) => {
+                            record_exit("tun mutex poisoned".to_string());
+                            break 'session;
+                        }
+                    }
+                    if let Err(e) = write_res {
+                        break 'pump format!("tls socket write failed: {e}");
+                    }
+                }
 
                 // 4. Periodic idle keepalive so NATs and middleboxes keep state warm.
                 //    Includes a 16-byte zero body so older servers that read non-empty
@@ -655,12 +659,10 @@ where
                     // Use the WouldBlock-aware writer (a full send buffer at
                     // idle would otherwise kill the session for no reason).
                     match write_tls_all(&mut stream, &tx_buf, &mut write_stalled_since) {
-                        Ok(remaining) if remaining.is_empty() => {
-                            last_tx = Instant::now();
-                        }
-                        Ok(_) => {
-                            // Partially written — try again next turn.
-                        }
+                        // Any successful return proves the keepalive left in
+                        // full: `write_tls_all` only returns on an empty
+                        // remainder or a WouldBlock, and WouldBlock is Err.
+                        Ok(_) => last_tx = Instant::now(),
                         Err(e) => break 'pump format!("tls keepalive write failed: {e}"),
                     }
                 }

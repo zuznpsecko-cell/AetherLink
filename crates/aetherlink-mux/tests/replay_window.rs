@@ -43,7 +43,8 @@ fn duplicate_sequence_is_a_typed_replay_rejection() {
     let frame = seal_at(id, generation, 7, b"once");
 
     assert!(
-        mux.open_data(&KEY, &frame.header, &frame.ciphertext).is_ok(),
+        mux.open_data(&KEY, &frame.header, &frame.ciphertext)
+            .is_ok(),
         "first arrival is accepted"
     );
     // Same frame again: a normal retransmit on a lossy path.
@@ -127,7 +128,8 @@ fn out_of_order_frame_advances_the_anchor() {
     // And: an in-window gap can still be filled (seq 3 was merely delayed).
     let three = seal_at(id, generation, 3, b"three");
     assert!(
-        mux.open_data(&KEY, &three.header, &three.ciphertext).is_ok(),
+        mux.open_data(&KEY, &three.header, &three.ciphertext)
+            .is_ok(),
         "a delayed in-window frame must still be accepted"
     );
     // ... but only once.
@@ -167,7 +169,9 @@ fn header_that_does_not_match_the_ciphertext_fails_authentication() {
     );
     // And: the honest header still opens the same bytes (nothing was consumed
     // by the failed attempt).
-    assert!(mux.open_data(&KEY, &frame.header, &frame.ciphertext).is_ok());
+    assert!(mux
+        .open_data(&KEY, &frame.header, &frame.ciphertext)
+        .is_ok());
 }
 
 /// Regression: a sealed datagram must open on the peer side.

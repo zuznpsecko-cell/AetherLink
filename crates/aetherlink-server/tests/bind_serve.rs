@@ -4,7 +4,6 @@
 //! client's OPEN frames, serves static from the configured root file,
 //! and fails bind fast on bad address or missing static root.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -54,7 +53,7 @@ fn test_server(listen: &str, static_body: &[u8]) -> aetherlink_server::Server {
         // here the same way a LAN-relaying deployment would set it.
         "egress": { "deny_private": false },
     });
-    let mut server = aetherlink_server::Server::new(doc).expect("server new");
+    let server = aetherlink_server::Server::new(doc).expect("server new");
     // Keep the temp dir alive for the test duration via the config path.
     let _ = &server.config.local_static_root;
     server
@@ -167,7 +166,7 @@ fn background_serve_echo_then_stop() {
     let bound = server.bind().expect("bind");
     let port = bound.local_addr().expect("local addr").port();
     // When: serving in background while the test drives a full exchange
-    let mut guard = bound.serve_background();
+    let guard = bound.serve_background();
     let mut stream = client_tls(port);
     let nonce = [0xE3u8; 32];
     let mut sess =

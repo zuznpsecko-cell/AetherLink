@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aetherlink_netstack::tun::{previous_gateway, RestoreOp};
-use aetherlink_netstack::tun::{rollback_plan, AppliedChange, Route, Snapshot};
+use aetherlink_netstack::tun::{rollback_plan, Route, Snapshot};
 
 use crate::{ClientError, Result};
 
@@ -561,7 +561,7 @@ impl RealPlatform {
             for (i, server) in servers.iter().enumerate() {
                 // `set ... static <dns>` for the primary,
                 // `add ... <dns> index=N` for the rest.
-                let mut args = windows::dns_set_args(&iface, server);
+                let mut args = windows::dns_set_args(iface, server);
                 if i > 0 {
                     args[2] = "add".to_string();
                     args.remove(5);

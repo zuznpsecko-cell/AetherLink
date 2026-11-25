@@ -426,21 +426,31 @@ enum WorkerMsg {
 /// never stalls the other direction and upload bursts do not pause 10ms
 /// per read timeout. Reports once on socket error/EOF, then exits; silent
 /// exit when the loop is gone.
-fn stream_worker(
+/// Everything a stream worker needs to start: its flow identity, the payload
+/// already received, and the channels back to the loop.
+struct WorkerStart {
     id: u16,
-    ip: String,
-    port: u16,
+    target: (String, u16),
     first: Vec<u8>,
     inbox: mpsc::Receiver<WorkerMsg>,
     out: mpsc::SyncSender<StreamReply>,
     aborted: Arc<AtomicBool>,
-    egress: crate::egress::EgressPolicy,
-) {
+}
+
+fn stream_worker(start: WorkerStart, egress: &crate::egress::EgressPolicy) {
+    let WorkerStart {
+        id,
+        target: (ip, port),
+        first,
+        inbox,
+        out,
+        aborted,
+    } = start;
     use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
     use std::net::Shutdown;
     let target = (ip.clone(), port);
     // Resolution + egress check happen here, off the tunnel loop (DEC-021/022).
-    let mut sock = match relay::dial_tcp(&ip, port, &egress) {
+    let mut sock = match relay::dial_tcp(&ip, port, egress) {
         Ok(s) => s,
         Err(kind) => {
             debug_log(&format!(
@@ -681,10 +691,19 @@ fn forward_tcp(
         .stack_size(WORKER_STACK)
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                stream_worker(id, tip, tport, pt, rx, out, aborted_worker, egress);
+                stream_worker(
+                    WorkerStart {
+                        id,
+                        target: (tip, tport),
+                        first: pt,
+                        inbox: rx,
+                        out,
+                        aborted: aborted_worker,
+                    },
+                    &egress,
+                );
             }));
-        })
-    {
+        }) {
         Ok(_) => {
             workers.insert(id, WorkerHandle { tx, aborted });
             ForwardOutcome::Delivered
@@ -1034,11 +1053,7 @@ fn enable_linux_tcp_keepalive(sock: &TcpStream) {
 ///
 /// `routes` starts empty on a live listener and is filled from the peer's
 /// OPEN frames; tests may pre-register entries instead.
-pub fn serve_connection(
-    sock: TcpStream,
-    ctx: &ServerCtx,
-    routes: &mut RouteTable,
-) -> Path {
+pub fn serve_connection(sock: TcpStream, ctx: &ServerCtx, routes: &mut RouteTable) -> Path {
     // DoS bound: the slot lives for the whole connection and is released on
     // drop, including on panic. Over the cap the socket is dropped unserved
     // (a TCP RST) rather than queued, so an attacker cannot rent memory by
@@ -1076,8 +1091,12 @@ pub fn serve_connection(
     // nothing. `accept_tls` cleared the handshake timeouts, so arm one here
     // and clear it again before the tunnel loop takes the socket.
     let auth = {
-        let _ = stream.get_ref().set_read_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
-        let _ = stream.get_ref().set_write_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
+        let _ = stream
+            .get_ref()
+            .set_read_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
+        let _ = stream
+            .get_ref()
+            .set_write_timeout(Some(tls::DEFAULT_HANDSHAKE_TIMEOUT));
         let outcome = session::handshake_server(&mut stream, &ctx.psk, &ctx.cache);
         let _ = stream.get_ref().set_read_timeout(None);
         let _ = stream.get_ref().set_write_timeout(None);
@@ -1697,9 +1716,7 @@ fn send_chunked(
         let sealed = match seal_one(sess, payload) {
             Ok(s) => s,
             Err(e) => {
-                debug_log(&format!(
-                    "tunnel: skip reply on closed flow id={id}: {e}"
-                ));
+                debug_log(&format!("tunnel: skip reply on closed flow id={id}: {e}"));
                 return Ok(());
             }
         };
@@ -1711,9 +1728,7 @@ fn send_chunked(
         let sealed = match seal_one(sess, chunk) {
             Ok(s) => s,
             Err(e) => {
-                debug_log(&format!(
-                    "tunnel: skip reply on closed stream id={id}: {e}"
-                ));
+                debug_log(&format!("tunnel: skip reply on closed stream id={id}: {e}"));
                 return Ok(());
             }
         };
@@ -1810,7 +1825,12 @@ fn read_tls_step(stream: &mut tls::ServerTlsStream, dst: &mut [u8]) -> std::io::
     loop {
         match stream.conn.reader().read(dst) {
             Ok(n) => return Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            // A `SO_RCVTIMEO` expiry is `WouldBlock` on Unix and `TimedOut` on
+            // Winsock. Treating only the Unix spelling as "no data yet" made
+            // every timed read look like a fatal error on Windows.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(e),
         }
         flush_tls_writes(stream)?;

@@ -111,7 +111,12 @@ relay. Rationale: DEC-020 in `docs/DECISIONS.md`.
 
 ## Checks
 
-`cargo test --workspace`, `cargo clippy --workspace --all-targets`,
+CI (`.github/workflows/ci.yml`) runs, cheapest first: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+(Linux **and** Windows), `dotnet test` for the GUI suite, the contract scripts
+and a `cargo audit` report. Rationale and the measured before/after: DEC-023.
+
+Locally: `cargo fmt --all`, `cargo clippy --workspace --all-targets`,
 `scripts/check_thin_hosts.ps1`, `scripts/check_gui_endpoints.ps1`,
 `scripts/check_quickstart.ps1`, `scripts/check_android_build.ps1`.
 

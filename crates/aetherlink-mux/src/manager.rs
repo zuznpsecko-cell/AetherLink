@@ -562,7 +562,6 @@ impl MuxManager {
         let nonce = build_nonce(header.stream_id, header.generation, 0, expect);
         let mut wire = Vec::with_capacity(FRAME_HEADER_SIZE + ciphertext.len());
         {
-            use bytes::BufMut;
             let mut hb = bytes::BytesMut::new();
             header.encode(&mut hb);
             wire.extend_from_slice(&hb);
@@ -635,7 +634,6 @@ impl MuxManager {
         let nonce = build_nonce(header.stream_id, header.generation, seq, expect);
         let mut wire = Vec::with_capacity(FRAME_HEADER_SIZE + ciphertext.len());
         {
-            use bytes::BufMut;
             let mut hb = bytes::BytesMut::new();
             header.encode(&mut hb);
             wire.extend_from_slice(&hb);

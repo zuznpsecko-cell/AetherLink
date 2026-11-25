@@ -228,7 +228,9 @@ fn mux_data_becomes_tcp_packet_in_tun() {
     pump.receive_mux(&sealed.header, &sealed.ciphertext, &mut tun)
         .expect("inject");
     // Then: one TCP packet toward TUN carries the payload
-    let out: Vec<_> = tun.outbound.drain(..).collect();
+    // `mem::take` moves the queue out in one go; `drain(..).collect()` on a
+    // Vec is the same thing spelled longer.
+    let out: Vec<_> = std::mem::take(&mut tun.outbound);
     assert_eq!(out.len(), 1);
     let parsed =
         aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(&out[0]).expect("valid ip");

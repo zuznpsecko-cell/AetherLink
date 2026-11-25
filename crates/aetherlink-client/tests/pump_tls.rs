@@ -390,7 +390,7 @@ fn bulk_send_does_not_wait_for_replies() {
                 true,
                 8001u32.wrapping_add(i.wrapping_mul(16)),
                 iss.wrapping_add(1),
-                &vec![i as u8; 16],
+                &[i as u8; 16],
             );
             guard.inbound.push_back(data);
         }
@@ -867,21 +867,19 @@ fn resilient_tls_pump_reconnects_transparently_after_abrupt_server_drop() {
     // 1. Wait for "before-drop" echo on Session 1.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let got_first = tun
-            .lock()
-            .expect("lock")
-            .outbound
-            .iter()
-            .any(|raw| {
-                aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
-                    .ok()
-                    .and_then(|ip| ip.tcp().map(|t| t.payload == b"before-drop"))
-                    .unwrap_or(false)
-            });
+        let got_first = tun.lock().expect("lock").outbound.iter().any(|raw| {
+            aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
+                .ok()
+                .and_then(|ip| ip.tcp().map(|t| t.payload == b"before-drop"))
+                .unwrap_or(false)
+        });
         if got_first {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "session #1 echo timed out");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session #1 echo timed out"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -894,17 +892,12 @@ fn resilient_tls_pump_reconnects_transparently_after_abrupt_server_drop() {
             "pump died instead of reconnecting: {:?}",
             handle.exit_reason()
         );
-        let got_local_rst = tun
-            .lock()
-            .expect("lock")
-            .outbound
-            .iter()
-            .any(|raw| {
-                aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
-                    .ok()
-                    .and_then(|ip| ip.tcp().map(|t| t.rst && t.dst_port == 42100))
-                    .unwrap_or(false)
-            });
+        let got_local_rst = tun.lock().expect("lock").outbound.iter().any(|raw| {
+            aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
+                .ok()
+                .and_then(|ip| ip.tcp().map(|t| t.rst && t.dst_port == 42100))
+                .unwrap_or(false)
+        });
         if got_local_rst {
             break;
         }
@@ -935,21 +928,19 @@ fn resilient_tls_pump_reconnects_transparently_after_abrupt_server_drop() {
             "pump died after reconnect: {:?}",
             handle.exit_reason()
         );
-        let got_second = tun
-            .lock()
-            .expect("lock")
-            .outbound
-            .iter()
-            .any(|raw| {
-                aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
-                    .ok()
-                    .and_then(|ip| ip.tcp().map(|t| t.payload == b"after-drop"))
-                    .unwrap_or(false)
-            });
+        let got_second = tun.lock().expect("lock").outbound.iter().any(|raw| {
+            aetherlink_netstack::smoltcp_wrapper::parse_ipv4_packet(raw)
+                .ok()
+                .and_then(|ip| ip.tcp().map(|t| t.payload == b"after-drop"))
+                .unwrap_or(false)
+        });
         if got_second {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "session #2 echo timed out");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session #2 echo timed out"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 

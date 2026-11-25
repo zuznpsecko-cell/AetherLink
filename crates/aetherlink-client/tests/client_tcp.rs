@@ -58,10 +58,6 @@ fn syn(seq: u32) -> Vec<u8> {
     build_tcp_packet(CLIENT_IP, DST, 41000, 80, true, false, false, seq, 0, &[])
 }
 
-fn advance(pump: &mut DataPump, tun: &mut FakeTun) {
-    pump.poll_once(tun).expect("poll");
-}
-
 /// Full handshake, returns (client_isn, server_iss).
 fn handshake(pump: &mut DataPump, tun: &mut FakeTun, isn: u32) -> (u32, u32) {
     // Given: SYN in TUN
@@ -1079,7 +1075,16 @@ fn high_rtt_multi_stream_upload_never_deadlocks_on_retransmits() {
         let port = 45_000u16 + (i as u16);
         let isn = 100_000u32 + (i as u32) * 100_000;
         tun.inbound.push_back(build_tcp_packet(
-            CLIENT_IP, DST, port, 443, true, false, false, isn, 0, &[],
+            CLIENT_IP,
+            DST,
+            port,
+            443,
+            true,
+            false,
+            false,
+            isn,
+            0,
+            &[],
         ));
         assert!(pump.poll_once(&mut tun).expect("syn").is_empty());
         let synack_out = tun.take_outbound();
@@ -1130,7 +1135,11 @@ fn high_rtt_multi_stream_upload_never_deadlocks_on_retransmits() {
     wire_queue.extend(burst1);
     pump.flush_acks(&mut tun);
     let initial_acks = tun.take_outbound();
-    assert_eq!(initial_acks.len(), streams, "every active stream gets prompt RCV.NXT ACK");
+    assert_eq!(
+        initial_acks.len(),
+        streams,
+        "every active stream gets prompt RCV.NXT ACK"
+    );
     for i in 0..streams {
         let ack_seg = initial_acks[i].tcp().expect("tcp");
         assert_eq!(

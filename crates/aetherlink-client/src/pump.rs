@@ -690,10 +690,7 @@ impl DataPump {
                         // SYN carrying payload (fast-open style): forward it
                         // now instead of waiting for the completing ACK.
                         if !seg.payload.is_empty() {
-                            let frames = match self.seal_payload(&fk, &mut flow, &seg.payload) {
-                                Ok(frames) => frames,
-                                Err(e) => return Err(e),
-                            };
+                            let frames = self.seal_payload(&fk, &mut flow, &seg.payload)?;
                             self.tcp.insert(fk, flow);
                             return Ok(Some(frames));
                         }
@@ -810,10 +807,7 @@ impl DataPump {
                 if seg.fin {
                     let mut frames = Vec::new();
                     if !payload_slice.is_empty() {
-                        match self.seal_payload(&fk, &mut flow, payload_slice) {
-                            Ok(f) => frames.extend(f),
-                            Err(e) => return Err(e),
-                        }
+                        frames.extend(self.seal_payload(&fk, &mut flow, payload_slice)?);
                     }
                     let has_upstream = flow.id.is_some();
                     flow.state = TcpState::HalfClosed;
@@ -860,10 +854,7 @@ impl DataPump {
                     self.tcp.insert(fk, flow);
                     return Ok(None);
                 }
-                let frames = match self.seal_payload(&fk, &mut flow, payload_slice) {
-                    Ok(frames) => frames,
-                    Err(e) => return Err(e),
-                };
+                let frames = self.seal_payload(&fk, &mut flow, payload_slice)?;
                 self.tcp.insert(fk, flow);
                 Ok(Some(frames))
             }

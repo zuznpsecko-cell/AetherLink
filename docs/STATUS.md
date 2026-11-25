@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilience (DEC-015) + header authentication (DEC-016), typed replay (DEC-017), library/deploy split (DEC-018), FFI lock (DEC-019), idempotent OPEN (DEC-020), egress policy (DEC-021), resolution off the loop (DEC-022); gates NOT run yet. Previous baseline: GUI endpoint profiles 49/49 .NET tests; Rust TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilience (DEC-015) + header authentication (DEC-016), typed replay (DEC-017), library/deploy split (DEC-018), FFI lock (DEC-019), idempotent OPEN (DEC-020), egress policy (DEC-021), resolution off the loop (DEC-022), measured CI gates (DEC-023); gates NOT run yet. Previous baseline: GUI endpoint profiles 49/49 .NET tests; Rust TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
 
 > **0l (upload 0.00): фикс в дереве, гейты НЕ прогонялись.** Причины и список правок — в
 > [docs/LIVE_ISSUES.md](LIVE_ISSUES.md#0l-аплоад-000-байты-терялись-молча-fin-убивал-ответ-id-кончались-в-дереве-гейты-не-прогонялись).
@@ -46,9 +46,20 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] Root `Cargo.toml` with workspace config
 - [x] Individual crate `Cargo.toml` files
 - [x] `protocol/` crate with golden test harness
-- [x] `DECISIONS.md` (DEC-001..DEC-022)
+- [x] `DECISIONS.md` (DEC-001..DEC-023)
 - [x] `STATUS.md` (this file)
 - [x] Basic `README.md`
+
+### Phase 22: CI gates (DEC-023)
+
+- [x] **Every gate measured before being made blocking** (probe workflow, then removed)
+- [x] `cargo fmt --all --check` — was 38 hunks / 18 files, fixed by a formatting-only commit
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — was already clean (0 warnings)
+- [x] `cargo test --workspace` now runs **on Windows too** (was `--no-run`: compile only)
+- [x] `dotnet test` for the GUI suite in CI (49 passed) — never ran before
+- [x] Contract scripts (`check_thin_hosts`, `check_gui_endpoints`, `check_quickstart`)
+- [x] `cargo audit` — advisory (loud), blocking once the report is clean
+- [ ] Still open: Android build gate (needs NDK/SDK in the runner)
 
 ### Phase 21: Egress control & loop hygiene (DEC-021..DEC-022)
 

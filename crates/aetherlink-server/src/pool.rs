@@ -129,13 +129,15 @@ where
         // first, so the drain decremented an increment that had not happened
         // yet and `active` underflowed to `usize::MAX`: `dispatch` then
         // refused every job until the process restarted.
-        let slot = match self.active.try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
-            if n >= self.cap {
-                None
-            } else {
-                Some(n + 1)
-            }
-        }) {
+        let slot = match self
+            .active
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+                if n >= self.cap {
+                    None
+                } else {
+                    Some(n + 1)
+                }
+            }) {
             Ok(_previous) => SlotGuard(&self.active),
             Err(_) => return false,
         };

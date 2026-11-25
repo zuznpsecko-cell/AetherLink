@@ -73,3 +73,4 @@ Check "remote has --yes escape hatch" (Has-Text $remoteInstall "--yes")
 
 if ($fail -gt 0) { Write-Output "$fail checks failed"; exit 1 }
 Write-Output "all quickstart checks passed"
+exit 0

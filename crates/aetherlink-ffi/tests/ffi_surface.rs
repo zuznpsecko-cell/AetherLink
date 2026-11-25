@@ -56,10 +56,7 @@ fn rules_set_list_reload_roundtrip() {
     let listed = read_out(h);
     assert!(listed.contains("\"one\""), "got: {listed}");
     assert!(listed.contains("\"site\""), "got: {listed}");
-    assert_eq!(
-        unsafe { aether_client_rules_reload(h) },
-        AetherError::Success as i32
-    );
+    assert_eq!(aether_client_rules_reload(h), AetherError::Success as i32);
 }
 
 #[test]
@@ -106,7 +103,7 @@ fn log_callback_receives_sanitized_line() {
     // Given: registered log callback + client with a known secret
     LINES.lock().expect("lines").clear();
     assert_eq!(
-        unsafe { aether_set_log_callback(capture) },
+        aether_set_log_callback(capture),
         AetherError::Success as i32
     );
     let cfg = c(r#"{"server_addr":"example.com:443","psk":"super-secret-psk-123"}"#);
@@ -130,15 +127,15 @@ fn android_tun_fd_validation() {
     let h = make_client();
     // When: bad handle / bad fd / good triple
     assert_eq!(
-        unsafe { aether_client_android_set_tun_fd(usize::MAX, 5, 1400) },
+        aether_client_android_set_tun_fd(usize::MAX, 5, 1400),
         AetherError::InvalidHandle as i32
     );
     assert_eq!(
-        unsafe { aether_client_android_set_tun_fd(h, -1, 1400) },
+        aether_client_android_set_tun_fd(h, -1, 1400),
         AetherError::InvalidArgument as i32
     );
     assert_eq!(
-        unsafe { aether_client_android_set_tun_fd(h, 5, 1400) },
+        aether_client_android_set_tun_fd(h, 5, 1400),
         AetherError::Success as i32
     );
 }

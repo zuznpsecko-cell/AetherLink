@@ -5,12 +5,10 @@
 //! crash-recovery file handling at the policy level. Real ioctls stay behind
 //! the `Platform` trait for the platform task.
 
-use std::net::IpAddr;
-
 use aetherlink_client::cleanup;
 use aetherlink_client::config::ClientConfig;
 use aetherlink_client::lifecycle;
-use aetherlink_client::platform::{FakePlatform, Platform, Step};
+use aetherlink_client::platform::{FakePlatform, Step};
 
 fn test_config() -> ClientConfig {
     ClientConfig::parse(&serde_json::json!({

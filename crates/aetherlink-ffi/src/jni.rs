@@ -178,7 +178,11 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientUp<'local>(
 ) -> jint {
     // `up()` brings the tunnel up (handshake, routes, TUN): keep it off the
     // handle lock so a slow connect cannot stall unrelated handles.
-    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle as usize) else {
+    let Some(mut client) = HANDLES
+        .lock()
+        .expect("handles")
+        .take_client(handle as usize)
+    else {
         return crate::AetherError::InvalidHandle as jint;
     };
     let code = match client.up() {
@@ -202,7 +206,11 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientDown<'local>(
     _cls: JClass<'local>,
     handle: jlong,
 ) -> jint {
-    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle as usize) else {
+    let Some(mut client) = HANDLES
+        .lock()
+        .expect("handles")
+        .take_client(handle as usize)
+    else {
         return crate::AetherError::InvalidHandle as jint;
     };
     let code = match client.down() {

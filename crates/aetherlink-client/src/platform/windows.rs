@@ -415,9 +415,12 @@ pub fn read_route_table() -> Result<RouteTable> {
 #[must_use]
 pub fn decode_cmd_output(raw: &[u8]) -> String {
     if raw.starts_with(&[0xFF, 0xFE]) {
-        let words: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        // Odd-length input leaves a trailing byte that is dropped: an
+        // incomplete code unit cannot be decoded and the command output is
+        // never load-bearing enough to fail on.
+        let bytes = &raw[2..];
+        let words: Vec<u16> = (0..bytes.len() / 2)
+            .map(|i| u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]))
             .collect();
         String::from_utf16_lossy(&words)
     } else if std::str::from_utf8(raw).is_ok() {

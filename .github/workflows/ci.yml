@@ -1,10 +1,17 @@
 name: CI
 
+# Gates in order of cost. Everything that can fail a PR here has been measured
+# on this repository (see docs/DECISIONS.md DEC-023) rather than assumed:
+# `cargo clippy` is warning-free, `cargo fmt --check` is clean as of the
+# formatting commit, and the .NET GUI suite is 49/49.
 on:
   pull_request:
   push:
     branches:
       - main
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   linux-rust-and-server:
@@ -12,12 +19,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Run full Rust workspace test suite
+
+      # Formatting and lints run first: they are seconds and they fail on the
+      # cheapest possible signal.
+      - name: Check formatting
+        # `cargo fmt --check` prints no file paths, so a red gate would say
+        # nothing about *what* to fix. Format in place, show the diff, then
+        # fail: the annotation carries the fix instructions.
+        run: |
+          cargo fmt --all
+          if git diff --quiet; then
+            echo "::notice::formatting clean"
+            exit 0
+          fi
+          # Plain `::error::` lines, one per file: the same form the clippy
+          # step uses. (Annotated forms with `title=` and percent-encoding are
+          # silently dropped here, and so are oversized messages.)
+          git diff --name-only | head -20 | while IFS= read -r f; do
+            echo "::error::needs rustfmt: $f"
+          done
+          exit 1
+
+      - name: Clippy (warnings are errors)
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            # clippy prints "error: ...", "warning: ..." and the
+            # "error: could not compile ..." trailer; grab the informative
+            # ones and annotate them (logs are not always retrievable).
+            grep -nE "^(error|warning)|^\s+--> " /tmp/clippy.log | head -20 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit "$status"
+
+      - name: Full Rust workspace tests
         run: cargo test --workspace
+
       - name: Build release FFI library & Linux .NET server host
         run: |
           cargo build --release -p aetherlink-ffi
@@ -28,15 +76,159 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Compile full Windows Rust workspace & tests
+
+      # Windows used to only *compile* the tests (`--no-run`), so a test that
+      # passed on Linux could panic on Windows and nobody would know. Now it
+      # runs them, plus the same lint gates.
+      - name: Check formatting
+        shell: pwsh
+        # Same rationale as the Linux step: surface the diff, not a bare exit 1.
         run: |
-          cargo test --workspace --no-run
-          cargo build --release -p aetherlink-ffi
+          # `if (git diff --quiet)` tests the command's *output* (always empty),
+          # not its exit code -- so that form reported "dirty" unconditionally.
+          # Ask git for the code explicitly, with EOL conversion pinned off so
+          # a CRLF checkout cannot masquerade as a formatting change.
+          cargo fmt --all
+          git -c core.autocrlf=false diff --quiet
+          if ($LASTEXITCODE -eq 0) { "::notice::formatting clean"; exit 0 }
+          # Plain `::error::` per file, like the clippy step: `title=` forms
+          # are silently dropped here.
+          foreach ($f in @(git -c core.autocrlf=false diff --name-only | Select-Object -First 20)) {
+            "::error::needs rustfmt: $f"
+          }
+          exit 1
+
+      - name: Clippy (warnings are errors)
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            ($out -split "`n") | Where-Object { $_ -match '^(error|warning)|^\s+--> ' } | Select-Object -First 20 |
+              ForEach-Object { "::error::$_" }
+          }
+          exit $code
+
+      - name: Full Rust workspace tests (Windows)
+        shell: pwsh
+        # A plain `cargo test` exit-1 says nothing about *which* test failed,
+        # and CI logs are not always retrievable. Annotate the failing test
+        # names so the failure is actionable from the check-run alone.
+        run: |
+          # `$env:RUNNER_TEMP`, not /tmp: there is no /tmp on a Windows runner,
+          # and Tee-Object would fail before cargo even ran.
+          $log = Join-Path $env:RUNNER_TEMP "test.log"
+          cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            $fails = @(Select-String -Path $log -Pattern '^\s*---- (\S+) stdout ----' |
+              Select-Object -First 15 | ForEach-Object { $_.Matches[0].Groups[1].Value })
+            if ($fails.Count -eq 0) {
+              "::error::cargo test failed (exit $status); no per-test failure lines found"
+            }
+            foreach ($f in $fails) { "::error::failing test: $f" }
+          }
+          exit $status
+
+      - name: Build release FFI library
+        run: cargo build --release -p aetherlink-ffi
+
+      - name: .NET GUI unit tests
+        run: dotnet test dotnet/AetherLink.Gui.Tests/AetherLink.Gui.Tests.csproj -c Release
+
       - name: Publish Windows Avalonia GUI & CLI client hosts
         run: |
           dotnet publish dotnet/AetherLink.Gui/AetherLink.Gui.csproj -c Release -r win-x64
           dotnet publish dotnet/AetherLink.Client/AetherLink.Client.csproj -c Release -r win-x64
+
+  contracts-and-audit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `check_thin_hosts.ps1` also asserts the staged Android .so files exist,
+      # but those are build outputs (.gitignore excludes them). The contract
+      # part is what belongs in a source gate; the binary part is guarded by
+      # `scripts/check_android_build.ps1` on a machine with an NDK.
+      - name: Thin-host and endpoint contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $fail = 0
+          # Scripts are invoked one by one, and the switch is spelled out per
+          # call (see the NOTE below) so a typo cannot turn this step into a
+          # silent exit-1 with no evidence.
+          #
+          # -SkipArtifacts: the staged Android .so files are build outputs and
+          # .gitignore excludes them, so a source gate cannot assert them.
+          $names = @("check_thin_hosts.ps1", "check_gui_endpoints.ps1", "check_quickstart.ps1")
+          foreach ($name in $names) {
+            # NOTE: an array of strings splatted with `@argList` passes each
+            # element *positionally* -- "-SkipArtifacts" arrives as a value, not
+            # as a switch, and binding fails with a terminating error (empty
+            # exit code, no FAIL lines). Invoke the two forms explicitly.
+            $skip = ($name -eq "check_thin_hosts.ps1")
+            "::notice::running $name$(if ($skip) { ' -SkipArtifacts' } else { '' })"
+            if ($skip) {
+              $out = & "./scripts/$name" -SkipArtifacts 2>&1
+            } else {
+              $out = & "./scripts/$name" 2>&1
+            }
+            $code = $LASTEXITCODE
+            # `$LASTEXITCODE` only exists once a native process ran; a pure
+            # pwsh script that never calls `exit` leaves it $null (and
+            # `$null -ne 0` is *true* in PowerShell, which used to turn a
+            # passing script into a red gate). The scripts now end with an
+            # explicit `exit 0`, and an unset code is normalised here so the
+            # verdict rests on the FAIL lines and on PowerShell errors.
+            if ($null -eq $code) { $code = 0 }
+            if ($Error.Count -gt 0) {
+              $code = "error"
+              $out = @($out) + @($Error | Select-Object -Last 5 | ForEach-Object { "PS: $_" })
+            }
+            $text = ($out | Out-String)
+            Write-Output "----- $name (exit $code) -----"
+            # -notmatch on FAIL lines is not enough: a script can die before
+            # printing any (missing Android SDK path, pwsh error). Always
+            # surface the tail so the annotation carries evidence.
+            $bad = $out | Where-Object { "$_" -match '^\s*FAIL' }
+            if ($code -ne 0 -or $bad) {
+              $fail++
+              # One annotation, not one per line: GitHub keeps only ~10
+              # annotations per step, so a burst of single-line ones loses the
+              # tail -- which is exactly where the evidence is. Newlines inside
+              # an annotation must be percent-encoded as %0A.
+              $tail = @($text -split "`n" |
+                ForEach-Object { $_.TrimEnd() } |
+                Where-Object { $_ -ne "" } |
+                Select-Object -Last 25)
+              $body = ($tail -join "%0A") -replace "%(?!0A)", "%25"
+              "::error title=$name::$name failed (exit $code)%0A$body"
+            }
+          }
+          if ($fail -ne 0) {
+            "::error::$fail contract script(s) failed"
+            exit 1
+          }
+          "::notice::all contract scripts passed"
+
+      # Non-blocking **for now**, and deliberately loud: a RustSec advisory
+      # needs a dependency bump, which may not be possible in the same change.
+      # The report is printed and annotated so it cannot be missed; flipping
+      # this to blocking is a one-line change once the tree is clean.
+      - name: Dependency audit (RustSec)
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+          echo "audit-exit=$LASTEXITCODE"

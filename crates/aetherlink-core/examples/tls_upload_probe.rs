@@ -6,7 +6,6 @@
 //! Usage: cargo run --example tls_upload_probe -- 31.57.158.233 8443 selmedia.ru 5
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::Instant;
 
 fn main() {

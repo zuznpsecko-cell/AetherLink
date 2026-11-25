@@ -16,7 +16,6 @@ members = [
 version = "1.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "AetherLink v1.5 - VPN with userspace network stack, single Rust core + FFI"
 
 [workspace.dependencies]
 # Core dependencies
@@ -27,7 +26,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Crypto
 hmac = "0.12"
@@ -36,7 +34,6 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 rand = "0.8"
 zeroize = { version = "1.7", features = ["derive"] }
-subtle = "2.5"
 
 # TLS
 rustls = { version = "0.23", features = ["std", "tls12"] }
@@ -53,7 +50,6 @@ libc = "0.2"
 jni = "0.21"
 
 # Testing
-hex = "0.4"
 pretty_assertions = "1.4"
 
 [profile.release]

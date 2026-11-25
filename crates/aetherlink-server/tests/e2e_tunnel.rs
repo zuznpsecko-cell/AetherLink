@@ -2184,7 +2184,11 @@ fn infinite_fast_download_aborted_by_rst_immediately_allows_upload() {
     for &id in &ul_ids {
         let reply = completed_uploads.get(&id).expect("upload reply present");
         let echoed = usize::from_be_bytes(reply.as_slice().try_into().expect("usize bytes"));
-        assert_eq!(echoed, 8 * 16_000, "upload stream {id} delivered 100% intact");
+        assert_eq!(
+            echoed,
+            8 * 16_000,
+            "upload stream {id} delivered 100% intact"
+        );
     }
 
     stop_dl.store(true, std::sync::atomic::Ordering::Relaxed);

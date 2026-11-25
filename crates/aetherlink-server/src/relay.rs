@@ -3,7 +3,7 @@
 //! The mux layer owns framing/crypto; relay owns the plain sockets.
 
 use std::collections::HashMap;
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::egress::{EgressDenied, EgressPolicy};
@@ -92,25 +92,38 @@ pub fn relay_udp(
     // A name can resolve to several addresses (and a resolved name can mix
     // allowed and denied ones), so keep the first accepted candidate and
     // report the real reason when none survives.
-    let mut denied: Option<EgressDenied> = None;
-    let dest = target
+    let candidates = target
         .to_socket_addrs()
-        .map_err(|e| ServerError::RelayError(format!("udp resolve {target}: {e}")))?
-        .find_map(|cand| match egress.check(cand.ip()) {
-            Ok(()) => Some(cand),
+        .map_err(|e| ServerError::RelayError(format!("udp resolve {target}: {e}")))?;
+    let mut denied: Option<EgressDenied> = None;
+    let mut allowed: Option<SocketAddr> = None;
+    for cand in candidates {
+        match egress.check(cand.ip()) {
+            Ok(()) => {
+                allowed = Some(cand);
+                break;
+            }
             Err(reason) => {
-                if denied.is_none() {
-                    denied = Some(reason);
-                }
-                None
+                denied.get_or_insert(reason);
             }
-        })
-        .ok_or_else(|| match denied {
+        }
+    }
+    let dest = match allowed {
+        Some(dest) => dest,
+        None => match denied {
             Some(reason) => {
-                ServerError::RelayError(format!("udp target {target}: {}", reason.as_str()))
+                return Err(ServerError::RelayError(format!(
+                    "udp target {target}: {}",
+                    reason.as_str()
+                )));
             }
-            None => ServerError::RelayError(format!("udp target {target}: no address")),
-        })?;
+            None => {
+                return Err(ServerError::RelayError(format!(
+                    "udp target {target}: no address"
+                )));
+            }
+        },
+    };
     let sock = UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| ServerError::RelayError(format!("udp bind: {e}")))?;
     sock.connect(dest)

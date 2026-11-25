@@ -14,14 +14,12 @@ aetherlink-protocol = { path = "../../protocol" }
 rustls = { workspace = true }
 rustls-pemfile = "2"
 webpki-roots = "1"
-webpki = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-tracing = { workspace = true }
 rustls-native-certs = "0.8.4"
 
 [dev-dependencies]
