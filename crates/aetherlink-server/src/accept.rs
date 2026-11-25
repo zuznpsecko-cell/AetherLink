@@ -1825,7 +1825,12 @@ fn read_tls_step(stream: &mut tls::ServerTlsStream, dst: &mut [u8]) -> std::io::
     loop {
         match stream.conn.reader().read(dst) {
             Ok(n) => return Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            // A `SO_RCVTIMEO` expiry is `WouldBlock` on Unix and `TimedOut` on
+            // Winsock. Treating only the Unix spelling as "no data yet" made
+            // every timed read look like a fatal error on Windows.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(e),
         }
         flush_tls_writes(stream)?;

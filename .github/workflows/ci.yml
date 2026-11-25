@@ -117,17 +117,6 @@ jobs:
           }
           exit $code
 
-      - name: DBG run one server test (temporary)
-        shell: pwsh
-        working-directory: crates/aetherlink-server
-        run: |
-          $log = Join-Path $env:RUNNER_TEMP "one.log"
-          cargo test --test resilience handshake_deadline_does_not_leak_into_the_served_stream -- --nocapture 2>&1 |
-            Tee-Object -FilePath $log | Out-Null
-          "::error::one-exit=$LASTEXITCODE"
-          Select-String -Path $log -Pattern 'panicked|assertion|left:|right:|Error|WouldBlock|TimedOut|test result' |
-            Select-Object -First 12 | ForEach-Object { "::error::one: $($_.Line.Trim())" }
-
       - name: Full Rust workspace tests (Windows)
         shell: pwsh
         # A plain `cargo test` exit-1 says nothing about *which* test failed,

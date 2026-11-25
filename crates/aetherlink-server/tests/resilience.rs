@@ -236,9 +236,14 @@ fn handshake_deadline_does_not_leak_into_the_served_stream() {
         .expect("set");
     let mut buf = [0u8; 1];
     let err = server.read(&mut buf).expect_err("nothing to read");
-    assert_eq!(
-        err.kind(),
-        std::io::ErrorKind::WouldBlock,
-        "socket must be usable after the handshake"
+    // A read timeout is reported as `WouldBlock` on Unix and as `TimedOut` on
+    // Winsock; both mean "the socket is alive, the read just expired".
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "socket must be usable after the handshake, got {:?}",
+        err.kind()
     );
 }
