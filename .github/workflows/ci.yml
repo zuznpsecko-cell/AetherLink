@@ -138,6 +138,14 @@ jobs:
           }
           exit $status
 
+      - name: DBG list server tests (temporary)
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "list.log"
+          cargo test -p aetherlink-server --test resilience --no-run 2>&1 | Tee-Object -FilePath $log
+          Select-String -Path $log -Pattern 'resilience' | Select-Object -First 4 |
+            ForEach-Object { "::error::list: $($_.Line)" }
+
       - name: Build release FFI library
         run: cargo build --release -p aetherlink-ffi
 
