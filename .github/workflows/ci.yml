@@ -117,13 +117,16 @@ jobs:
           }
           exit $code
 
-      - name: DBG list server tests (temporary)
+      - name: DBG run one server test (temporary)
         shell: pwsh
+        working-directory: crates/aetherlink-server
         run: |
-          $log = Join-Path $env:RUNNER_TEMP "list.log"
-          cargo test -p aetherlink-server --test resilience --no-run 2>&1 | Tee-Object -FilePath $log
-          Select-String -Path $log -Pattern 'resilience' | Select-Object -First 4 |
-            ForEach-Object { "::error::list: $($_.Line)" }
+          $log = Join-Path $env:RUNNER_TEMP "one.log"
+          cargo test --test resilience handshake_deadline_does_not_leak_into_the_served_stream -- --nocapture 2>&1 |
+            Tee-Object -FilePath $log | Out-Null
+          "::error::one-exit=$LASTEXITCODE"
+          Select-String -Path $log -Pattern 'panicked|assertion|left:|right:|Error|WouldBlock|TimedOut|test result' |
+            Select-Object -First 12 | ForEach-Object { "::error::one: $($_.Line.Trim())" }
 
       - name: Full Rust workspace tests (Windows)
         shell: pwsh
