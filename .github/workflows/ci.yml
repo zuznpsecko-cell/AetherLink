@@ -33,14 +33,11 @@ jobs:
         # nothing about *what* to fix. Format in place, show the diff, then
         # fail: the annotation carries the fix instructions.
         run: |
-          echo "::error::FMT_MARK_START ref=$(git rev-parse --short HEAD) branch=$(git rev-parse --abbrev-ref HEAD)"
-          cargo fmt --all; rc=$?
-          echo "::error::FMT_MARK_RAN rc=$rc"
+          cargo fmt --all
           if git diff --quiet; then
             echo "::notice::formatting clean"
             exit 0
           fi
-          echo "::error::FMT_MARK_DIRTY"
           # Plain `::error::` lines, one per file: the same form the clippy
           # step uses. (Annotated forms with `title=` and percent-encoding are
           # silently dropped here, and so are oversized messages.)

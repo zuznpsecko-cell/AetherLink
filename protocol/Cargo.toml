@@ -7,7 +7,6 @@ description = "AetherLink protocol specifications and golden tests"
 
 [dependencies]
 serde = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]
 aetherlink-crypto = { path = "../crates/aetherlink-crypto" }
