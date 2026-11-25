@@ -90,11 +90,16 @@ jobs:
         shell: pwsh
         # Same rationale as the Linux step: surface the diff, not a bare exit 1.
         run: |
+          # `if (git diff --quiet)` tests the command's *output* (always empty),
+          # not its exit code -- so that form reported "dirty" unconditionally.
+          # Ask git for the code explicitly, with EOL conversion pinned off so
+          # a CRLF checkout cannot masquerade as a formatting change.
           cargo fmt --all
-          if (git diff --quiet) { "::notice::formatting clean"; exit 0 }
+          git -c core.autocrlf=false diff --quiet
+          if ($LASTEXITCODE -eq 0) { "::notice::formatting clean"; exit 0 }
           # Plain `::error::` per file, like the clippy step: `title=` forms
           # are silently dropped here.
-          foreach ($f in @(git diff --name-only | Select-Object -First 20)) {
+          foreach ($f in @(git -c core.autocrlf=false diff --name-only | Select-Object -First 20)) {
             "::error::needs rustfmt: $f"
           }
           exit 1
