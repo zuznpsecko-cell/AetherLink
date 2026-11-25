@@ -18,8 +18,123 @@ mod wire_help;
 
 const PSK: &[u8] = b"phase-i2-test-psk-32-bytes-long!!!";
 
+/// How the test writes `key.pem`.
+#[derive(Clone, Copy)]
+enum KeyPem {
+    /// `BEGIN PRIVATE KEY` (what rcgen emits).
+    Pkcs8,
+    /// `BEGIN EC PRIVATE KEY` (RFC 5915), as written by
+    /// `openssl ecparam -genkey` and many ACME clients.
+    Sec1,
+}
+
 /// Test server with real PEM files + static root in a temp dir.
 fn test_server(listen: &str, static_body: &[u8]) -> aetherlink_server::Server {
+    test_server_with_key(listen, static_body, KeyPem::Pkcs8)
+}
+
+/// Read one DER TLV: `(tag, contents, rest)`. Test-only, trusts its input.
+fn der_tlv(buf: &[u8]) -> (u8, &[u8], &[u8]) {
+    let tag = buf[0];
+    let (len, hdr) = if buf[1] & 0x80 == 0 {
+        (buf[1] as usize, 2)
+    } else {
+        let n = (buf[1] & 0x7F) as usize;
+        let len = buf[2..2 + n]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | b as usize);
+        (len, 2 + n)
+    };
+    (tag, &buf[hdr..hdr + len], &buf[hdr + len..])
+}
+
+/// Encode one DER TLV (definite length; short or long form).
+fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = contents.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes: Vec<u8> = len
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|&b| b == 0)
+            .collect();
+        out.push(0x80 | bytes.len() as u8);
+        out.extend_from_slice(&bytes);
+    }
+    out.extend_from_slice(contents);
+    out
+}
+
+/// Turn a PKCS#8 EC key into the standalone SEC1 `ECPrivateKey` that
+/// `openssl ec` / `openssl ecparam -genkey` write.
+///
+/// PKCS#8 = SEQUENCE { version, algorithm SEQUENCE { id-ecPublicKey,
+/// namedCurve OID }, privateKey OCTET STRING { ECPrivateKey } }. Inside
+/// PKCS#8 the ECPrivateKey usually omits its `[0] parameters` (the curve is in
+/// the algorithm identifier); a standalone SEC1 file carries it, so it is
+/// re-inserted here: ECPrivateKey = SEQUENCE { version, privateKey,
+/// [0] namedCurve, [1] publicKey }.
+fn pkcs8_to_sec1(pkcs8: &[u8]) -> Vec<u8> {
+    let (tag, info, _) = der_tlv(pkcs8);
+    assert_eq!(tag, 0x30, "PrivateKeyInfo must be a SEQUENCE");
+    let (tag, _version, rest) = der_tlv(info);
+    assert_eq!(tag, 0x02, "version must be an INTEGER");
+    let (tag, algorithm, rest) = der_tlv(rest);
+    assert_eq!(tag, 0x30, "algorithm must be a SEQUENCE");
+    let (tag, _ec_public_key, curve_oid) = der_tlv(algorithm);
+    assert_eq!(tag, 0x06, "algorithm id must be an OID");
+    assert_eq!(curve_oid[0], 0x06, "namedCurve must be an OID");
+    let (tag, embedded, _) = der_tlv(rest);
+    assert_eq!(tag, 0x04, "privateKey must be an OCTET STRING");
+
+    let (tag, ec_key, _) = der_tlv(embedded);
+    assert_eq!(tag, 0x30, "ECPrivateKey must be a SEQUENCE");
+    let (_, _, after_version) = der_tlv(ec_key);
+    let (_, _, after_private) = der_tlv(after_version);
+    if after_private.first() == Some(&0xA0) {
+        return embedded.to_vec(); // parameters already present
+    }
+    let head = &ec_key[..ec_key.len() - after_private.len()];
+    let mut body = head.to_vec();
+    body.extend_from_slice(&der(0xA0, curve_oid));
+    body.extend_from_slice(after_private);
+    der(0x30, &body)
+}
+
+/// Minimal PEM armour (standard base64, 64-column lines).
+fn pem(label: &str, der: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::new();
+    for chunk in der.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &b)| acc | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                b64.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            } else {
+                b64.push('=');
+            }
+        }
+    }
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).expect("ascii"));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
+}
+
+/// Test server whose `key.pem` uses the requested encoding.
+fn test_server_with_key(
+    listen: &str,
+    static_body: &[u8],
+    key_pem: KeyPem,
+) -> aetherlink_server::Server {
     // Unique temp dir: wall-clock nanos collide between parallel tests
     // (same tick -> same dir -> concurrently written cert files read back
     // partial -> bind fails). pid + thread + counter makes it collision-free.
@@ -40,7 +155,14 @@ fn test_server(listen: &str, static_body: &[u8]) -> aetherlink_server::Server {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, key.cert.pem()).expect("cert");
-    std::fs::write(&key_path, key.key_pair.serialize_pem()).expect("key");
+    let key_text = match key_pem {
+        KeyPem::Pkcs8 => key.key_pair.serialize_pem(),
+        KeyPem::Sec1 => pem(
+            "EC PRIVATE KEY",
+            &pkcs8_to_sec1(&key.key_pair.serialize_der()),
+        ),
+    };
+    std::fs::write(&key_path, key_text).expect("key");
     let doc = serde_json::json!({
         "listen": listen,
         "psk": String::from_utf8_lossy(PSK),
@@ -253,4 +375,43 @@ fn bind_rejects_missing_static_root() {
     let mut server = test_server("127.0.0.1:0", b"x");
     server.config.local_static_root = "/nonexistent-aether-root".to_string();
     assert!(server.bind().is_err());
+}
+
+#[test]
+fn bind_accepts_a_sec1_ec_private_key() {
+    // Given: key.pem in SEC1 form (`BEGIN EC PRIVATE KEY`), not PKCS#8. The
+    // server used to re-label the SEC1 body as PKCS#8 and fail at startup.
+    let server = test_server_with_key(
+        "127.0.0.1:0",
+        b"<html><body>SEC1-OK</body></html>",
+        KeyPem::Sec1,
+    );
+    // When: bind loads it
+    let bound = server.bind().expect("bind must accept a SEC1 key");
+    let port = bound.local_addr().expect("local addr").port();
+    let server = std::thread::spawn(move || bound.serve_once());
+
+    // Then: a real TLS handshake completes with that key (a bad preface
+    // afterwards just routes to the static page).
+    let mut stream = client_tls(port);
+    stream.write_all(&[0xFF]).expect("bad preface");
+    stream.flush().expect("flush");
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    assert!(
+        String::from_utf8_lossy(&resp).contains("SEC1-OK"),
+        "static page over a SEC1-keyed TLS session"
+    );
+    assert_eq!(server.join().expect("server thread"), Path::Static);
+}
+
+#[test]
+fn test_pem_helper_matches_rcgen_pkcs8_armour() {
+    // Guard for the helper above: re-armouring rcgen's own PKCS#8 DER must
+    // reproduce rcgen's PEM, so the SEC1 test fails on the server, not on a
+    // broken base64 encoder.
+    let key = rcgen::KeyPair::generate().expect("key");
+    let ours = pem("PRIVATE KEY", &key.serialize_der());
+    let theirs = key.serialize_pem().replace("\r\n", "\n");
+    assert_eq!(ours.trim(), theirs.trim());
 }

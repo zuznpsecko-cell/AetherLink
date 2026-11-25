@@ -16,6 +16,11 @@ internal static partial class Native
     [LibraryImport(Lib)]
     internal static partial int aether_server_stop(nuint handle);
 
+    // 1 = serving, 0 = the accept loop ended by itself (reason in
+    // aether_last_error), negative = invalid handle.
+    [LibraryImport(Lib)]
+    internal static partial int aether_server_is_running(nuint handle);
+
     // The core returns a pointer into its thread-local error buffer: valid
     // until the next FFI call on this thread, owned by the core — copy the
     // text, never free the pointer. (Marshalling it as `string` would make
@@ -47,6 +52,28 @@ internal sealed class AetherServer : IDisposable
         _handle = handle;
     }
 
+    /// <summary>
+    /// False once the core's accept loop has stopped on its own (the listener
+    /// failed); <paramref name="reason"/> then carries the core's error text.
+    /// </summary>
+    public bool IsServing(out string reason)
+    {
+        reason = string.Empty;
+        if (_handle == nuint.Zero)
+        {
+            reason = "server not started";
+            return false;
+        }
+
+        if (Native.aether_server_is_running(_handle) == 1)
+        {
+            return true;
+        }
+
+        reason = Native.LastError();
+        return false;
+    }
+
     public void Dispose()
     {
         if (_handle != nuint.Zero)
@@ -70,6 +97,19 @@ internal static class Program
 
         using var done = new ManualResetEventSlim(false);
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; done.Set(); };
-        done.Wait();
+
+        // Watch the core while waiting: if the listener dies, exit non-zero so
+        // the supervisor (systemd Restart=on-failure, a Windows service
+        // recovery action) restarts us. Idling here would leave a process that
+        // looks healthy but accepts nothing.
+        while (!done.Wait(TimeSpan.FromSeconds(1)))
+        {
+            if (!server.IsServing(out var reason))
+            {
+                Console.Error.WriteLine($"AetherLink server stopped: {reason}");
+                Environment.ExitCode = 1;
+                return;
+            }
+        }
     }
 }

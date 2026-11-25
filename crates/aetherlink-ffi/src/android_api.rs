@@ -6,14 +6,15 @@
 //! lives here so it is testable on a plain host without a device, a JNI VM or
 //! a `VpnService`.
 //!
-//! Handles live in the shared [`crate::HANDLES`] map, so the C ABI and the
+//! Handles live in the shared handle table ([`crate::handles`]), so the C ABI and the
 //! Android host see the same clients. Error text goes to the same slot as the
 //! C ABI; Kotlin reads it through `lastError()`.
 
 use aetherlink_client::lifecycle::SocketHandle;
 use aetherlink_client::{Client, ClientError};
 
-use crate::{AetherError, HANDLES};
+use crate::handles::{handles, CheckoutError, FreeOutcome, Lease, Teardown};
+use crate::AetherError;
 
 /// Error code returned across the FFI boundary (`AetherError` as `i32`).
 pub type Code = i32;
@@ -42,23 +43,21 @@ pub fn create(config_json: &str) -> usize {
             return 0;
         }
     };
-    HANDLES.lock().expect("handles").insert_client(client)
+    handles().insert_client(client)
 }
 
 /// `clientPlan`: the `VpnService.Builder` document for a live handle.
 pub fn plan(handle: usize) -> Result<String, Code> {
     crate::clear_last_error();
     // Out of the map for the duration of the call: the plan document reads
-    // platform state, and holding `HANDLES` across it would serialise every
+    // platform state, and holding the handle table lock across it would serialise every
     // other handle in the process (see DEC-019).
-    let Some(client) = HANDLES.lock().expect("handles").take_client(handle) else {
-        return Err(invalid_handle("clientPlan"));
+    let mut lease = match Lease::checkout(handle, Teardown::Android) {
+        Ok(lease) => lease,
+        Err(e) => return Err(checkout_failed("clientPlan", e)),
     };
-    let outcome = client.android_plan();
-    HANDLES
-        .lock()
-        .expect("handles")
-        .return_client(handle, client);
+    let outcome = lease.client().android_plan();
+    lease.finish();
     outcome.map_err(|e| {
         crate::set_last_error(&format!("clientPlan: {e}"));
         AetherError::InternalError as Code
@@ -68,14 +67,12 @@ pub fn plan(handle: usize) -> Result<String, Code> {
 /// `clientStatus`: the status document for a live handle.
 pub fn status(handle: usize) -> Result<String, Code> {
     crate::clear_last_error();
-    let Some(client) = HANDLES.lock().expect("handles").take_client(handle) else {
-        return Err(invalid_handle("clientStatus"));
+    let mut lease = match Lease::checkout(handle, Teardown::Android) {
+        Ok(lease) => lease,
+        Err(e) => return Err(checkout_failed("clientStatus", e)),
     };
-    let outcome = client.android_status();
-    HANDLES
-        .lock()
-        .expect("handles")
-        .return_client(handle, client);
+    let outcome = lease.client().android_status();
+    lease.finish();
     outcome.map_err(|e| {
         crate::set_last_error(&format!("clientStatus: {e}"));
         AetherError::InternalError as Code
@@ -98,14 +95,14 @@ pub fn connect(handle: usize, protector: Option<Protector<'_>>) -> Code {
     // This runs TCP connect + TLS handshake + AUTH with the server. Holding
     // the global handle lock across it used to freeze every other handle in
     // the host process for the duration of the network round trip.
-    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle) else {
-        return invalid_handle("clientConnect");
+    let mut lease = match Lease::checkout(handle, Teardown::Android) {
+        Ok(lease) => lease,
+        Err(e) => return checkout_failed("clientConnect", e),
     };
-    let outcome = client.android_connect(None, |raw| protect_with(protector, raw));
-    HANDLES
-        .lock()
-        .expect("handles")
-        .return_client(handle, client);
+    let outcome = lease
+        .client()
+        .android_connect(None, |raw| protect_with(protector, raw));
+    lease.finish();
     match outcome {
         Ok(()) => AetherError::Success as Code,
         Err(e) => {
@@ -131,14 +128,12 @@ pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
         crate::set_last_error(&format!("clientAttachTun: invalid mtu {mtu}"));
         return AetherError::InvalidArgument as Code;
     }
-    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle) else {
-        return invalid_handle("clientAttachTun");
+    let mut lease = match Lease::checkout(handle, Teardown::Android) {
+        Ok(lease) => lease,
+        Err(e) => return checkout_failed("clientAttachTun", e),
     };
-    let outcome = attach_tun(&mut client, fd, mtu);
-    HANDLES
-        .lock()
-        .expect("handles")
-        .return_client(handle, client);
+    let outcome = attach_tun(lease.client(), fd, mtu);
+    lease.finish();
     match outcome {
         Ok(()) => AetherError::Success as Code,
         Err(msg) => {
@@ -151,14 +146,12 @@ pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
 /// `clientDisconnect`: stop the pump and release the transport.
 pub fn disconnect(handle: usize) -> Code {
     crate::clear_last_error();
-    let Some(mut client) = HANDLES.lock().expect("handles").take_client(handle) else {
-        return invalid_handle("clientDisconnect");
+    let mut lease = match Lease::checkout(handle, Teardown::Android) {
+        Ok(lease) => lease,
+        Err(e) => return checkout_failed("clientDisconnect", e),
     };
-    let outcome = client.android_disconnect();
-    HANDLES
-        .lock()
-        .expect("handles")
-        .return_client(handle, client);
+    let outcome = lease.client().android_disconnect();
+    lease.finish();
     match outcome {
         Ok(()) => AetherError::Success as Code,
         Err(e) => {
@@ -170,11 +163,18 @@ pub fn disconnect(handle: usize) -> Code {
 
 /// `clientFree`: disconnect and drop the handle. Idempotent by contract —
 /// the host may free twice after a crash/restart path.
+///
+/// A free that races an in-flight call (e.g. `clientConnect` still in its
+/// TLS handshake) is deferred: the handle is invalid at once and the
+/// in-flight call disconnects the client when it returns. It used to report
+/// success here while the in-flight call put the client back afterwards — a
+/// "freed" handle that kept its live transport.
 pub fn free(handle: usize) -> Code {
     crate::clear_last_error();
-    let client = HANDLES.lock().expect("handles").remove_client(handle);
-    if let Some(mut client) = client {
-        let _ = client.android_disconnect();
+    let outcome = handles().request_free(handle, Teardown::Android);
+    if let FreeOutcome::Freed(mut client) = outcome {
+        crate::handles::tear_down(&mut client, Teardown::Android);
+        crate::forget_staged(handle);
     }
     // Unknown handle: still success. The end state (no client) is what the
     // host asked for; an error here would only make teardown noisier.
@@ -187,9 +187,19 @@ pub fn last_error() -> Option<String> {
     crate::last_error_text()
 }
 
-fn invalid_handle(operation: &str) -> Code {
-    crate::set_last_error(&format!("{operation}: invalid client handle"));
-    AetherError::InvalidHandle as Code
+fn checkout_failed(operation: &str, err: CheckoutError) -> Code {
+    match err {
+        CheckoutError::Invalid => {
+            crate::set_last_error(&format!("{operation}: invalid client handle"));
+            AetherError::InvalidHandle as Code
+        }
+        CheckoutError::Busy => {
+            crate::set_last_error(&format!(
+                "{operation}: client handle is busy with another call, retry"
+            ));
+            AetherError::Busy as Code
+        }
+    }
 }
 
 fn code_of(error: &ClientError) -> Code {

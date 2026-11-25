@@ -137,11 +137,13 @@ TLS fidelity: в **Rust core** (единый TLS-профиль на весь da
 aether_version()
 aether_server_start(config_json) -> handle
 aether_server_stop(handle)
+aether_server_is_running(handle) -> 1/0  // 0 = listener умер сам, причина в last_error
 aether_client_create(config_json) -> handle
 aether_client_up(handle) -> error
 aether_client_down(handle) -> error
 aether_client_status(handle, out_json)
 aether_client_force_cleanup()  // idempotent, после краша
+aether_client_free(handle)     // во время другого вызова — отложенный, см. DEC-024
 
 // routing rules
 aether_client_rules_list / set / reload
