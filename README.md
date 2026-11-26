@@ -2,10 +2,25 @@
 
 VPN with userspace netstack. Single Rust core + thin FFI hosts (.NET/Android).
 
+## Platform support
+
+| Component | Windows | Linux | Android |
+|-----------|---------|-------|---------|
+| Server (`AetherLink.Server`) | ✅ runs | ✅ runs (systemd, `docs/DEPLOY_UBUNTU.md`) | — |
+| Desktop client (CLI + GUI) | ✅ runs (Wintun, live-tested against a VPS) | ❌ not yet: `/dev/net/tun` open is not implemented | — |
+| Android client | — | — | 🔄 core + JNI ready; Kotlin host is a skeleton, no tunnel on a device yet |
+
 ## Run (server + client)
 
 Windows (client elevated): `.\scripts\run_server_windows.ps1`, `.\scripts\run_client_windows.ps1`
-Ubuntu: `./scripts/run_server_ubuntu.sh`, `sudo ./scripts/run_client_ubuntu.sh`
+
+Ubuntu: `./scripts/run_server_ubuntu.sh` runs the server. The client script
+`sudo ./scripts/run_client_ubuntu.sh` exists, but the client stops at `tun open`
+on Linux (TUN is Windows-only for now), so use a Windows client.
+
+The server reads its TLS key as PKCS#8 (`BEGIN PRIVATE KEY`), PKCS#1
+(`BEGIN RSA PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`). If the listener
+dies, the host exits with code 1 so systemd restarts it (DEC-024).
 
 ## GUI client (Windows, Avalonia)
 
@@ -30,9 +45,13 @@ old single-server configs migrate to a `default` profile. Logs:
 
 ## Android client
 
-Two screens: server settings + Connect, and an app picker (empty list = all
-apps in the tunnel, non-empty = allowlist). Thin Kotlin host over the same
-Rust core; no crypto or frame parsing in Kotlin.
+**Status: Rust side ready, Kotlin host is a skeleton.** The core already plans
+the Android interface, split tunneling, `VpnService.protect()`-ed connect and
+TUN attach, all exported over JNI. The Kotlin app has no Activity yet, passes
+handle `0` and calls the desktop path, so it does not tunnel. Target design
+(PLAN_ANDROID Phase 3+): two screens, server settings + Connect and an app
+picker (empty list = all apps in the tunnel, non-empty = allowlist). Thin host:
+no crypto or frame parsing in Kotlin.
 
 ```powershell
 .\scripts\build_android.ps1        # cargo-ndk for 3 ABIs + assembleDebug
@@ -81,7 +100,34 @@ id** (new generation). Only the latter resets the flow: the former is ignored,
 so a duplicate OPEN no longer restarts a live stream, its replay window or its
 relay. Rationale: DEC-020 in `docs/DECISIONS.md`.
 
+## FFI contract (for host authors)
+
+Hosts (.NET, Kotlin) talk to `aetherlink_core` through a C ABI
+(`crates/aetherlink-ffi/src/lib.rs`) and JNI (`jni.rs`). Rules (DEC-024):
+
+- Every export is wrapped in a panic guard: a Rust panic returns
+  `InternalError` (-8) with the message in `aether_last_error`, it never
+  unwinds into the host.
+- Return codes: `0` Success, `-1` InvalidHandle, `-2` InvalidConfig,
+  `-3` AlreadyRunning, `-4` NotRunning, `-5` NetworkError, `-6` DnsError,
+  `-7` AuthError, `-8` InternalError, `-9` InvalidArgument,
+  `-10` PermissionDenied, `-11` StaleState (leftover state file: call
+  `aether_client_force_cleanup`, retry once), `-12` Busy (another call on the
+  same handle is in flight; the handle is valid, retry later).
+- `aether_client_free` during an in-flight call is deferred: the handle is
+  invalid at once, the running call tears the client down when it returns,
+  and `free` still returns Success.
+- `aether_server_is_running` returns `1` while serving and `0` once the
+  listener has died (reason in `aether_last_error`); hosts poll it and exit
+  non-zero.
+
 ## Known limitations
+
+- **Desktop client is Windows-only.** The Linux TUN backend is not
+  implemented (`TunInterface::open` returns an error off Windows).
+- **TLS fingerprint is rustls defaults.** Phase T (golden TLS profile,
+  fallback-shape tests, DEC-012) is not done. ALPN: the client offers
+  `h2,http/1.1`, the server only `http/1.1` (DEC-007 amendment).
 
 - **IPv4 only.** IPv6 targets are parsed but dropped: dial targets are built as
   `"{addr}:{port}"`, which is not a valid IPv6 literal.
@@ -90,7 +136,7 @@ relay. Rationale: DEC-020 in `docs/DECISIONS.md`.
 - **`kill_switch` and `restore_on_exit` are parsed but not enforced** by the
   core; the GUI hosts the YAML keys, the tunnel does not act on them.
 - **Android host is not wired end-to-end** (`AetherVpnService` passes handle 0;
-  `clientConnect`/`clientAttachTun` are not called from Kotlin).
+  `clientConnect`/`clientAttachTun` are not called from Kotlin; no Activity).
 - **Egress policy is address-based, not a full allowlist.** `deny_private`
   (default on) keeps the server off loopback, LAN, link-local and cloud
   metadata; `allow`/`deny` CIDRs cover the exceptions. It does not restrict
@@ -115,12 +161,23 @@ CI (`.github/workflows/ci.yml`) runs, cheapest first: `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
 (Linux **and** Windows), `dotnet test` for the GUI suite, the contract scripts
 and a `cargo audit` report. Rationale and the measured before/after: DEC-023.
+All of these are green on `main` and block PRs; `cargo audit` is advisory.
+Not covered by CI: the Android build (no NDK/SDK in the runner) and anything
+live (TUN, a real VPS).
 
 Locally: `cargo fmt --all`, `cargo clippy --workspace --all-targets`,
 `scripts/check_thin_hosts.ps1`, `scripts/check_gui_endpoints.ps1`,
 `scripts/check_quickstart.ps1`, `scripts/check_android_build.ps1`.
 
-Docs: `PLAN_FINAL_TDD.md` (live plan), `PLAN_ANDROID.md` (Android plan),
-`PLAN_ENDPOINTS_WINDOWS.md` (Windows endpoint plan), `docs/WINDOWS_GUI.md`
-(GUI + TDD log), `docs/ANDROID.md` (Android TDD log), `docs/DECISIONS.md`,
-`docs/STATUS.md`.
+## Docs
+
+| Document | What it is |
+|----------|------------|
+| `docs/STATUS.md` | Current state by phase, test counts, next steps |
+| `docs/LIVE_ISSUES.md` | Live-run journal: open and closed problems with evidence |
+| `docs/DECISIONS.md` | Architecture decisions DEC-001…DEC-024 |
+| `docs/DEPLOY_UBUNTU.md` | Server on Ubuntu: certificate, systemd, troubleshooting |
+| `docs/WINDOWS_GUI.md` | Windows GUI: usage, endpoint profiles, TDD log |
+| `docs/ANDROID.md` | Android: build, current limitations, TDD log |
+| `docs/LIVE_W4.md` | Live Windows runbook (W4) and its results |
+| `PLAN_*.md` | Plans (status banner at the top of each); `PLAN_TDD.md` is historical |
