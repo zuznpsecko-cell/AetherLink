@@ -1,5 +1,11 @@
 # AetherLink v1.5 — TDD Development Plan
 
+> **Исторический документ.** Это исходный план v1.5. Его сменил
+> [`PLAN_FINAL_TDD.md`](PLAN_FINAL_TDD.md), а актуальное состояние ведётся в
+> [`docs/STATUS.md`](docs/STATUS.md). Отличия от этого плана зафиксированы в
+> [`docs/DECISIONS.md`](docs/DECISIONS.md) (например, протокол v2 — DEC-014/DEC-016,
+> ALPN сервера только `http/1.1` — DEC-007). Текст ниже не обновляется.
+
 ## Общая стратегия TDD
 
 **Red → Green → Refactor:**

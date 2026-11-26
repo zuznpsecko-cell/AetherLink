@@ -1,7 +1,8 @@
 # Windows GUI: endpoint profiles
 
-Статус: **Phase 1–3 закрыты** (код, тесты, гейты); Phase 4 — ручная приёмка
-на живых серверах (требует admin и реальные PSK). План и матрица приёмки:
+Статус: **Phase 1–3 закрыты** (код, тесты, гейты); `dotnet test` GUI (49 тестов)
+и `check_gui_endpoints.ps1` блокируют PR в CI (DEC-023). Phase 4 — ручная приёмка
+на живых серверах (требует admin и реальные PSK) — **не выполнена**. План и матрица приёмки:
 [`PLAN_ENDPOINTS_WINDOWS.md`](../PLAN_ENDPOINTS_WINDOWS.md).
 
 GUI умеет несколько профилей подключения (эндпоинтов): добавление,
@@ -127,8 +128,13 @@ routing: { ... }       # общее для всех профилей
 - PSK хранится в plaintext-YAML, как и раньше; в GUI он не логируется и не
   попадает в сообщения об ошибках, но и не шифруется at rest.
 - PSK выбранного профиля намеренно продублирован в YAML (список + зеркало).
-- Профили принадлежат Windows GUI. Core, FFI и CLI не менялись и видят один
-  сервер через зеркало; `client.endpoints` — host-only состояние.
+- Профили принадлежат Windows GUI. Core, FFI и CLI видят один сервер через
+  зеркало; `client.endpoints` — host-only состояние.
+- Новый FFI-код `-12 Busy` (DEC-024: вызов на занятом handle) GUI явно не
+  обрабатывает, и на практике он недостижим: `up`/`down`/cleanup
+  сериализованы `_opGate`, опрос статуса стартует после успешного `up` и
+  останавливается до `down`. Если опрос всё же получит ненулевой код, он
+  просто пропускает такт (2 с).
 - Android пока не умеет профили: это отдельный этап после живого теста.
 - Переименование выбранного профиля сохраняется при потере фокуса/переключении,
   отдельной кнопки «Save» нет.
@@ -181,8 +187,8 @@ E3 UI+gates | dotnet build -c Release; dotnet test -c Release; check_gui_endpoin
 - `dotnet test` в Debug: 49/49 (150 ms), в Release: 49/49 (403 ms).
 - `cargo test -p aetherlink-client --test config_schema`: 3/3 passed.
 - Полные `cargo fmt --check` / `clippy -D warnings` / `cargo test --workspace`
-  имеют известные pre-existing падения (см. `docs/ANDROID.md`,
-  `docs/LIVE_ISSUES.md`); в этой итерации Rust-код не менялся, кроме
-  characterization-теста.
+  на момент этой итерации имели известные pre-existing падения; позже эти
+  долги закрыты, и все три гейта зелёные и блокирующие в CI (DEC-023). В этой
+  итерации Rust-код не менялся, кроме characterization-теста.
 - Ручной smoke GUI (`--minimized`) и живые переключения не выполнялись: нужен
   admin и реальные PSK (см. матрицу выше).

@@ -1,6 +1,27 @@
 # Android-клиент AetherLink
 
-Статус: **Phase 1 закрыта** (host core, TDD); дальше Phase 2 (FFI/JNI). План: [`PLAN_ANDROID.md`](../PLAN_ANDROID.md).
+Статус: **Rust-часть готова, Kotlin-хост — каркас.** План: [`PLAN_ANDROID.md`](../PLAN_ANDROID.md).
+
+| Слой | Состояние |
+|---|---|
+| Ядро для Android (Phase 1: план интерфейса, split, `connect_protected`, `AndroidTun`, cleanup, inline CA) | ✅ готово, тесты на хосте (журнал ниже) |
+| FFI/JNI (`crates/aetherlink-ffi/src/android_api.rs`, `jni.rs`) | ✅ 13 JNI-функций: `clientCreate/Plan/Connect/AttachTun/Status/Disconnect/Free/Up/Down`, `setTunFd`, `setSplitConfig`, `forceCleanup`, `lastError`; panic-safe, отложенный `clientFree` (DEC-024) |
+| Kotlin-хост (`apps/android`) | ⏳ каркас: только `AetherCore.kt` и `AetherVpnService.kt`, нет Activity/экранов/хранилища конфига |
+| Сквозной туннель на устройстве | ❌ не работает (см. «Текущие ограничения») |
+
+### Текущие ограничения
+
+- `AetherVpnService` передаёт в ядро handle `0` (настоящий из `clientCreate`
+  не получается) и зовёт `setTunFd` + `clientUp` — десктопный путь, а не
+  Android-поток `clientConnect` (с `VpnService.protect()`) → `clientAttachTun`.
+- `AetherCore.kt` объявляет 6 из 13 JNI-функций; `clientConnect`,
+  `clientAttachTun`, `clientPlan`, `clientStatus`, `clientDisconnect`,
+  `clientFree`, `lastError` из Kotlin не вызываются.
+- В манифесте нет Activity с `LAUNCHER`, нет `VpnService.prepare()` и
+  `startForeground()`; сервис возвращает `START_STICKY`.
+- `scripts/check_android_host.ps1` — RED-гейт целевой формы хоста; он
+  ожидаемо красный, пока Phase 2+ из плана не выполнены.
+- Сборка Android в CI не гейтится (в раннере нет NDK/SDK).
 
 ## Сборка
 
@@ -35,20 +56,25 @@ Robolectric/androidx.test не резолвятся.
 
 ```powershell
 adb install -r apps\android\app\build\outputs\apk\debug\app-debug.apk
-adb shell am start -n link.aether.client/.MainActivity
 ```
 
-## Конфиг
+Запускать пока нечего: Activity (`MainActivity`) в APK ещё нет, она
+появится вместе с UI (Phase 3 плана). Установка проверяет только, что APK
+собран и ставится.
 
-Сервер, SNI, PSK и CA вводятся в главном окне и сохраняются в
+## Конфиг (целевое поведение, ещё не реализовано)
+
+Ядро уже принимает `client.tls.ca_pem` (P1-R9) и `android.split` (P1-R4);
+UI ниже — план Phase 3. Сервер, SNI, PSK и CA будут вводиться в главном окне и сохраняются в
 `SharedPreferences` (PSK — private mode; не шифруется). CA — PEM внутреннего
 CA (`ca-cert.pem`); системное хранилище Android клиенту недоступно, поэтому
 `client.tls.ca_pem` добавляется к системным и webpki-корням. Проверка
 сертификата не отключается: сертификат от другого CA по-прежнему отвергается.
 
-## Split tunneling
+## Split tunneling (целевое поведение)
 
-Два экрана: главное окно и «Приложения».
+Режимы ниже ядро уже планирует (`android_plan`, P1-R2/R3); экранов в
+приложении пока нет. Два экрана: главное окно и «Приложения».
 
 - список приложений пуст → весь трафик в туннеле (`mode: all`);
 - выбраны приложения → через туннель только они (`mode: allow`);
@@ -64,7 +90,9 @@ CA (`ca-cert.pem`); системное хранилище Android клиенту
 - **Gradle качает дистрибутив** — первый запуск wrapper скачивает Gradle 8.10.2.
 - **`NativeCommandError` от cargo** — скрипт уже гоняет нативные команды через
   `cmd /c`; если вызываете cargo вручную, используйте `cmd /c "cargo ..."`.
-- **VPN не поднимается** — проверьте согласие VPN и `adb logcat | Select-String aether`.
+- **VPN не поднимается** — ожидаемо в текущем состоянии хоста (см. «Текущие
+  ограничения»). Когда хост будет доведён: согласие VPN и
+  `adb logcat | Select-String aether`.
 
 ## TDD log
 
@@ -89,3 +117,8 @@ P1-R8 host-aware cleanup | cargo test -p aetherlink-client --test cleanup_androi
 P1-R9 inline CA PEM | cargo test -p aetherlink-core --test tls_ca | RED: E0425 `system_client_config_with_ca` not found (4 вызова) | GREEN: 4 passed — приватный CA из `ca_pem` подтверждает свой сервер (TLS1.3 handshake + данные), чужой приватный CA отвергается (`TlsError`), desktop без CA тоже его не принимает, битый/пустой PEM → `ConfigError`, `with_ca(None)` эквивалентен `system_client_config()`. CA аддитивный (native + webpki + `ca_pem`), `dangerous()` не используется: доверие доказывается поведением, а не grep'ом; при заданном CA недоступный native-store не фатален (webpki + CA). Клиентский connect передаёт `config.tls_ca_pem`. Правка теста: второе рукопожатие требует новый listener | red: 3dd4985 green: 9aedf76
 G1 host-core gate | cargo test --workspace --no-fail-fast -- --skip infinite_fast_download_aborted_by_rst_immediately_allows_upload; cargo ndk --platform 26 -t arm64-v8a check -p aetherlink-core -p aetherlink-client -p aetherlink-netstack -p aetherlink-ffi; cargo clippy --workspace --all-targets; cargo fmt --check | RED: n/a (gate) | GREEN: test — 318 passed, 0 failed (вечный e2e-тест пропущен как baseline P0-R3); ndk check — 4 крейта Finished; clippy — 88 warnings, ровно baseline, в новых файлах 0; fmt — падает только на baseline-файлах (`threads.rs`, `client_tcp.rs`, `pump_tls.rs`, `accept.rs`), долг P6-R0/G0. P1-R1…R9 закрыты; desktop-путь (connect/up/down/cleanup) зелёный | green: 9aedf76
 ```
+
+Примечание к G1: долги baseline, перечисленные в P0-R3 и G1 (88 предупреждений
+clippy, `cargo fmt --check` на старых файлах, вечный e2e-тест), позже закрыты:
+fmt/clippy `-D warnings`/`cargo test --workspace` зелёные и блокирующие в CI
+(DEC-023, `docs/LIVE_ISSUES.md` «Android TDD baseline»).

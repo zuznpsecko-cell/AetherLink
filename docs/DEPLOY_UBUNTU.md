@@ -1,6 +1,9 @@
-# DEPLOY_UBUNTU — сервер AetherLink на VPS (selmedia.ru)
+# DEPLOY_UBUNTU — сервер AetherLink на VPS
 
 Пошагово, с нуля, под root. Итог: `systemctl`-сервис на 443 с wildcard-сертом.
+
+> В примерах домен — `vpn.example.com`; подставьте свой. Скрипты берут домен
+> из `DOMAIN=` (или первого аргумента), в конфиги он не зашит.
 
 ## -1. Одна команда (рекомендуется)
 
@@ -14,16 +17,15 @@ bash <(curl -Ls https://raw.githubusercontent.com/zuznpsecko-cell/AetherLink/mai
 Без токена — self-signed серт. Полностью неинтерактивно:
 
 ```bash
-DOMAIN=selmedia.ru CLOUDFLARE_API_TOKEN=xxx bash <(curl -Ls <url>) --yes
+DOMAIN=vpn.example.com CLOUDFLARE_API_TOKEN=xxx bash <(curl -Ls <url>) --yes
 ```
 
-Домен задаётся параметром (`DOMAIN=`), жесткой привязки к `selmedia.ru` в
-скриптах нет. Ниже — те же шаги вручную, по частям.
+Ниже — те же шаги вручную, по частям.
 
 ## 0. Что нужно заранее
 
 - VPS: Ubuntu 22.04/24.04, root-доступ по SSH.
-- DNS: A-запись `selmedia.ru` → IP VPS, режим **DNS-only (серое облако)**.
+- DNS: A-запись `vpn.example.com` → IP VPS, режим **DNS-only (серое облако)**.
   Оранжевое (proxied) нельзя: клиенты упрутся в edge Cloudflare, а не в наш сервер.
 - Порт **443/TCP** наружу (UDP для транспорта не нужен — всё внутри TLS).
 
@@ -60,15 +62,15 @@ ssh root@vps "mkdir -p /tmp/aetherlink && tar -xzf /tmp/aetherlink-ubuntu-*.tar.
 ## 2. Сертификат (один раз)
 
 Токен Cloudflare: dashboard → My Profile → API Tokens → Create Token →
-шаблон «Edit zone DNS», зона `selmedia.ru`.
+шаблон «Edit zone DNS», зона `vpn.example.com`.
 
 ```bash
 echo 'dns_cloudflare_api_token = TOKEN' | sudo tee /etc/letsencrypt/cloudflare.ini
 sudo chmod 600 /etc/letsencrypt/cloudflare.ini
-sudo ./scripts/provision_cert_ubuntu.sh
+sudo DOMAIN=vpn.example.com ./scripts/provision_cert_ubuntu.sh
 ```
 
-Проверка: `sudo openssl x509 -in /etc/letsencrypt/live/selmedia.ru-wildcard/fullchain.pem -noout -subject -dates`
+Проверка: `sudo openssl x509 -in /etc/letsencrypt/live/vpn.example.com-wildcard/fullchain.pem -noout -subject -dates`
 
 ## 3. Конфиг сервера
 
@@ -81,13 +83,21 @@ nano server.yaml
 - `server.listen: "0.0.0.0:443"`, `server.psk` — сгенерировать:
   `openssl rand -base64 32` (тот же PSK потом в клиент!);
 - `local_static_root` — оставить `./fallback` (создастся сам);
-- `dns_upstream` — по умолчанию `1.1.1.1`/`8.8.8.8`, можно не трогать.
+- `dns_upstream` — по умолчанию `1.1.1.1`/`8.8.8.8`, можно не трогать;
+- `max_connections` (512), `max_streams` (4096), `egress` (`deny_private: true`)
+  и блоклист рекламы — разумные значения по умолчанию, описаны прямо в
+  `configs/server.example.yaml`.
+
+Ключ (`tls_key`) принимается в любом из PEM-форматов: PKCS#8
+(`BEGIN PRIVATE KEY`), PKCS#1 (`BEGIN RSA PRIVATE KEY`) или SEC1
+(`BEGIN EC PRIVATE KEY`) — конвертировать ключ certbot или openssl не нужно
+(DEC-024).
 
 ## 4. Сборка, установка, автозапуск
 
 ```bash
-TLS_CERT=/etc/letsencrypt/live/selmedia.ru-wildcard/fullchain.pem \
-TLS_KEY=/etc/letsencrypt/live/selmedia.ru-wildcard/privkey.pem \
+TLS_CERT=/etc/letsencrypt/live/vpn.example.com-wildcard/fullchain.pem \
+TLS_KEY=/etc/letsencrypt/live/vpn.example.com-wildcard/privkey.pem \
 ./scripts/run_server_ubuntu.sh server.yaml   # smoke: Ctrl+C после старта
 sudo ./deploy/linux/install.sh               # → /opt/aetherlink + unit
 sudo ufw allow 443/tcp
@@ -99,17 +109,25 @@ sudo systemctl enable --now aetherlink-server
 ```bash
 systemctl status aetherlink-server --no-pager
 journalctl -u aetherlink-server -n 30 --no-pager
-echo | openssl s_client -connect selmedia.ru:443 -servername selmedia.ru \
-  -tls1_3 -alpn h2 2>/dev/null | openssl x509 -noout -subject -dates
+echo | openssl s_client -connect vpn.example.com:443 -servername vpn.example.com \
+  -tls1_3 -alpn http/1.1 2>/dev/null | openssl x509 -noout -subject -dates
 ```
 
-Должны увидеть: сервис active, handshake TLS 1.3 + ALPN `h2`, серт на
-`selmedia.ru` от Let's Encrypt.
+Должны увидеть: сервис active, handshake TLS 1.3 + ALPN `http/1.1`, серт на
+`vpn.example.com` от Let's Encrypt. Сервер предлагает только `http/1.1`
+(статический fallback отвечает HTTP/1.1); `h2` предлагает лишь клиент, и
+туннель от ALPN не зависит (DEC-007).
+
+Если listener сервера умер (например, отозвали сокет), процесс пишет в журнал
+`AetherLink server stopped: <причина>` и выходит с кодом 1; unit с
+`Restart=on-failure` поднимает его через 5 с. Временные ошибки `accept()`
+(исчерпаны дескрипторы/память) сервер переживает сам, с паузой 10 мс…1 с
+(DEC-024).
 
 ## 6. Продление серта без дауна
 
 ```bash
-sudo certbot reconfigure --cert-name selmedia.ru-wildcard \
+sudo certbot reconfigure --cert-name vpn.example.com-wildcard \
   --deploy-hook "systemctl restart aetherlink-server"
 sudo certbot renew --dry-run   # проверка цепочки
 ```
@@ -121,8 +139,8 @@ sudo certbot renew --dry-run   # проверка цепочки
 
 ```yaml
 # client.yaml
-server_addr: "selmedia.ru:443"
-outer_sni: "selmedia.ru"
+server_addr: "vpn.example.com:443"
+outer_sni: "vpn.example.com"
 psk: "<тот же PSK, что на сервере>"
 ```
 
@@ -135,10 +153,13 @@ psk: "<тот же PSK, что на сервере>"
 | Симптом | Причина → действие |
 |---|---|
 | `aether_server_start failed` | битый конфиг — текст причины теперь в исключении |
-| handshake висит | 443 закрыт фаерволом / DNS ведёт не туда (`dig +short selmedia.ru`) |
+| handshake висит | 443 закрыт фаерволом / DNS ведёт не туда (`dig +short vpn.example.com`) |
 | клиент получает static вместо туннеля | PSK не совпал; `outer_sni` ≠ имени в серте |
 | `cert.pem/key.pem not found` | забыты `TLS_CERT`/`TLS_KEY` при smoke-запуске |
 | renewal не подхватывается | нет deploy-hook → `systemctl restart aetherlink-server` |
+| `bad key pem` / `no private key found` / `bad cert/key` | ключ не PEM, пустой или не от этого серта; поддерживаются PKCS#8, PKCS#1, SEC1 |
+| в журнале `AetherLink server stopped: …`, сервис перезапускается | умер listener; причина в той же строке, systemd поднимает сервис сам |
+| в журнале `accept: … backing off` | нехватка дескрипторов/памяти (`EMFILE`, `ENOMEM`); сервер ждёт и продолжает, поднимите `LimitNOFILE` или снизьте `max_connections` |
 
 ## 9. Обновление
 

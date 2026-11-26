@@ -1,5 +1,17 @@
 # PLAN_ANDROID — доведение Android-клиента AetherLink до рабочего состояния (TDD)
 
+> **Статус на 2026-11-25** (текст плана ниже не переписывался, это исторический план).
+> - ✅ **Phase 0** — сборка APK (3 ABI) и тестовый каркас; baseline-долги P0-R3 закрыты (DEC-023).
+> - ✅ **Phase 1** — Android data plane в Rust (P1-R1…R9, гейт G1).
+> - 🔄 **Phase 2** — Rust-часть готова: `ffi/tests/android_api.rs`, 13 JNI-функций, глобальный
+>   `last_error`, panic-safe экспорт и отложенный `clientFree` (DEC-024). Нет `check_jni_symbols`
+>   и device smoke `JniSmokeTest` (P2-R3, P2-R5).
+> - ⏳ **Phase 3–6** не начаты: Kotlin-хост — каркас (handle `0`, нет Activity, Android-поток
+>   `clientConnect` → `clientAttachTun` не вызывается). `scripts/check_android_host.ps1` красный
+>   по замыслу.
+>
+> Актуальное состояние: [`docs/ANDROID.md`](docs/ANDROID.md), [`docs/STATUS.md`](docs/STATUS.md).
+
 _Составлен: 2026-10-20. Переработан под TDD: 2026-10-22. Основание: аудит `apps/android`, `crates/aetherlink-client`, `crates/aetherlink-ffi`, `crates/aetherlink-netstack`._
 
 Статус: **черновик к исполнению**. Реализация начинается после подтверждения плана.
@@ -235,14 +247,14 @@ VpnService умеет **только include-маршруты** и **per-app all
 
 ### D6. TLS-доверие
 
-Реальный деплой использует самоподписанный/внутренний CA (`ca-cert.pem`, `cert.pem`, SNI `selmedia.ru`). На Android системное хранилище Android недоступно `rustls-native-certs`.
+Реальный деплой использует самоподписанный/внутренний CA (`ca-cert.pem`, `cert.pem`, SNI `vpn.example.com`). На Android системное хранилище Android недоступно `rustls-native-certs`.
 
 Решение:
 
 - новое поле `client.tls.ca_pem` (inline PEM, строка) — добавляется в `RootCertStore` вместе с системными и webpki-корнями; если `rustls-native-certs` на Android недоступен — **не падаем**, используем webpki + `ca_pem`;
 - Kotlin читает выбранный файл/вставленный текст и кладёт PEM в JSON конфига;
 - `insecure_skip_verify` **не добавляем** (осознанно; для лабораторных тестов — отдельный тестовый конфиг с CA).
-- Требование к сертификату: SAN должен содержать `outer_sni` (нынешний `selmedia.ru`).
+- Требование к сертификату: SAN должен содержать `outer_sni` (например, `vpn.example.com`).
 
 **TDD-следствие:** L0-тест «валидный PEM → RootCertStore содержит сертификат», «битый PEM → ConfigError», «без CA поведение desktop не меняется»; grep-тест «в коде нет `dangerous()`/skip-verify».
 
@@ -281,7 +293,7 @@ object AetherCore : CoreApi {
 }
 ```
 
-Коды ошибок — существующий `AetherError` (`0`, `-1…-11`). JNI-функции обязаны:
+Коды ошибок — существующий `AetherError` (`0`, `-1…-12`; `-12 Busy` добавлен в DEC-024). JNI-функции обязаны:
 
 - писать текст ошибки в **глобальный** слот `LAST_ERROR` (`Mutex<Option<String>>`), не thread-local: `lastError()` может вызываться с другого потока, чем упавший вызов;
 - не паниковать на невалидных handle/fd (проверять до `unwrap`);
@@ -321,8 +333,8 @@ C ABI (`aether_client_*`) сохраняется для Windows/.NET. Функц
 
 ```yaml
 client:
-  server_addr: "31.57.158.233:443"
-  outer_sni: "selmedia.ru"
+  server_addr: "203.0.113.10:443"
+  outer_sni: "vpn.example.com"
   psk: "..."
   tls:
     ca_pem: |            # inline PEM (Android: вставляется из UI)

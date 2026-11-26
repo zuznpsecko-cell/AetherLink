@@ -1,5 +1,21 @@
 # PLAN_FINAL_TDD — AetherLink v1.5 до финала без заглушек
 
+> **Статус на 2026-11-25.** Галочки ниже не обновлялись по ходу работ и **занижают**
+> прогресс: отмечено 6 из 47 пунктов, а фактически сделано большинство. Есть сессионный
+> хендшейк, accept/bind/serve, `up`/`down` клиента, pump, FFI-поверхность и E2E по
+> localhost (`core/tests/session_handshake.rs`, `server/tests/accept_loop.rs`,
+> `client/tests/up_down.rs`, `netstack/tests/pump.rs`, `ffi/tests/ffi_surface.rs`,
+> `server/tests/e2e_tunnel.rs`). Заглушек (`TODO`/`unimplemented!`) в `crates/*/src` нет.
+> Ворота из шапки зелёные в CI на каждом PR (DEC-023). Живой туннель против VPS на
+> Windows работает.
+>
+> **Не сделано:** Linux TUN (D3/D4, нет `netstack/tests/tun_io.rs`); Phase T (нет
+> `protocol/tests/tls_profile.rs`, `server/tests/fallback_shape.rs`); живые чек-листы
+> D5/G3/I6 выполнены частично (`docs/LIVE_W4.md`).
+>
+> Актуальное состояние: [`docs/STATUS.md`](docs/STATUS.md),
+> [`docs/LIVE_ISSUES.md`](docs/LIVE_ISSUES.md).
+
 Методология: каждый шаг — Red (падающий тест) → Green (минимум кода) → ворота
 (`cargo fmt --check`, `clippy --all-targets`, `cargo test --workspace`,
 `check_thin_hosts.ps1`, `check_quickstart.ps1`). Ни один шаг не закрыт без
@@ -263,17 +279,17 @@ Depends: W (live transport proven). Goal: the session is
 indistinguishable from generic browser HTTPS to passive observation and
 unsolicited connection attempts, with zero per-host TLS code.
 
-- [ ] T1. Red: `protocol/tests/tls_profile.rs` � golden vectors for the
+- [ ] T1. Red: `protocol/tests/tls_profile.rs` — golden vectors for the
       single TLS profile: ALPN order, allowed TLS 1.3 ciphers, forbidden
       extensions/values, SNI source rule. Any deviation fails the build.
-- [ ] T2. Green: `core/tls.rs` � one profile constructor used by client
+- [ ] T2. Green: `core/tls.rs` — one profile constructor used by client
       and server paths; resumption policy unified; SNI strictly from
       config (never derived from internals).
-- [ ] T3. Red: `server/tests/fallback_shape.rs` � unauthenticated probes
+- [ ] T3. Red: `server/tests/fallback_shape.rs` — unauthenticated probes
       (bad AUTH, plaintext, wrong SNI) receive byte-comparable generic
       static answers: statuses, headers, close semantics versus a reference
       static server; no tunnel markers in body, headers, or timing class.
-- [ ] T4. Green: `server/accept.rs` + `fallback.rs` � shape fixes per red;
+- [ ] T4. Green: `server/accept.rs` + `fallback.rs` — shape fixes per red;
       error paths (TLS alert vs close, AUTH reject vs static) unified.
 - [ ] T5. Gates + `STATUS.md`: fidelity phase DONE; `check_thin_hosts.ps1`
       extended with a no-direct-TLS-in-hosts assertion if missing.
