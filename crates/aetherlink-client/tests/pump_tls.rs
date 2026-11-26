@@ -949,3 +949,130 @@ fn resilient_tls_pump_reconnects_transparently_after_abrupt_server_drop() {
     handle.stop();
     server.join().expect("server thread");
 }
+
+/// Server for the keepalive tests: TLS + handshake, then `serve` owns the
+/// stream. Returns the port and the server thread.
+fn keepalive_server<F>(serve: F) -> (u16, std::thread::JoinHandle<()>)
+where
+    F: FnOnce(aetherlink_core::tls::ServerTlsStream) + Send + 'static,
+{
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        key.cert.der().to_vec(),
+    )];
+    let key_der = key.key_pair.serialize_der();
+    let server_cfg =
+        Arc::new(aetherlink_core::tls::server_config(chain, &key_der).expect("server cfg"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let cache = NonceCache::new();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept");
+        let mut stream = aetherlink_core::tls::accept_tls(sock, &server_cfg).expect("server tls");
+        let _sess = aetherlink_core::session::handshake_server(&mut stream, PSK, &cache)
+            .expect("server hs");
+        serve(stream);
+    });
+    (port, server)
+}
+
+/// Read one frame without panicking on EOF (the client may hang up first).
+fn try_read_one(
+    stream: &mut aetherlink_core::tls::ServerTlsStream,
+) -> Option<(FrameHeader, Vec<u8>)> {
+    let mut hb = [0u8; aetherlink_frame::FRAME_HEADER_SIZE];
+    stream.read_exact(&mut hb).ok()?;
+    let mut hbuf = bytes::BytesMut::from(&hb[..]);
+    let header = FrameHeader::decode(&mut hbuf).ok()?;
+    let mut ct = vec![0u8; header.length as usize];
+    stream.read_exact(&mut ct).ok()?;
+    Some((header, ct))
+}
+
+/// Short keepalive so the tests run in about a second.
+fn fast_keepalive() -> aetherlink_client::threads::TlsPumpOptions {
+    aetherlink_client::threads::TlsPumpOptions {
+        pad: PAD,
+        keepalive: Duration::from_millis(100),
+    }
+}
+
+#[test]
+fn keepalive_timeout_drops_an_echoing_server_that_goes_silent() {
+    use aetherlink_client::threads::{spawn_pump_tls_with, NoReconnect};
+    use aetherlink_protocol::FrameType;
+    // Given: a server that echoes the first PING, then stays connected but
+    // never answers again (hung process, blackholed return path).
+    let (port, server) = keepalive_server(|mut stream| {
+        let mut echoed = false;
+        while let Some((header, ct)) = try_read_one(&mut stream) {
+            if header.frame_type == FrameType::Ping && !echoed {
+                echoed = true;
+                write_one(&mut stream, &header, &ct);
+            }
+        }
+    });
+    let tunnel = aetherlink_client::lifecycle::connect(
+        &test_config(&format!("127.0.0.1:{port}")),
+        Some(Arc::new(AcceptAll)),
+    )
+    .expect("connect");
+    let tun = Arc::new(Mutex::new(FakeTun::default()));
+    // When: the pump idles with a 100 ms keepalive (dead after 300 ms)
+    let mut handle =
+        spawn_pump_tls_with(tun, tunnel, fast_keepalive(), None::<NoReconnect>).expect("spawn");
+    // Then: it ends on its own with a keepalive timeout, not a write error.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while handle.is_alive() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pump kept a silent echoing server"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reason = handle.exit_reason().expect("exit reason");
+    assert!(reason.contains("keepalive timeout"), "{reason}");
+    handle.stop();
+    server.join().expect("server thread");
+}
+
+#[test]
+fn keepalive_without_echo_support_keeps_the_session() {
+    use aetherlink_client::threads::{spawn_pump_tls_with, NoReconnect};
+    use aetherlink_protocol::FrameType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Given: a server from before the echo — it reads PINGs and never answers.
+    let pings = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&pings);
+    let (port, server) = keepalive_server(move |mut stream| {
+        while let Some((header, _)) = try_read_one(&mut stream) {
+            if header.frame_type == FrameType::Ping {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    let tunnel = aetherlink_client::lifecycle::connect(
+        &test_config(&format!("127.0.0.1:{port}")),
+        Some(Arc::new(AcceptAll)),
+    )
+    .expect("connect");
+    let tun = Arc::new(Mutex::new(FakeTun::default()));
+    let mut handle =
+        spawn_pump_tls_with(tun, tunnel, fast_keepalive(), None::<NoReconnect>).expect("spawn");
+    // When: idling for several dead-peer windows
+    std::thread::sleep(Duration::from_millis(1500));
+    // Then: still alive (no false timeout), and the configured interval —
+    // not the 15 s default — paced the PINGs.
+    assert!(
+        handle.is_alive(),
+        "old server timed out: {:?}",
+        handle.exit_reason()
+    );
+    assert!(
+        pings.load(Ordering::SeqCst) >= 3,
+        "keepalive interval ignored"
+    );
+    handle.stop();
+    server.join().expect("server thread");
+}
+

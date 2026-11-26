@@ -10,6 +10,7 @@
 
 using System.Runtime.InteropServices;
 using System.Text;
+using AetherLink.Interop;
 
 internal static partial class Native
 {
@@ -60,11 +61,29 @@ internal sealed class AetherClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Bring the tunnel up with the same recovery as the GUI: Busy is retried,
+    /// and a leftover state file from a run that died without teardown
+    /// (StaleState) restores the network and retries once, instead of
+    /// failing until someone runs `cleanup` by hand.
+    /// </summary>
     public void Up()
     {
-        if (Native.aether_client_up(_handle) != 0)
+        var handle = _handle;
+        var rc = CoreRecovery.UpWithRecovery(
+            () => Native.aether_client_up(handle),
+            () =>
+            {
+                // Release whatever the refused attempt left, then replay the
+                // state file (routes, DNS, adapter) like `cleanup` does.
+                _ = Native.aether_client_down(handle);
+                return Native.aether_client_force_cleanup();
+            },
+            message => Console.Error.WriteLine(message));
+        if (rc != CoreCodes.Success)
         {
-            throw new InvalidOperationException($"aether_client_up failed: {Native.LastError()} (routes/DNS rolled back by core).");
+            throw new InvalidOperationException(
+                $"aether_client_up failed ({CoreRecovery.Describe(rc)}): {Native.LastError()} (routes/DNS rolled back by core).");
         }
     }
 
@@ -84,9 +103,12 @@ internal sealed class AetherClient : IDisposable
     {
         if (_handle != nuint.Zero)
         {
-            _ = Native.aether_client_down(_handle);
+            var handle = _handle;
+            // Ctrl+C and ProcessExit can both land here: a concurrent call
+            // answers Busy, which is retried rather than skipping the restore.
+            _ = CoreRecovery.RetryWhileBusy(() => Native.aether_client_down(handle));
             // Release the client from the core's handle map.
-            _ = Native.aether_client_free(_handle);
+            _ = Native.aether_client_free(handle);
             _handle = nuint.Zero;
         }
     }

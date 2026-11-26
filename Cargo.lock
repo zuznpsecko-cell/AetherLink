@@ -60,8 +60,6 @@ dependencies = [
  "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
- "webpki",
  "webpki-roots",
 ]
 
@@ -70,7 +68,6 @@ name = "aetherlink-crypto"
 version = "1.5.0"
 dependencies = [
  "chacha20poly1305",
- "hex",
  "hkdf",
  "hmac",
  "pretty_assertions",
@@ -108,8 +105,8 @@ dependencies = [
  "aetherlink-crypto",
  "aetherlink-protocol",
  "bytes",
- "hex",
  "pretty_assertions",
+ "rand",
  "serde",
  "thiserror 1.0.69",
  "zeroize",
@@ -155,7 +152,7 @@ dependencies = [
  "aetherlink-crypto",
  "aetherlink-frame",
  "aetherlink-mux",
- "hex",
+ "bytes",
  "pretty_assertions",
  "serde",
 ]
@@ -576,12 +573,6 @@ dependencies = [
  "spin",
  "stable_deref_trait",
 ]
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"
@@ -1460,16 +1451,6 @@ name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
-
-[[package]]
-name = "webpki"
-version = "0.22.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed63aea5ce73d0ff405984102c42de94fc55a6b75765d621c65262469b3c9b53"
-dependencies = [
- "ring",
- "untrusted",
-]
 
 [[package]]
 name = "webpki-roots"

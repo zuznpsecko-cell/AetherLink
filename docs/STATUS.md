@@ -1,6 +1,6 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-11-25 (сверка документации с кодом после DEC-024; `main` = `ed1b979`)._
+_Last Updated: 2026-11-26 (DEC-025: dead-peer, PSK floor, NonceCache, `--locked`; поверх `main` = `c477cc8`)._
 
 ## Сейчас
 
@@ -16,7 +16,7 @@ _Last Updated: 2026-11-25 (сверка документации с кодом �
   вместе; v1-пир получает отказ на байте preface.
 - **Платформы:** сервер — Linux/Windows; десктоп-клиент — **только Windows** (Linux TUN
   не реализован); Android — Rust-часть и Kotlin-хост готовы, на устройстве не проверено (`docs/ANDROID.md`).
-- Решения: DEC-001…DEC-024 в `docs/DECISIONS.md`.
+- Решения: DEC-001…DEC-025 в `docs/DECISIONS.md`.
 
 ## Overview
 
@@ -63,7 +63,17 @@ _Last Updated: 2026-11-25 (сверка документации с кодом �
 - [x] FFI handle table keeps a `Busy` slot during a call; `free` racing a call is deferred, never resurrects the handle; new code `Busy = -12`
 - [x] Every C ABI / JNI export in `catch_unwind` (panic → `InternalError` + `last_error`); poison-tolerant mutexes; invalid UTF-8 arguments are errors
 - [x] Tests: `server/tests/accept_errors.rs` (12), `bind_serve.rs` (+2: SEC1 key served over TLS, PEM helper), unit tests in `ffi/src/handles.rs` (6) and `ffi/src/lib.rs` (6); CI green
-- [ ] Still open: PKCS#1 test (rcgen/ring cannot generate RSA; needs a fixed PEM fixture); GUI/Kotlin do not handle `Busy` explicitly
+- [x] ~~Still open: PKCS#1 test; GUI/Kotlin do not handle `Busy`~~ — closed: PKCS#1 fixture test (DEC-025), Kotlin handles `Busy` upstream, .NET via `dotnet/Shared/CoreRecovery.cs` (DEC-025)
+
+### Phase 24: Review follow-ups (DEC-025)
+
+- [x] Cargo.lock reconciled with the manifests; every cargo step in CI runs `--locked`
+- [x] Dead-peer detection: server echoes PING, client interval from `keepalive_s`, "keepalive timeout" after 3 silent intervals (only once the server has echoed)
+- [x] .NET hosts: shared Busy/StaleState policy (GUI retries Busy; CLI `up` recovers from StaleState)
+- [x] PSK minimum 16 bytes at config parse (client + server)
+- [x] `NonceCache`: O(1) `HashSet` + ordered queue, poison-tolerant lock
+- [x] PKCS#1 RSA key regression test (committed throwaway fixture)
+- [ ] Not yet run: authored without a local toolchain — CI is the first run
 
 ### Phase 22: CI gates (DEC-023)
 
@@ -207,6 +217,6 @@ green in CI on Linux and Windows; exact per-run totals live in the CI logs.
    затем автопереподключение при смене сети.
 3. Phase I6: полный live E2E чек-лист (kill -9, DNS no-leak захватом, domain-direct;
    `docs/LIVE_W4.md`).
-4. Dead-peer детекция: эхо-Ping на сервере, `keepalive_s` из конфига.
+4. ~~Dead-peer детекция~~ — сделано (DEC-025); остаётся живая проверка обрыва на VPS.
 5. Linux TUN для десктоп-клиента.
 6. Phase T: TLS-fidelity hardening (DEC-012).

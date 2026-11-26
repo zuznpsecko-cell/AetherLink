@@ -422,7 +422,7 @@ where
     T: aetherlink_netstack::tun::TunPackets + Send + 'static,
 {
     let tunnel = connect(config, verifier)?;
-    let pad = config.pad_multiple;
-    crate::threads::spawn_pump_tls(tun, tunnel, pad)
+    let opts = crate::threads::TlsPumpOptions::from_config(config);
+    crate::threads::spawn_pump_tls_with(tun, tunnel, opts, None::<crate::threads::NoReconnect>)
         .map_err(|e| ClientError::PlatformError(format!("pump spawn: {e}")))
 }

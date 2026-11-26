@@ -918,9 +918,9 @@ impl DataPump {
 
     /// Inject one mux frame downstream, emitting IP packet(s) into TUN.
     ///
-    /// Only DATA (TCP) and DATAGRAM (UDP) are accepted; anything else,
-    /// unknown ids, direction mismatches and AEAD failures return `Err`
-    /// with nothing written to TUN.
+    /// Only DATA (TCP) and DATAGRAM (UDP) carry packets; a PING (keepalive
+    /// echo) is accepted and ignored. Anything else, unknown ids, direction
+    /// mismatches and AEAD failures return `Err` with nothing written to TUN.
     pub fn receive_mux(
         &mut self,
         header: &FrameHeader,
@@ -1050,6 +1050,9 @@ impl DataPump {
                 tun.send_packet(&pkt)?;
                 Ok(())
             }
+            // The server's echo of our keepalive: liveness only, nothing for
+            // the TUN (the pump thread tracks it for dead-peer detection).
+            FrameType::Ping => Ok(()),
             other => Err(ClientError::RoutingError(format!(
                 "inbound frame type {other:?} not allowed"
             ))),

@@ -14,7 +14,7 @@ pub struct ServerConfig {
     pub tls_cert: String,
     /// TLS key path.
     pub tls_key: String,
-    /// Pre-shared key (required, non-empty; never logged).
+    /// Pre-shared key (required, at least `MIN_PSK_LEN` bytes; never logged).
     pub psk: String,
     /// Static web root for the G2 fallback.
     pub local_static_root: String,
@@ -50,6 +50,13 @@ impl ServerConfig {
         let doc = root.get("server").unwrap_or(root);
         let listen = required_str(doc, "listen")?;
         let psk = required_str(doc, "psk")?;
+        // Length only — the value itself never goes into an error or a log.
+        if psk.len() < aetherlink_crypto::MIN_PSK_LEN {
+            return Err(ServerError::ConfigError(format!(
+                "psk too short: need at least {} bytes",
+                aetherlink_crypto::MIN_PSK_LEN
+            )));
+        }
         let local_static_root = required_str(doc, "local_static_root")?;
         let tls_cert = doc
             .get("tls_cert")

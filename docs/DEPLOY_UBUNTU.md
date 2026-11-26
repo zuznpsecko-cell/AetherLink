@@ -81,7 +81,8 @@ nano server.yaml
 
 Выставить:
 - `server.listen: "0.0.0.0:443"`, `server.psk` — сгенерировать:
-  `openssl rand -base64 32` (тот же PSK потом в клиент!);
+  `openssl rand -base64 32` (тот же PSK потом в клиент!); короче 16 байт сервер
+  и клиент не примут (`psk too short`, DEC-025);
 - `local_static_root` — оставить `./fallback` (создастся сам);
 - `dns_upstream` — по умолчанию `1.1.1.1`/`8.8.8.8`, можно не трогать;
 - `max_connections` (512), `max_streams` (4096), `egress` (`deny_private: true`)

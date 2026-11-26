@@ -7,6 +7,7 @@
 // Changed is raised from any thread; subscribers must marshal to the UI thread.
 
 using System.Text.Json;
+using AetherLink.Interop;
 
 namespace AetherLink.Gui.Services;
 
@@ -72,11 +73,13 @@ internal sealed class TunnelService : ITunnelController, IDisposable
                 return false;
             }
 
-            var rc = Native.aether_client_up(handle);
-            if (rc != 0)
+            // Busy (another call on the handle in flight) means the core did
+            // nothing: retry briefly instead of failing the connect.
+            var rc = CoreRecovery.RetryWhileBusy(() => Native.aether_client_up(handle));
+            if (rc != CoreCodes.Success)
             {
                 var err = Native.LastError();
-                StaleState = rc == Native.StaleStateCode;
+                StaleState = rc == CoreCodes.StaleState;
                 // Core already rolls routes/DNS back on failure; down+free
                 // only release whatever a half-finished attempt left behind
                 // (and keep the core's handle map from accumulating clients).
@@ -111,9 +114,12 @@ internal sealed class TunnelService : ITunnelController, IDisposable
             _handle = nuint.Zero;
             if (handle != nuint.Zero)
             {
-                if (Native.aether_client_down(handle) != 0)
+                // A status poll that outlived StopPolling's wait still holds
+                // the handle: down answers Busy until it returns.
+                var rc = CoreRecovery.RetryWhileBusy(() => Native.aether_client_down(handle));
+                if (rc != CoreCodes.Success)
                 {
-                    GuiLog.Error($"down reported: {Native.LastError()}");
+                    GuiLog.Error($"down reported {CoreRecovery.Describe(rc)}: {Native.LastError()}");
                 }
                 // Release the client from the core's handle map (idempotent;
                 // its down is a safety net, the pump is already stopped).
@@ -251,7 +257,9 @@ internal sealed class TunnelService : ITunnelController, IDisposable
                     }
 
                     var buf = new byte[4096];
-                    if (Native.aether_client_status(handle, buf, (nuint)buf.Length) == 0)
+                    // Non-zero (Busy included) skips this tick: the next poll
+                    // retries, and up/down state stays authoritative.
+                    if (Native.aether_client_status(handle, buf, (nuint)buf.Length) == CoreCodes.Success)
                     {
                         var end = Array.IndexOf(buf, (byte)0);
                         var json = System.Text.Encoding.UTF8.GetString(buf, 0, end < 0 ? buf.Length : end);

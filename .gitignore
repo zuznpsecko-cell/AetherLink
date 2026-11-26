@@ -32,6 +32,9 @@ captures/
 # --- Secrets: keys, certs, credentials (NEVER commit) ---
 *.pem
 *.key
+# Public, throwaway TLS test fixtures (see the README next to them): they
+# exist to exercise key formats rcgen cannot produce. Never a real key.
+!crates/aetherlink-server/tests/fixtures/rsa_pkcs1_*.pem
 *.p12
 *.pfx
 *credentials*

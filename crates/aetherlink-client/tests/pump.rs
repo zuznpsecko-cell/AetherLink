@@ -332,6 +332,25 @@ fn tampered_frame_fails_closed_without_tun_write() {
 }
 
 #[test]
+fn keepalive_echo_is_accepted_without_tun_write() {
+    // Given: the server's echo of a keepalive PING (unsealed, padded body)
+    let echo = FrameHeader {
+        length: 16,
+        frame_type: aetherlink_protocol::FrameType::Ping,
+        flags: 0,
+        stream_id: 0,
+        sequence: 0,
+        generation: 0,
+    };
+    let mut tun = FakeTun::default();
+    let mut pump = DataPump::new(KEY, PAD);
+    // When: injected -> Then: Ok (not "frame type not allowed"), TUN untouched
+    let res = pump.receive_mux(&echo, &[0u8; 16], &mut tun);
+    assert!(res.is_ok(), "ping echo rejected: {res:?}");
+    assert!(tun.outbound.is_empty());
+}
+
+#[test]
 fn truncated_ip_packet_is_dropped() {
     // Given: garbage bytes in TUN
     let mut tun = FakeTun::with_packets(vec![vec![0x45, 0x00, 0x00]]);

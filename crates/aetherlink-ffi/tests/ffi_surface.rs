@@ -19,7 +19,7 @@ fn c(s: &str) -> CString {
 }
 
 fn make_client() -> usize {
-    let cfg = c(r#"{"server_addr":"example.com:443","psk":"x"}"#);
+    let cfg = c(r#"{"server_addr":"example.com:443","psk":"ffi-test-psk-0123"}"#);
     let h = unsafe { aether_client_create(cfg.as_ptr()) };
     assert_ne!(h, 0, "client create");
     h
