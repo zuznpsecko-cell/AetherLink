@@ -105,7 +105,7 @@ fn ffi_accepts_yaml_configs() {
     // Given: a server YAML document with real temp TLS files
     let (cert, key, root) = temp_server_files();
     let server_yaml = format!(
-        "listen: \"127.0.0.1:0\"\npsk: \"x\"\nlocal_static_root: \"{root}\"\ntls_cert: \"{cert}\"\ntls_key: \"{key}\"\n"
+        "listen: \"127.0.0.1:0\"\npsk: \"ffi-test-psk-0123\"\nlocal_static_root: \"{root}\"\ntls_cert: \"{cert}\"\ntls_key: \"{key}\"\n"
     );
     // When: starting → Then: serving handle out.
     let sh = unsafe { aether_server_start(c(&server_yaml).as_ptr()) };
