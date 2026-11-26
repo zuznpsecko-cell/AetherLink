@@ -1075,4 +1075,3 @@ fn keepalive_without_echo_support_keeps_the_session() {
     handle.stop();
     server.join().expect("server thread");
 }
-

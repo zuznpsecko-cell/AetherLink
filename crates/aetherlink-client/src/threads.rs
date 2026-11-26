@@ -741,9 +741,7 @@ where
                 // 4. Periodic idle keepalive so NATs and middleboxes keep state warm.
                 //    Includes a 16-byte zero body so older servers that read non-empty
                 //    frame bodies directly do not misread `read(&mut []) -> Ok(0)` as EOF.
-                if !stream.conn.wants_write()
-                    && outbox.is_empty()
-                    && last_tx.elapsed() >= keepalive
+                if !stream.conn.wants_write() && outbox.is_empty() && last_tx.elapsed() >= keepalive
                 {
                     tx_buf.clear();
                     // Keepalive PING has an empty, unsealed body: generation
@@ -1141,4 +1139,3 @@ mod liveness_tests {
         );
     }
 }
-
