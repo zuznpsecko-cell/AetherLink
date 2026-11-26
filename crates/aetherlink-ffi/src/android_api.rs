@@ -115,8 +115,10 @@ pub fn connect(handle: usize, protector: Option<Protector<'_>>) -> Code {
 /// `clientAttachTun`: take ownership of the detached `VpnService` fd.
 ///
 /// Arguments are checked before the descriptor is touched: a bad fd here must
-/// not close somebody else's descriptor, and a bad MTU must not leave the fd
-/// dangling.
+/// not close somebody else's descriptor. Every other refusal still owns the
+/// fd (Kotlin gave it up with `detachFd()`), so it is closed: a leaked VPN fd
+/// keeps the interface up with nobody reading it, and every app's traffic
+/// disappears into it.
 pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
     crate::clear_last_error();
     // Validate first: these rejections must not disturb the handle map.
@@ -126,11 +128,15 @@ pub fn attach(handle: usize, fd: i32, mtu: i32) -> Code {
     }
     if mtu <= 0 {
         crate::set_last_error(&format!("clientAttachTun: invalid mtu {mtu}"));
+        release_fd(fd);
         return AetherError::InvalidArgument as Code;
     }
     let mut lease = match Lease::checkout(handle, Teardown::Android) {
         Ok(lease) => lease,
-        Err(e) => return checkout_failed("clientAttachTun", e),
+        Err(e) => {
+            release_fd(fd);
+            return checkout_failed("clientAttachTun", e);
+        }
     };
     let outcome = attach_tun(lease.client(), fd, mtu);
     lease.finish();
@@ -221,6 +227,23 @@ fn protect_with(protector: Protector<'_>, raw: SocketHandle) -> bool {
 fn protect_with(protector: Protector<'_>, raw: SocketHandle) -> bool {
     protector(raw as i32)
 }
+
+/// Close a `VpnService` fd that `attach` refused before wrapping it.
+///
+/// Android only: there the number really is the detached tun fd. Host builds
+/// never receive one (tests pass made-up numbers that may alias the test
+/// process's own descriptors), so nothing is closed there.
+#[cfg(target_os = "android")]
+fn release_fd(fd: i32) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    // Safety: Kotlin transferred ownership with `detachFd()` and never closes
+    // it again; this is the only owner left.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+}
+
+#[cfg(not(target_os = "android"))]
+fn release_fd(_fd: i32) {}
 
 /// Bridge the parked transport to the detached fd.
 ///

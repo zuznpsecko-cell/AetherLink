@@ -1,8 +1,16 @@
 //! JNI entry points for `link.aether.client.AetherCore` (Kotlin `object`).
 //!
-//! Thin bridge: lifecycle calls forward to `aetherlink_client`; the TUN fd
-//! and split config are staged here until the platform task wires them into
-//! the netstack (validated + stored now, applied later).
+//! Thin bridge: every call forwards to [`crate::android_api`], where the
+//! logic lives and is tested on the host. The Android flow is
+//! `clientCreate` → `clientConnect` (socket protected through
+//! `AetherCore.protectFd` → `VpnService.protect`) → `clientPlan` →
+//! `establish()` in Kotlin → `clientAttachTun` → `clientStatus` polling →
+//! `clientDisconnect`/`clientFree`.
+//!
+//! The desktop entry points (`clientUp`/`clientDown`, staged `setTunFd`/
+//! `setSplitConfig`) are not exported over JNI: on Android they led into the
+//! Windows route/DNS path. The staging maps below remain for the C ABI
+//! (`aether_client_android_set_tun_fd`, `aether_client_set_split_config`).
 //!
 //! Error codes mirror [`crate::AetherError`] so Kotlin sees one contract.
 //! Every entry point runs inside [`crate::ffi_guard`]: a Rust panic must not
@@ -13,15 +21,14 @@
 // section per function would repeat that sentence a dozen times.
 #![allow(clippy::missing_safety_doc)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
-
-use crate::handles::{handles, Lease, Teardown};
 
 /// Staged TUN attachment: VpnService fd + MTU, awaiting platform bring-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +74,6 @@ pub fn staged_split(handle: usize) -> Option<String> {
 pub(crate) fn unstage(handle: usize) {
     lock(&TUN).remove(&handle);
     lock(&SPLIT).remove(&handle);
-}
-
-fn client_exists(handle: usize) -> bool {
-    // A probe, not an accessor: nothing is checked out (nothing to put back).
-    handles().contains_client(handle)
 }
 
 /// Fallback for `jint` entry points whose body panicked.
@@ -147,18 +149,48 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_lastError<'local>(
 
 /// `AetherCore.clientConnect(handle): Int`.
 ///
-/// The protector bridge into Kotlin (`VpnService.protect`) lands in P2-G3;
-/// until then the call is refused with `PermissionDenied` instead of ever
-/// connecting the transport unprotected.
+/// Socket → `AetherCore.protectFd(fd)` (Kotlin forwards to
+/// `VpnService.protect`) → TCP → TLS → AUTH. The protector runs on this very
+/// thread, synchronously inside the call, so the `JNIEnv` of the call is
+/// valid for it: no cached `JavaVM`, no thread attach. `AetherCore` is a
+/// Kotlin `object`, so the second JNI argument is its instance and
+/// `protectFd` is an instance method on it.
+///
+/// `protectFd` returning `false` (no running `VpnService`) or throwing makes
+/// the core refuse with `PermissionDenied` before a packet is sent.
 #[no_mangle]
 pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientConnect<'local>(
-    _env: JNIEnv<'local>,
-    _cls: JClass<'local>,
+    env: JNIEnv<'local>,
+    host: JObject<'local>,
     handle: jlong,
 ) -> jint {
-    crate::ffi_guard("clientConnect", PANIC_CODE, || {
-        crate::android_api::connect(handle as usize, None) as jint
+    crate::ffi_guard("clientConnect", PANIC_CODE, move || {
+        let env = RefCell::new(env);
+        let protector = |fd: i32| protect_via_host(&env, &host, fd);
+        crate::android_api::connect(handle as usize, Some(&protector as &dyn Fn(i32) -> bool))
+            as jint
     })
+}
+
+/// Call `host.protectFd(fd): Boolean`; any JNI failure counts as "not
+/// protected" (and a pending Java exception is cleared, so the JVM does not
+/// rethrow it at the native-method boundary).
+fn protect_via_host(env: &RefCell<JNIEnv<'_>>, host: &JObject<'_>, fd: i32) -> bool {
+    let Ok(mut env) = env.try_borrow_mut() else {
+        return false;
+    };
+    let protected = env
+        .call_method(host, "protectFd", "(I)Z", &[JValue::Int(fd)])
+        .and_then(|value| value.z());
+    match protected {
+        Ok(ok) => ok,
+        Err(_) => {
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            false
+        }
+    }
 }
 
 /// `AetherCore.clientAttachTun(handle, fd, mtu): Int`.
@@ -196,98 +228,6 @@ pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientFree<'local>(
 ) -> jint {
     crate::ffi_guard("clientFree", PANIC_CODE, || {
         crate::android_api::free(handle as usize) as jint
-    })
-}
-
-/// `AetherCore.clientUp(handle): Int`.
-#[no_mangle]
-pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientUp<'local>(
-    _env: JNIEnv<'local>,
-    _cls: JClass<'local>,
-    handle: jlong,
-) -> jint {
-    crate::ffi_guard("clientUp", PANIC_CODE, || {
-        // `up()` brings the tunnel up (handshake, routes, TUN): checked out,
-        // not locked, so a slow connect cannot stall unrelated handles.
-        let mut lease = match Lease::checkout(handle as usize, Teardown::Android) {
-            Ok(lease) => lease,
-            Err(e) => return crate::handles_code(e),
-        };
-        let outcome = lease.client().up();
-        lease.finish();
-        match outcome {
-            Ok(()) => crate::AetherError::Success as jint,
-            Err(aetherlink_client::ClientError::StaleState(_)) => {
-                crate::AetherError::StaleState as jint
-            }
-            Err(_) => crate::AetherError::NetworkError as jint,
-        }
-    })
-}
-
-/// `AetherCore.clientDown(handle): Int`.
-#[no_mangle]
-pub unsafe extern "C" fn Java_link_aether_client_AetherCore_clientDown<'local>(
-    _env: JNIEnv<'local>,
-    _cls: JClass<'local>,
-    handle: jlong,
-) -> jint {
-    crate::ffi_guard("clientDown", PANIC_CODE, || {
-        let mut lease = match Lease::checkout(handle as usize, Teardown::Android) {
-            Ok(lease) => lease,
-            Err(e) => return crate::handles_code(e),
-        };
-        let outcome = lease.client().down();
-        lease.finish();
-        match outcome {
-            Ok(()) => crate::AetherError::Success as jint,
-            Err(_) => crate::AetherError::NetworkError as jint,
-        }
-    })
-}
-
-/// `AetherCore.setTunFd(handle, fd, mtu): Int` — validates + stages.
-#[no_mangle]
-pub unsafe extern "C" fn Java_link_aether_client_AetherCore_setTunFd<'local>(
-    _env: JNIEnv<'local>,
-    _cls: JClass<'local>,
-    handle: jlong,
-    fd: jint,
-    mtu: jint,
-) -> jint {
-    crate::ffi_guard("setTunFd", PANIC_CODE, || {
-        if !client_exists(handle as usize) {
-            return crate::AetherError::InvalidHandle as jint;
-        }
-        if fd < 0 || mtu <= 0 {
-            return crate::AetherError::InvalidArgument as jint;
-        }
-        stage_tun(handle as usize, fd, mtu);
-        crate::AetherError::Success as jint
-    })
-}
-
-/// `AetherCore.setSplitConfig(handle, json): Int` — validates + stages.
-#[no_mangle]
-pub unsafe extern "C" fn Java_link_aether_client_AetherCore_setSplitConfig<'local>(
-    mut env: JNIEnv<'local>,
-    _cls: JClass<'local>,
-    handle: jlong,
-    config: JString<'local>,
-) -> jint {
-    crate::ffi_guard("setSplitConfig", PANIC_CODE, || {
-        if !client_exists(handle as usize) {
-            return crate::AetherError::InvalidHandle as jint;
-        }
-        let json: String = match env.get_string(&config) {
-            Ok(s) => s.into(),
-            Err(_) => return crate::AetherError::InvalidArgument as jint,
-        };
-        if serde_json::from_str::<serde_json::Value>(&json).is_err() {
-            return crate::AetherError::InvalidArgument as jint;
-        }
-        stage_split(handle as usize, json);
-        crate::AetherError::Success as jint
     })
 }
 

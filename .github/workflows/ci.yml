@@ -149,6 +149,51 @@ jobs:
           dotnet publish dotnet/AetherLink.Gui/AetherLink.Gui.csproj -c Release -r win-x64
           dotnet publish dotnet/AetherLink.Client/AetherLink.Client.csproj -c Release -r win-x64
 
+  android:
+    # The Android host end to end, minus a device: the Rust core for the three
+    # APK ABIs (cargo-ndk with the runner's NDK), the Kotlin L1 suite
+    # (Robolectric) and the debug APK. This is what proves that the JNI
+    # surface in jni.rs and the `external fun`s in AetherCore.kt still agree
+    # and that the Kotlin compiles; a real tunnel needs a device (L2, see
+    # docs/ANDROID.md).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "^3" --locked
+
+      # `cfg(target_os = "android")` code (fd ownership in android_api.rs,
+      # the AndroidTun attach) is invisible to the host clippy run above.
+      - name: Clippy for the Android target (warnings are errors)
+        env:
+          CARGO_TERM_COLOR: never
+        run: cargo ndk --platform 26 -t arm64-v8a clippy -p aetherlink-ffi -- -D warnings
+
+      - name: Core .so (3 ABIs) + debug APK
+        run: bash scripts/build_android.sh debug
+
+      - name: Kotlin L1 tests (Robolectric)
+        working-directory: apps/android
+        run: ./gradlew testDebugUnitTest --console=plain
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-debug
+          if-no-files-found: ignore
+          path: |
+            apps/android/app/build/outputs/apk/debug/app-debug.apk
+            apps/android/app/build/reports/tests/
+
   contracts-and-audit:
     runs-on: windows-latest
     steps:
@@ -171,7 +216,7 @@ jobs:
           #
           # -SkipArtifacts: the staged Android .so files are build outputs and
           # .gitignore excludes them, so a source gate cannot assert them.
-          $names = @("check_thin_hosts.ps1", "check_gui_endpoints.ps1", "check_quickstart.ps1")
+          $names = @("check_thin_hosts.ps1", "check_gui_endpoints.ps1", "check_quickstart.ps1", "check_android_host.ps1")
           foreach ($name in $names) {
             # NOTE: an array of strings splatted with `@argList` passes each
             # element *positionally* -- "-SkipArtifacts" arrives as a value, not

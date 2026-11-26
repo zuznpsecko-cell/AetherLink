@@ -92,14 +92,6 @@ fn checkout_failed(op: &str, err: CheckoutError) -> c_int {
     }
 }
 
-/// Bare FFI code for a failed checkout (JNI paths that set no error text).
-pub(crate) fn handles_code(err: CheckoutError) -> c_int {
-    match err {
-        CheckoutError::Invalid => AetherError::InvalidHandle as c_int,
-        CheckoutError::Busy => AetherError::Busy as c_int,
-    }
-}
-
 /// Drop host-side staging for a handle that is gone for good.
 pub(crate) fn forget_staged(handle: usize) {
     crate::jni::unstage(handle);
