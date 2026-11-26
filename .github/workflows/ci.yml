@@ -4,6 +4,9 @@ name: CI
 # on this repository (see docs/DECISIONS.md DEC-023) rather than assumed:
 # `cargo clippy` is warning-free, `cargo fmt --check` is clean as of the
 # formatting commit, and the .NET GUI suite is 49/49.
+# Every cargo clippy/test/build step runs with `--locked`: a Cargo.lock that
+# has drifted from the manifests fails the gate instead of being silently
+# rewritten on the runner (and builds stay reproducible).
 on:
   pull_request:
   push:
@@ -51,7 +54,7 @@ jobs:
           CARGO_TERM_COLOR: never
         run: |
           set +e
-          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             # clippy prints "error: ...", "warning: ..." and the
@@ -64,11 +67,11 @@ jobs:
           exit "$status"
 
       - name: Full Rust workspace tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build release FFI library & Linux .NET server host
         run: |
-          cargo build --release -p aetherlink-ffi
+          cargo build --locked --release -p aetherlink-ffi
           dotnet publish dotnet/AetherLink.Server/AetherLink.Server.csproj -c Release -r linux-x64
 
   windows-client-and-gui:
@@ -109,7 +112,7 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
+          $out = cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | Out-String
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             ($out -split "`n") | Where-Object { $_ -match '^(error|warning)|^\s+--> ' } | Select-Object -First 20 |
@@ -126,7 +129,7 @@ jobs:
           # `$env:RUNNER_TEMP`, not /tmp: there is no /tmp on a Windows runner,
           # and Tee-Object would fail before cargo even ran.
           $log = Join-Path $env:RUNNER_TEMP "test.log"
-          cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath $log
+          cargo test --locked --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath $log
           $status = $LASTEXITCODE
           if ($status -ne 0) {
             $fails = @(Select-String -Path $log -Pattern '^\s*---- (\S+) stdout ----' |
@@ -139,7 +142,7 @@ jobs:
           exit $status
 
       - name: Build release FFI library
-        run: cargo build --release -p aetherlink-ffi
+        run: cargo build --locked --release -p aetherlink-ffi
 
       - name: .NET GUI unit tests
         run: dotnet test dotnet/AetherLink.Gui.Tests/AetherLink.Gui.Tests.csproj -c Release
@@ -176,7 +179,7 @@ jobs:
       - name: Clippy for the Android target (warnings are errors)
         env:
           CARGO_TERM_COLOR: never
-        run: cargo ndk --platform 26 -t arm64-v8a clippy -p aetherlink-ffi -- -D warnings
+        run: cargo ndk --platform 26 -t arm64-v8a clippy --locked -p aetherlink-ffi -- -D warnings
 
       - name: Core .so (3 ABIs) + debug APK
         run: bash scripts/build_android.sh debug

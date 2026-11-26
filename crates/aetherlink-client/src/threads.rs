@@ -49,8 +49,86 @@ const TLS_OUTBOX_MAX: usize = 512;
 /// a 24-byte `FrameHeader` across two TLS records.
 const TLS_BATCH_FRAMES: usize = 32;
 const TLS_BATCH_BYTES: usize = 16 * 1024;
-/// Periodic mux `PING` interval when no upload frames have been sent recently.
-const TLS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Default idle mux `PING` interval (`client.keepalive_s` overrides it).
+pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(15);
+/// Keepalive intervals a PING may stay unanswered (no byte at all from the
+/// server) before the transport is declared dead.
+pub const KEEPALIVE_MISSES: u32 = 3;
+
+/// Config-derived tunables of the TLS pump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsPumpOptions {
+    /// Frame padding multiple (`client.pad_multiple`).
+    pub pad: usize,
+    /// Idle PING interval (`client.keepalive_s`).
+    pub keepalive: Duration,
+}
+
+impl TlsPumpOptions {
+    /// `pad` with the default keepalive.
+    #[must_use]
+    pub fn new(pad: usize) -> Self {
+        Self {
+            pad,
+            keepalive: DEFAULT_KEEPALIVE,
+        }
+    }
+
+    /// Padding and keepalive from a validated client config.
+    #[must_use]
+    pub fn from_config(config: &crate::config::ClientConfig) -> Self {
+        Self {
+            pad: config.pad_multiple,
+            // `parse` rejects 0; a hand-built config must not turn the idle
+            // PING into a busy loop either.
+            keepalive: Duration::from_secs(config.keepalive_s.max(1)),
+        }
+    }
+
+    /// Silence after an unanswered PING that ends the transport.
+    #[must_use]
+    pub fn dead_after(&self) -> Duration {
+        self.keepalive.saturating_mul(KEEPALIVE_MISSES)
+    }
+}
+
+/// `reconnect` type for a TLS pump that never re-dials.
+pub type NoReconnect = fn() -> crate::Result<ConnectedTunnel>;
+
+/// Dead-peer bookkeeping for the TLS pump.
+///
+/// Only armed once the server has echoed a PING: servers that predate the
+/// echo never answer, and timing them out would drop every idle session.
+/// Any byte from the server proves it alive; the clock starts at the first
+/// PING sent since then.
+#[derive(Debug, Default)]
+struct PeerLiveness {
+    echoes_ping: bool,
+    unanswered_since: Option<Instant>,
+}
+
+impl PeerLiveness {
+    /// A keepalive PING left in full.
+    fn ping_sent(&mut self, now: Instant) {
+        self.unanswered_since.get_or_insert(now);
+    }
+
+    /// Bytes arrived from the server.
+    fn heard_from_peer(&mut self) {
+        self.unanswered_since = None;
+    }
+
+    /// A PING came back: the server echoes, so silence now means trouble.
+    fn echo_seen(&mut self) {
+        self.echoes_ping = true;
+    }
+
+    /// `Some(silence)` once an echoing server stayed silent past `dead_after`.
+    fn dead(&self, now: Instant, dead_after: Duration) -> Option<Duration> {
+        let silent = now.saturating_duration_since(self.unanswered_since?);
+        (self.echoes_ping && silent >= dead_after).then_some(silent)
+    }
+}
 
 /// Write one sealed frame: 24B header + ciphertext.
 ///
@@ -431,7 +509,7 @@ pub fn spawn_pump_tls<T>(
 where
     T: TunPackets + Send + 'static,
 {
-    spawn_pump_tls_resilient::<T, fn() -> crate::Result<ConnectedTunnel>>(tun, tunnel, pad, None)
+    spawn_pump_tls_with(tun, tunnel, TlsPumpOptions::new(pad), None::<NoReconnect>)
 }
 
 /// Spawn the non-blocking full-duplex TLS pump with optional automatic transport
@@ -447,7 +525,30 @@ where
     T: TunPackets + Send + 'static,
     R: Fn() -> crate::Result<ConnectedTunnel> + Send + 'static,
 {
+    spawn_pump_tls_with(tun, tunnel, TlsPumpOptions::new(pad), reconnect)
+}
+
+/// [`spawn_pump_tls_resilient`] with every config-derived tunable
+/// (production path: `TlsPumpOptions::from_config`).
+///
+/// Keepalive: after `opts.keepalive` without upload frames the pump sends a
+/// PING; once the server has shown it echoes PINGs, `opts.dead_after()` of
+/// total silence after one ends the transport ("keepalive timeout"), which
+/// triggers the transparent reconnect when `reconnect` is set.
+pub fn spawn_pump_tls_with<T, R>(
+    tun: Arc<Mutex<T>>,
+    tunnel: ConnectedTunnel,
+    opts: TlsPumpOptions,
+    reconnect: Option<R>,
+) -> std::io::Result<PumpHandle>
+where
+    T: TunPackets + Send + 'static,
+    R: Fn() -> crate::Result<ConnectedTunnel> + Send + 'static,
+{
     use std::io::ErrorKind;
+
+    let TlsPumpOptions { pad, keepalive } = opts;
+    let dead_after = opts.dead_after();
 
     let ConnectedTunnel { mut stream, sess } = tunnel;
     let _ = stream.sock.set_nodelay(true);
@@ -482,6 +583,7 @@ where
         let mut write_stalled_since: Option<Instant> = None;
         let mut rx_partial_since: Option<Instant> = None;
         let mut last_tx = Instant::now();
+        let mut liveness = PeerLiveness::default();
 
         // Drain any post-handshake plaintext bytes buffered alongside ServerAuthOk.
         if let Ok(state) = stream.conn.process_new_packets() {
@@ -639,9 +741,7 @@ where
                 // 4. Periodic idle keepalive so NATs and middleboxes keep state warm.
                 //    Includes a 16-byte zero body so older servers that read non-empty
                 //    frame bodies directly do not misread `read(&mut []) -> Ok(0)` as EOF.
-                if !stream.conn.wants_write()
-                    && outbox.is_empty()
-                    && last_tx.elapsed() >= TLS_KEEPALIVE_INTERVAL
+                if !stream.conn.wants_write() && outbox.is_empty() && last_tx.elapsed() >= keepalive
                 {
                     tx_buf.clear();
                     // Keepalive PING has an empty, unsealed body: generation
@@ -662,7 +762,10 @@ where
                         // Any successful return proves the keepalive left in
                         // full: `write_tls_all` only returns on an empty
                         // remainder or a WouldBlock, and WouldBlock is Err.
-                        Ok(_) => last_tx = Instant::now(),
+                        Ok(_) => {
+                            last_tx = Instant::now();
+                            liveness.ping_sent(last_tx);
+                        }
                         Err(e) => break 'pump format!("tls keepalive write failed: {e}"),
                     }
                 }
@@ -682,6 +785,7 @@ where
                         Ok(_) => {
                             progressed = true;
                             rx_partial_since = None;
+                            liveness.heard_from_peer();
                             match stream.conn.process_new_packets() {
                                 Ok(state) => {
                                     let avail = state.plaintext_bytes_to_read();
@@ -762,6 +866,9 @@ where
                                         header.frame_type, header.stream_id, header.length
                                     ));
                                 }
+                                if header.frame_type == FrameType::Ping {
+                                    liveness.echo_seen();
+                                }
                                 if let Err(e) = pump.receive_mux(header, ct, &mut *guard) {
                                     aetherlink_netstack::debug_log(&format!(
                                         "pump: tls frame dropped: {e}"
@@ -779,6 +886,14 @@ where
 
                 if let Some(reason) = peer_eof {
                     break 'pump reason;
+                }
+
+                // 7. Dead peer: an echoing server went silent after a PING.
+                if let Some(silent) = liveness.dead(Instant::now(), dead_after) {
+                    break 'pump format!(
+                        "keepalive timeout: no reply from server for {} ms",
+                        silent.as_millis()
+                    );
                 }
 
                 if !progressed {
@@ -836,6 +951,9 @@ where
                         write_stalled_since = None;
                         rx_partial_since = None;
                         last_tx = Instant::now();
+                        // New transport (possibly a restarted server): learn
+                        // its echo support again before timing it out.
+                        liveness = PeerLiveness::default();
                         if let Ok(state) = new_stream.conn.process_new_packets() {
                             let avail = state.plaintext_bytes_to_read();
                             if avail > 0 {
@@ -945,5 +1063,79 @@ mod read_tests {
         let (h, ct) = read_sealed(&mut r).expect("frame assembles");
         assert_eq!(h.stream_id, 7);
         assert_eq!(ct, b"ABC");
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    const DEAD: Duration = Duration::from_secs(45);
+
+    #[test]
+    fn silence_without_echo_support_never_kills() {
+        // Given: a server that has never echoed (predates the echo)
+        let mut live = PeerLiveness::default();
+        let t0 = Instant::now();
+        live.ping_sent(t0);
+        // Then: even far past the bound the transport is left alone.
+        assert_eq!(live.dead(t0 + DEAD * 10, DEAD), None);
+    }
+
+    #[test]
+    fn echoing_server_silent_past_bound_is_dead() {
+        let mut live = PeerLiveness::default();
+        live.echo_seen();
+        let t0 = Instant::now();
+        live.ping_sent(t0);
+        // A later PING does not restart the clock.
+        live.ping_sent(t0 + DEAD / 3);
+        assert_eq!(live.dead(t0 + DEAD - Duration::from_millis(1), DEAD), None);
+        assert_eq!(live.dead(t0 + DEAD, DEAD), Some(DEAD));
+    }
+
+    #[test]
+    fn any_byte_from_server_clears_the_clock() {
+        let mut live = PeerLiveness::default();
+        live.echo_seen();
+        let t0 = Instant::now();
+        live.ping_sent(t0);
+        live.heard_from_peer();
+        assert_eq!(live.dead(t0 + DEAD * 2, DEAD), None);
+        // The next PING starts a fresh window.
+        live.ping_sent(t0 + DEAD * 2);
+        assert_eq!(live.dead(t0 + DEAD * 2 + DEAD / 2, DEAD), None);
+        assert!(live.dead(t0 + DEAD * 3, DEAD).is_some());
+    }
+
+    #[test]
+    fn options_follow_config_keepalive() {
+        let parse = |extra: serde_json::Value| {
+            let mut doc = serde_json::json!({
+                "server_addr": "example.com:443",
+                "psk": "unit-test-psk-0123456789",
+            });
+            if let (Some(map), Some(more)) = (doc.as_object_mut(), extra.as_object()) {
+                map.extend(more.clone());
+            }
+            crate::config::ClientConfig::parse(&doc).expect("valid config")
+        };
+        // Default: 15 s interval, dead after 3 silent intervals.
+        let opts = TlsPumpOptions::from_config(&parse(serde_json::json!({})));
+        assert_eq!(opts, TlsPumpOptions::new(128));
+        assert_eq!(opts.keepalive, DEFAULT_KEEPALIVE);
+        assert_eq!(opts.dead_after(), Duration::from_secs(45));
+        // Configured: `keepalive_s` and `pad_multiple` reach the pump.
+        let mut cfg = parse(serde_json::json!({"keepalive_s": 25, "pad_multiple": 64}));
+        let opts = TlsPumpOptions::from_config(&cfg);
+        assert_eq!(opts.keepalive, Duration::from_secs(25));
+        assert_eq!(opts.pad, 64);
+        assert_eq!(opts.dead_after(), Duration::from_secs(75));
+        // A hand-built zero never becomes a busy loop.
+        cfg.keepalive_s = 0;
+        assert_eq!(
+            TlsPumpOptions::from_config(&cfg).keepalive,
+            Duration::from_secs(1)
+        );
     }
 }

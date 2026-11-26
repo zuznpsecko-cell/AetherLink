@@ -30,4 +30,9 @@
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <PackageReference Include="Microsoft.Win32.SystemEvents" Version="10.0.1" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- FFI result-code policy shared by the .NET hosts (tested in AetherLink.Gui.Tests). -->
+    <Compile Include="..\Shared\CoreRecovery.cs" Link="Shared\CoreRecovery.cs" />
+  </ItemGroup>
 </Project>

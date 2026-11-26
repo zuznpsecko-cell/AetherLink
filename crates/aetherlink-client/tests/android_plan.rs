@@ -24,7 +24,7 @@ fn all_mode_config() -> ClientConfig {
     config(json!({
         "client": {
             "server_addr": "31.57.158.233:443",
-            "psk": "test-psk",
+            "psk": "test-psk-32-bytes-long-exactly!!",
             "full_tunnel": {
                 "mtu": 1400,
                 "include_private_lan_direct": false
@@ -275,7 +275,7 @@ fn lan_direct_config() -> ClientConfig {
     config(json!({
         "client": {
             "server_addr": "31.57.158.233:443",
-            "psk": "test-psk",
+            "psk": "test-psk-32-bytes-long-exactly!!",
             "full_tunnel": {
                 "mtu": 1400,
                 "include_private_lan_direct": true

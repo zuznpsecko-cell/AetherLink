@@ -728,7 +728,7 @@ mod tests {
     }
 
     fn create() -> usize {
-        let cfg = CString::new(r#"{"server_addr":"127.0.0.1:9","psk":"guard-test-psk"}"#)
+        let cfg = CString::new(r#"{"server_addr":"127.0.0.1:9","psk":"guard-test-psk-long"}"#)
             .expect("cstring");
         let h = unsafe { aether_client_create(cfg.as_ptr()) };
         assert_ne!(h, 0, "create: {:?}", last_error_text());

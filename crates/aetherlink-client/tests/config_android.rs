@@ -16,7 +16,7 @@ fn config(doc: Value) -> ClientConfig {
 fn base_client() -> Value {
     json!({
         "server_addr": "31.57.158.233:443",
-        "psk": "test-psk",
+        "psk": "test-psk-32-bytes-long-exactly!!",
         "full_tunnel": { "mtu": 1400, "include_private_lan_direct": true }
     })
 }
@@ -145,7 +145,7 @@ fn desktop_config_without_android_or_tls_sections_is_unchanged() {
     let cfg = config(json!({
         "client": {
             "server_addr": "server.example.com:443",
-            "psk": "test-psk"
+            "psk": "test-psk-32-bytes-long-exactly!!"
         }
     }));
 

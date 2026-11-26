@@ -14,11 +14,11 @@ pub struct ClientConfig {
     pub server_addr: String,
     /// SNI presented outside (defaults to the host part).
     pub outer_sni: String,
-    /// Pre-shared key (required, non-empty; never logged).
+    /// Pre-shared key (required, at least `MIN_PSK_LEN` bytes; never logged).
     pub psk: String,
     /// Frame padding multiple.
     pub pad_multiple: usize,
-    /// Keepalive interval, seconds.
+    /// Idle keepalive PING interval, seconds (> 0, default 15).
     pub keepalive_s: u64,
     /// TUN MTU.
     pub mtu: u32,
@@ -97,6 +97,13 @@ impl ClientConfig {
         let server_addr = required_str(doc, "server_addr")?;
         let (host, _port) = parse_port(&server_addr)?;
         let psk = required_str(doc, "psk")?;
+        // Length only — the value itself never goes into an error or a log.
+        if psk.len() < aetherlink_crypto::MIN_PSK_LEN {
+            return Err(ClientError::ConfigError(format!(
+                "psk too short: need at least {} bytes",
+                aetherlink_crypto::MIN_PSK_LEN
+            )));
+        }
         let dns_mode = doc
             .get("dns_mode")
             .and_then(serde_json::Value::as_str)
@@ -119,6 +126,17 @@ impl ClientConfig {
         if pad_multiple == 0 {
             return Err(ClientError::ConfigError(
                 "pad_multiple must be > 0".to_string(),
+            ));
+        }
+        // Idle PING interval; the client drops a transport whose (echoing)
+        // server stays silent for 3 intervals after one. 0 would busy-loop.
+        let keepalive_s = doc
+            .get("keepalive_s")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(15);
+        if keepalive_s == 0 {
+            return Err(ClientError::ConfigError(
+                "keepalive_s must be > 0".to_string(),
             ));
         }
         let full = doc.get("full_tunnel");
@@ -148,10 +166,7 @@ impl ClientConfig {
             outer_sni,
             psk,
             pad_multiple,
-            keepalive_s: doc
-                .get("keepalive_s")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(15),
+            keepalive_s,
             mtu,
             kill_switch: get_bool(full, "kill_switch", false),
             restore_on_exit: get_bool(full, "restore_on_exit", true),

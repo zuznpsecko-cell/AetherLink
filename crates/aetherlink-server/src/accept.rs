@@ -1505,7 +1505,14 @@ fn tunnel_loop(
                 }
             }
             FrameType::Ping => {
-                debug_log("tunnel: ping");
+                // Echo the keepalive verbatim: it is unsealed (zero body, or
+                // padding the client chose) and carries no stream state. The
+                // client uses the reply for dead-peer detection; clients that
+                // predate the echo log it as a dropped frame and carry on.
+                debug_log("tunnel: ping, echoing");
+                if let Err(e) = write_sealed(stream, &header, &ct) {
+                    return format!("ping echo write failed: {e}");
+                }
                 continue;
             }
             FrameType::GoAway => {

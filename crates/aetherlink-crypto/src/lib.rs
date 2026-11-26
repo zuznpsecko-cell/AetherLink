@@ -69,6 +69,12 @@ pub const HKDF_TX_LABEL: &[u8] = b"tx";
 /// HKDF label for RX direction
 pub const HKDF_RX_LABEL: &[u8] = b"rx";
 
+/// Minimum pre-shared key length in bytes, enforced where configs are
+/// parsed (client and server). The PSK is the only secret behind the HMAC
+/// token and the HKDF session keys, and a captured handshake allows offline
+/// guessing, so short human-chosen keys are refused outright.
+pub const MIN_PSK_LEN: usize = 16;
+
 /// Default nonce replay cache TTL (5 minutes)
 pub const DEFAULT_NONCE_TTL_SECS: u64 = 300;
 

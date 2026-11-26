@@ -1839,6 +1839,14 @@ fn zero_and_padded_ping_keep_tunnel_alive() {
         generation: 0,
     };
     wire_help::write_frame(&mut stream, &ping0, &[]);
+    // ...and is echoed back verbatim: the client's dead-peer detection
+    // counts on that reply.
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(
+        (h.frame_type, h.length, h.stream_id),
+        (FrameType::Ping, 0, 0)
+    );
+    assert!(c.is_empty());
 
     // 2. 16-byte padded Ping (sent by non-blocking TLS keepalive) also succeeds.
     let ping16 = FrameHeader {
@@ -1850,6 +1858,12 @@ fn zero_and_padded_ping_keep_tunnel_alive() {
         generation: 0,
     };
     wire_help::write_frame(&mut stream, &ping16, &[0u8; 16]);
+    let (h, c) = wire_help::read_frame(&mut stream);
+    assert_eq!(
+        (h.frame_type, h.length, h.stream_id),
+        (FrameType::Ping, 16, 0)
+    );
+    assert_eq!(c, [0u8; 16]);
 
     // 3. Subsequent stream open + data still succeeds on the same tunnel session.
     let s1 = sess.mux.open_tcp("127.0.0.1", echo).expect("open");

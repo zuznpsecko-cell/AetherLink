@@ -1070,4 +1070,103 @@ other than `WouldBlock` (`Err(_) => break`). A single `ECONNABORTED` or an
 - `crates/aetherlink-server/tests/bind_serve.rs`: `bind` accepts a SEC1 key
   and completes a real TLS handshake with it; the PEM helper reproduces
   rcgen's PKCS#8 armour. There is no PKCS#1 test: rcgen (ring backend) cannot
-  generate RSA keys; a fixed RSA PEM fixture would be needed.
+  generate RSA keys; a fixed RSA PEM fixture would be needed. *(Closed by
+  DEC-025: `bind_accepts_a_pkcs1_rsa_private_key` with a committed fixture.)*
+
+## DEC-025: Dead-peer detection, PSK floor, O(1) replay cache, locked builds
+
+**Date:** 2026-11-26
+**Status:** Accepted
+
+### Context
+Review follow-ups, each small, each a real gap:
+
+1. **Cargo.lock had drifted from the manifests** (core listed `tracing` and
+   `webpki`, crypto/frame/protocol listed `hex`; frame lacked `rand`, protocol
+   lacked `bytes`). CI ran without `--locked`, so every runner silently
+   rewrote the lock and builds were not reproducible.
+2. **No dead-peer detection when idle.** The client sent a keepalive PING
+   every 15 s (hard-coded; `keepalive_s` was parsed and ignored), the server
+   swallowed it (`Ping => continue`), so a hung server or a blackholed return
+   path stayed "up" until a write eventually stalled.
+3. **.NET hosts ignored `Busy = -12`** (DEC-024), and the CLI host had no
+   `StaleState = -11` recovery at all (only the GUI did).
+4. **Any non-empty PSK was accepted**, `"x"` included. The PSK is the only
+   secret behind the HMAC token and the HKDF session keys, and a captured
+   handshake allows offline guessing.
+5. **`NonceCache` was a `Vec`**: O(n) replay scan and `remove(0)` under one
+   lock on every accepted handshake (10 000 entries by default),
+   `lock().unwrap()` (one panic poisons auth for the whole server), and
+   `max_entries = 0` panicked on `remove(0)` of an empty vector.
+6. **DEC-024's PKCS#1 key path had no test.**
+
+### Decision
+- **Locked builds.** The lock is reconciled with the manifests (no version
+  changes, no new packages; `hex` and `webpki` were referenced only by the
+  stale entries and are gone). Every `cargo clippy/test/build` step in CI —
+  Linux, Windows and the Android clippy — runs with `--locked`.
+- **Echo PING.** The server echoes each PING verbatim (unsealed, same body).
+  The client accepts PING in `receive_mux`, takes the idle interval from
+  `client.keepalive_s` (default 15, `0` rejected at parse time) and, once the
+  server has echoed at least one PING, ends the transport when nothing at all
+  arrives for `3 × keepalive_s` after a PING ("keepalive timeout"). The
+  resilient pump then re-dials as for any transport drop. Plumbing:
+  `threads::TlsPumpOptions` (`from_config`) + `spawn_pump_tls_with`; the old
+  `spawn_pump_tls(…, pad)` / `spawn_pump_tls_resilient` keep their
+  signatures (default keepalive).
+- **Shared host policy for result codes.** `dotnet/Shared/CoreRecovery.cs`
+  (compiled into the GUI and the CLI via `<Compile Link>`) owns the codes and
+  the policy: Busy → bounded retry (5 × 200 ms, the core did nothing), up
+  answering StaleState → restore the network (`force_cleanup`) and retry once.
+  The GUI retries Busy on `up`/`down` (its StaleState flow in the view model is
+  unchanged); the CLI `up` now recovers from StaleState like the GUI. Kotlin
+  already handled both upstream.
+- **PSK floor: `MIN_PSK_LEN = 16` bytes** (`aetherlink_crypto`), checked where
+  client and server configs are parsed. Bytes, not characters — that is what
+  HMAC/HKDF consume. The error says "psk too short" and never echoes the value.
+- **`NonceCache` = `HashSet` + insertion-ordered `VecDeque`.** `Instant` is
+  monotonic and every insert stamps `now`, so expiry and capacity eviction pop
+  from the front: O(1) amortised lookup/insert. The lock is taken with
+  `PoisonError::into_inner` (every mutation keeps both structures consistent
+  before anything can panic); `max_entries` is clamped to ≥ 1. Only nonces
+  that passed token verification reach the cache, so capacity eviction cannot
+  be driven by an unauthenticated peer.
+- **PKCS#1 regression test** with a committed throwaway RSA-2048 identity
+  (`crates/aetherlink-server/tests/fixtures/`, narrow `.gitignore` exception,
+  README states it is not a secret).
+
+### Consequences
+- Configs with a PSK under 16 bytes now fail to load (server: no start;
+  client: `aether_client_create` fails with "psk too short"). The GUI endpoint
+  editor and the Android form still only check "non-empty", so the user sees
+  the core's error on connect. The shipped examples (22 bytes) and
+  `openssl rand -base64 32` (44 bytes) pass.
+- Protocol compatibility both ways: an old client logs the server's echo as a
+  dropped frame and carries on; a new client never times out a server that
+  has not echoed (old servers are treated exactly as before).
+- A Cargo.lock that drifts again fails CI instead of being rewritten.
+
+### Tests
+- Lock: reconciled by inspection (no cargo in the authoring sandbox); the
+  `--locked` gates accept it (CI green on PR #22).
+- `crates/aetherlink-server/tests/e2e_tunnel.rs`: zero-length and 16-byte
+  PINGs are echoed verbatim and the session keeps working.
+- `crates/aetherlink-client/tests/pump.rs`: a PING echo is accepted without
+  touching the TUN.
+- `crates/aetherlink-client/tests/pump_tls.rs`: an echoing server that goes
+  silent is dropped with "keepalive timeout"; a server that never echoes is
+  kept, and the configured interval (not 15 s) paces the PINGs.
+- `crates/aetherlink-client/src/threads.rs` (unit): liveness rules (no echo →
+  never dead, clock not restarted by later PINGs, any byte clears it) and
+  `TlsPumpOptions::from_config`.
+- PSK: `server_fallback_relay.rs` (15 bytes rejected without echo, 16 accepted)
+  and `client/tests/config_schema.rs` (same, plus UTF-8 counted in bytes);
+  short-PSK fixtures across the client/server/FFI tests were lengthened.
+- `crates/aetherlink-crypto/src/auth.rs` (unit): capacity evicts only the
+  oldest, zero cap clamped, expiry purges set and queue, poisoned lock keeps
+  replay protection; the existing replay/expiry tests are unchanged.
+- `crates/aetherlink-server/tests/bind_serve.rs`: `bind` accepts a PKCS#1 RSA
+  key and completes a real TLS handshake with it.
+- `dotnet/AetherLink.Gui.Tests/CoreRecoveryTests.cs`: code values, up policy,
+  bounded Busy retry, StaleState cleanup + single retry, failed cleanup.
+

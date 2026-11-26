@@ -181,11 +181,11 @@ impl Client {
         if let Ok(peer) = tunnel.stream.sock.peer_addr() {
             reconnect_cfg.server_addr = peer.to_string();
         }
-        let pad = self.config.pad_multiple;
-        let handle = threads::spawn_pump_tls_resilient(
+        let opts = threads::TlsPumpOptions::from_config(&self.config);
+        let handle = threads::spawn_pump_tls_with(
             tun,
             tunnel,
-            pad,
+            opts,
             Some(move || lifecycle::connect(&reconnect_cfg, verifier.clone())),
         )
         .map_err(|e| ClientError::PlatformError(format!("tls pump spawn: {e}")))?;
@@ -227,8 +227,8 @@ impl Client {
         if self.pump.is_some() {
             return Ok(());
         }
-        let pad = self.config.pad_multiple;
-        let handle = threads::spawn_pump_tls(tun, tunnel, pad)
+        let opts = threads::TlsPumpOptions::from_config(&self.config);
+        let handle = threads::spawn_pump_tls_with(tun, tunnel, opts, None::<threads::NoReconnect>)
             .map_err(|e| ClientError::PlatformError(format!("tls pump spawn: {e}")))?;
         self.pump = Some(handle);
         Ok(())
@@ -284,8 +284,8 @@ impl Client {
                 "android_connect must run before attaching the tun".to_string(),
             )
         })?;
-        let pad = self.config.pad_multiple;
-        let handle = threads::spawn_pump_tls(tun, tunnel, pad)
+        let opts = threads::TlsPumpOptions::from_config(&self.config);
+        let handle = threads::spawn_pump_tls_with(tun, tunnel, opts, None::<threads::NoReconnect>)
             .map_err(|e| ClientError::PlatformError(format!("tls pump spawn: {e}")))?;
         self.pump = Some(handle);
         self.up = true;

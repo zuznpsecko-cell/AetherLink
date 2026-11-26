@@ -26,7 +26,15 @@ enum KeyPem {
     /// `BEGIN EC PRIVATE KEY` (RFC 5915), as written by
     /// `openssl ecparam -genkey` and many ACME clients.
     Sec1,
+    /// `BEGIN RSA PRIVATE KEY` (PKCS#1), as written by `openssl genrsa` /
+    /// `openssl rsa -traditional`. rcgen cannot generate RSA keys, so this
+    /// one is a committed throwaway fixture (`tests/fixtures/README.md`).
+    Pkcs1Rsa,
 }
+
+/// Self-signed RSA identity for `localhost` (fixture, not a secret).
+const RSA_PKCS1_CERT: &str = include_str!("fixtures/rsa_pkcs1_cert.pem");
+const RSA_PKCS1_KEY: &str = include_str!("fixtures/rsa_pkcs1_key.pem");
 
 /// Test server with real PEM files + static root in a temp dir.
 fn test_server(listen: &str, static_body: &[u8]) -> aetherlink_server::Server {
@@ -154,14 +162,18 @@ fn test_server_with_key(
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
-    std::fs::write(&cert_path, key.cert.pem()).expect("cert");
-    let key_text = match key_pem {
-        KeyPem::Pkcs8 => key.key_pair.serialize_pem(),
-        KeyPem::Sec1 => pem(
-            "EC PRIVATE KEY",
-            &pkcs8_to_sec1(&key.key_pair.serialize_der()),
+    let (cert_text, key_text) = match key_pem {
+        KeyPem::Pkcs8 => (key.cert.pem(), key.key_pair.serialize_pem()),
+        KeyPem::Sec1 => (
+            key.cert.pem(),
+            pem(
+                "EC PRIVATE KEY",
+                &pkcs8_to_sec1(&key.key_pair.serialize_der()),
+            ),
         ),
+        KeyPem::Pkcs1Rsa => (RSA_PKCS1_CERT.to_string(), RSA_PKCS1_KEY.to_string()),
     };
+    std::fs::write(&cert_path, cert_text).expect("cert");
     std::fs::write(&key_path, key_text).expect("key");
     let doc = serde_json::json!({
         "listen": listen,
@@ -216,7 +228,14 @@ fn client_tls(port: u16) -> aetherlink_core::tls::ClientTlsStream {
             Ok(HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+            // ECDSA for the rcgen identities, RSA-PSS (TLS 1.3) for the
+            // PKCS#1 fixture: the server can only sign with a scheme the
+            // client offers.
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+            ]
         }
     }
 
@@ -401,6 +420,35 @@ fn bind_accepts_a_sec1_ec_private_key() {
     assert!(
         String::from_utf8_lossy(&resp).contains("SEC1-OK"),
         "static page over a SEC1-keyed TLS session"
+    );
+    assert_eq!(server.join().expect("server thread"), Path::Static);
+}
+
+#[test]
+fn bind_accepts_a_pkcs1_rsa_private_key() {
+    // Given: key.pem in PKCS#1 form (`BEGIN RSA PRIVATE KEY`) — the other
+    // format DEC-024 stopped re-labelling as PKCS#8.
+    assert!(RSA_PKCS1_KEY.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+    let server = test_server_with_key(
+        "127.0.0.1:0",
+        b"<html><body>PKCS1-OK</body></html>",
+        KeyPem::Pkcs1Rsa,
+    );
+    // When: bind loads it
+    let bound = server.bind().expect("bind must accept a PKCS#1 RSA key");
+    let port = bound.local_addr().expect("local addr").port();
+    let server = std::thread::spawn(move || bound.serve_once());
+
+    // Then: a real TLS handshake signed with that RSA key completes (a bad
+    // preface afterwards just routes to the static page).
+    let mut stream = client_tls(port);
+    stream.write_all(&[0xFF]).expect("bad preface");
+    stream.flush().expect("flush");
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    assert!(
+        String::from_utf8_lossy(&resp).contains("PKCS1-OK"),
+        "static page over a PKCS#1-keyed TLS session"
     );
     assert_eq!(server.join().expect("server thread"), Path::Static);
 }

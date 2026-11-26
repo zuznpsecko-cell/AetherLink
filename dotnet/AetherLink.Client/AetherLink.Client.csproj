@@ -14,4 +14,8 @@
     <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- FFI result-code policy shared by the .NET hosts (tested in AetherLink.Gui.Tests). -->
+    <Compile Include="..\Shared\CoreRecovery.cs" Link="Shared\CoreRecovery.cs" />
+  </ItemGroup>
 </Project>

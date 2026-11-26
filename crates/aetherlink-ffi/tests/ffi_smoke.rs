@@ -42,7 +42,7 @@ fn temp_server_files() -> (String, String, String) {
 fn bindable_server_json() -> String {
     let (cert, key, root) = temp_server_files();
     format!(
-        r#"{{"listen":"127.0.0.1:0","psk":"x","local_static_root":"{root}","tls_cert":"{cert}","tls_key":"{key}"}}"#
+        r#"{{"listen":"127.0.0.1:0","psk":"ffi-test-psk-0123","local_static_root":"{root}","tls_cert":"{cert}","tls_key":"{key}"}}"#
     )
 }
 
@@ -77,7 +77,7 @@ fn ffi_server_start_stop_lifecycle() {
 #[test]
 fn ffi_server_start_requires_listenable_tls() {
     // Given: config without TLS identity files
-    let cfg = c(r#"{"listen":"127.0.0.1:0","psk":"x","local_static_root":"./fallback"}"#);
+    let cfg = c(r#"{"listen":"127.0.0.1:0","psk":"ffi-test-psk-0123","local_static_root":"."}"#);
     // When: starting → Then: no handle (bind fails fast, nothing half-started).
     assert_eq!(unsafe { aether_server_start(cfg.as_ptr()) }, 0);
 }
@@ -105,7 +105,7 @@ fn ffi_accepts_yaml_configs() {
     // Given: a server YAML document with real temp TLS files
     let (cert, key, root) = temp_server_files();
     let server_yaml = format!(
-        "listen: \"127.0.0.1:0\"\npsk: \"x\"\nlocal_static_root: \"{root}\"\ntls_cert: \"{cert}\"\ntls_key: \"{key}\"\n"
+        "listen: \"127.0.0.1:0\"\npsk: \"ffi-test-psk-0123\"\nlocal_static_root: \"{root}\"\ntls_cert: \"{cert}\"\ntls_key: \"{key}\"\n"
     );
     // When: starting → Then: serving handle out.
     let sh = unsafe { aether_server_start(c(&server_yaml).as_ptr()) };
@@ -116,7 +116,7 @@ fn ffi_accepts_yaml_configs() {
 #[test]
 fn ffi_client_create_and_invalid_handle() {
     // Given: valid client config document (psk is required, never defaulted)
-    let cfg = c(r#"{"server_addr":"example.com:443","psk":"x"}"#);
+    let cfg = c(r#"{"server_addr":"example.com:443","psk":"ffi-test-psk-0123"}"#);
     // When: creating
     let h = unsafe { aether_client_create(cfg.as_ptr()) };
     assert_ne!(h, 0, "create must yield a handle");
@@ -143,7 +143,7 @@ fn ffi_client_create_and_invalid_handle() {
 #[test]
 fn ffi_client_free_releases_handle() {
     // Given: a live client handle
-    let cfg = c(r#"{"server_addr":"example.com:443","psk":"x"}"#);
+    let cfg = c(r#"{"server_addr":"example.com:443","psk":"ffi-test-psk-0123"}"#);
     let h = unsafe { aether_client_create(cfg.as_ptr()) };
     assert_ne!(h, 0, "create must yield a handle");
     // When: freeing it

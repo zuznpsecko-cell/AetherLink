@@ -9,12 +9,8 @@ internal static partial class Native
 {
     private const string Lib = "aetherlink_core";
 
-    /// <summary>
-    /// Core error code for "a leftover state file blocks bring-up"
-    /// (previous run died without teardown). The GUI auto-recovers:
-    /// force_cleanup + one retry.
-    /// </summary>
-    internal const int StaleStateCode = -11;
+    // Result codes and what to do with them (StaleState, Busy) live in
+    // dotnet/Shared/CoreRecovery.cs, shared with the CLI host.
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nuint aether_client_create(string configJson);

@@ -96,7 +96,7 @@ fn dns_upstream_is_canonical() {
 #[test]
 fn config_parse_minimal_valid() {
     // Given: minimal server config document
-    let raw = r#"{"listen":"0.0.0.0:443","psk":"abc","local_static_root":"./fallback"}"#;
+    let raw = r#"{"listen":"0.0.0.0:443","psk":"test-psk-0123456789","local_static_root":"."}"#;
     // When: parsing
     // Then: accepted
     config::parse(raw).expect("valid config must parse");
@@ -109,6 +109,22 @@ fn config_rejects_missing_psk() {
     // When: parsing
     // Then: rejected, never default to empty secret
     assert!(config::parse(raw).is_err());
+}
+
+#[test]
+fn config_rejects_short_psk_without_echoing_it() {
+    // Given: a PSK one byte under the minimum
+    let short = "a".repeat(aetherlink_crypto::MIN_PSK_LEN - 1);
+    let raw = format!(r#"{{"listen":"0.0.0.0:443","psk":"{short}","local_static_root":"."}}"#);
+    // When: parsing -> Then: rejected, and the secret is not in the error
+    let err = config::parse(&raw).expect_err("short psk must be rejected");
+    let text = err.to_string();
+    assert!(text.contains("psk too short"), "{text}");
+    assert!(!text.contains(&short), "error must not echo the psk");
+    // And: exactly the minimum is accepted.
+    let ok = "a".repeat(aetherlink_crypto::MIN_PSK_LEN);
+    let raw = format!(r#"{{"listen":"0.0.0.0:443","psk":"{ok}","local_static_root":"."}}"#);
+    config::parse(&raw).expect("minimum-length psk must parse");
 }
 
 #[test]
