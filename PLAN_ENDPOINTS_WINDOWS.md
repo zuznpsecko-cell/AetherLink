@@ -1,5 +1,11 @@
 # PLAN — несколько эндпоинтов в Windows-клиенте AetherLink
 
+> **Статус на 2026-11-25:** реализовано в коде (Phase 17 в `docs/STATUS.md`):
+> `client.endpoints` + зеркало, UI профилей, 49/49 .NET-тестов и `check_gui_endpoints.ps1`
+> гоняются в CI. **Не выполнена** ручная матрица L3 (§5): живое переключение `Down → Up`
+> между серверами, восстановление после kill, логи без PSK. Android-профили (§10) не начаты.
+> Текст плана ниже не переписывался. Актуально: [`docs/WINDOWS_GUI.md`](docs/WINDOWS_GUI.md).
+
 _Дата: 2026-10-26. Клиент: `dotnet/AetherLink.Gui` (Avalonia, Windows). Android — отдельным этапом после живого теста (§10)._
 
 Статус: черновик к исполнению. Реализация — только после подтверждения плана.
@@ -121,7 +127,7 @@ public sealed partial class EndpointProfile : ObservableObject
 │ ┌ Endpoints ─────────┐ ┌ Редактор ────────────────────────┐ │
 │ │ home   1.2.3.4:443 │ │ Name       [home             ]   │ │
 │ │ backup 5.6.7.8:443 │ │ Address    [1.2.3.4:443      ]   │ │
-│ │                    │ │ Outer SNI  [selmedia.ru      ]   │ │
+│ │                    │ │ Outer SNI  [vpn.example.com  ]   │ │
 │ │ [Add] [Duplicate]  │ │ PSK        [************     ]   │ │
 │ │ [Delete]           │ │                                  │ │
 │ └────────────────────┘ │ Full tunnel [x]                  │ │

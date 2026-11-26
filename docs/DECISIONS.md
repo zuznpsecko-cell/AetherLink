@@ -164,6 +164,16 @@ G1 invariant requires TLS fingerprint to look like browser HTTPS.
 - Custom fingerprinting is complex and brittle
 - MVP goal: working tunnel, not perfect stealth
 
+### Amendment (2026-11-25, documenting existing code)
+ALPN differs by side (`crates/aetherlink-core/src/tls.rs`):
+- **Client** offers `h2`, `http/1.1` (browser-like ClientHello).
+- **Server** offers only `http/1.1`. The static fallback answers in raw
+  HTTP/1.1; a browser that negotiated `h2` would expect HTTP/2 framing and
+  fail to render the decoy page. The tunnel itself ignores ALPN, so the
+  client still connects.
+
+Checking the server by hand: `openssl s_client -alpn http/1.1`.
+
 ---
 
 ## DEC-008: Frame Padding Strategy

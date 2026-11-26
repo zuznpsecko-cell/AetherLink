@@ -1,17 +1,21 @@
 # AetherLink v1.5 — Implementation Status
 
-_Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilience (DEC-015) + header authentication (DEC-016), typed replay (DEC-017), library/deploy split (DEC-018), FFI lock (DEC-019), idempotent OPEN (DEC-020), egress policy (DEC-021), resolution off the loop (DEC-022), measured CI gates (DEC-023); gates NOT run yet. Previous baseline: GUI endpoint profiles 49/49 .NET tests; Rust TDD 230/230, TUNNEL WORKS live vs VPS: DNS+TCP+HTTP proven, egress=VPS; perf frontier: speedtest 235ms/20Mbps/0up — see docs/LIVE_ISSUES.md)_
+_Last Updated: 2026-11-25 (сверка документации с кодом после DEC-024; `main` = `ed1b979`)._
 
-> **0l (upload 0.00): фикс в дереве, гейты НЕ прогонялись.** Причины и список правок — в
-> [docs/LIVE_ISSUES.md](LIVE_ISSUES.md#0l-аплоад-000-байты-терялись-молча-fin-убивал-ответ-id-кончались-в-дереве-гейты-не-прогонялись).
-> В рабочей песочнице нет Rust toolchain, поэтому `cargo fmt --check` / `clippy -D warnings` /
-> `cargo test --workspace` и живой замер спидтеста нужно выполнить локально.
+## Сейчас
 
-> ⚠️ **Протокол v2 (DEC-014) — ломающее изменение, гейты НЕ прогонялись.** Заголовок кадра
-> несёт `generation: u32` (offset 11..15), nonce = `id || generation || seq || type || 0`.
-> Закрывает повтор AEAD nonce при переиспользовании stream id (в v1 неизбежный после
-> 32 768 выдач id, начиная с `(id, 0, OpenTcp)`). `PROTOCOL_VERSION = 2`: v1-пир получает
-> отказ на байе preface. Клиент и сервер нужно обновлять вместе.
+- **Гейты зелёные на `main`.** Каждый PR блокирующе проходит `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace` на Linux
+  **и** Windows, `dotnet test` GUI, сборку .NET-хостов и контрактные скрипты (DEC-023).
+  Не гейтятся: сборка Android (нет NDK/SDK в раннере) и всё живое (TUN, VPS).
+- **Живьём против VPS туннель работает** (Windows-клиент): DNS + TCP + HTTP, egress = VPS
+  (`docs/LIVE_ISSUES.md`, §0). Открыт аплоад (§0m): фикс управления потоком в `main`,
+  живой замер после него не делался.
+- **Протокол v2** (DEC-014, DEC-016): ломающее изменение, клиент и сервер обновляются
+  вместе; v1-пир получает отказ на байте preface.
+- **Платформы:** сервер — Linux/Windows; десктоп-клиент — **только Windows** (Linux TUN
+  не реализован); Android — Rust-часть готова, Kotlin-хост каркас (`docs/ANDROID.md`).
+- Решения: DEC-001…DEC-024 в `docs/DECISIONS.md`.
 
 ## Overview
 
@@ -22,22 +26,22 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 | **Phase 2: Frame Protocol** | ✅ Done (v2) | 24B header + `generation` (DEC-014), len-prefix padding, random reserved tail, header authenticated as AEAD AAD (DEC-016); the unused `codec::ReplayWindow` was deleted — the only replay window lives in `mux::manager::open` (DEC-017) |
 | **Phase 3: Mux Layer** | ✅ Done | TCP streams + UDP flows, per-incarnation generation + anti-replay, virtual DNS, OPEN frames (6+8, +8 nonce tests) |
 | **Phase 4: Golden spec** | ✅ Done | `protocol/` canonical consts, `build_nonce`, pinned v2 header bytes + nonce layout (5+8); AAD layout pinned in `frame/tests/header_auth.rs` |
-| **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, ALPN h2, sync I/O (3) |
+| **Phase 5: TLS Transport** | ✅ Done | rustls TLS1.3-only, sync I/O; ALPN: client `h2,http/1.1`, server `http/1.1` only (DEC-007 amendment); server keys PKCS#8/PKCS#1/SEC1 (DEC-024) |
 | **Phase A: Session handshake** | ✅ Done | PREFACE+AUTH → keys → mux DATA both ways (4) |
-| **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve (8+4+4+1); resilience hardening in DEC-015 |
-| **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun open + TunPackets/DataPump + pump threads tested; Windows up/down live cycle green (LIVE_W4); traffic through tunnel pending transport attach |
+| **Phase 6: Server Core** | ✅ Done | Fallback/AUTH/relay/dial/resolve + accept-loop + bind/serve; resilience (DEC-015), egress policy (DEC-021), accept loop survives `accept()` errors (DEC-024) |
+| **Phase 7: Netstack** | 🔄 Partial | Snapshot/rollback + IP pump + socket pump + wintun + TunPackets/DataPump + pump threads; Windows: transport attached, live traffic through the tunnel proven. **Linux TUN (`/dev/net/tun`) not implemented** — `TunInterface::open` returns an error off Windows |
 | **Phase T: TLS fidelity** | ⏳ Next | DEC-012 accepted; golden profile + fallback-shape tests pending (see PLAN_FINAL_TDD.md) |
 | **Phase 8: Full Tunnel + Routing** | ✅ Done | Ruleset/DNS-policy/cleanup + full `up` over fake platform (8+11) |
-| **Phase 9: FFI API** | ✅ Done | C ABI smoke + rules/log-cb/android-fd + JNI symbols (5+5) |
+| **Phase 9: FFI API** | ✅ Done | C ABI + JNI (13 functions); panic-safe exports, `Busy` slots + deferred `free`, `aether_server_is_running` (DEC-019, DEC-024) |
 | **Phase 10: Client Integration** | ✅ Done | Typed config, lifecycle, status JSON |
 | **Phase 11: Testing + Docs** | 🔄 Partial | PLAN_FINAL_TDD.md is the live plan; DoD checklist below |
-| **Phase 12: Windows Wintun** | 🔄 Partial | Version pinned, host load path + deploy note; session bring-up pending privs |
+| **Phase 12: Windows Wintun** | ✅ Done | Version pinned, host load path + deploy note; session bring-up and live up/down proven (LIVE_W4, live tunnel vs VPS) |
 | **Phase 13: .NET Hosts** | ✅ Done | Server/Client build 0/0, thin (grep-enforced), status cmd, quickstart scripts |
-| **Phase 14: Android** | ✅ Done (build) | minSdk 26, APK assembles with 3 ABIs + JNI; on-device test pending |
+| **Phase 14: Android** | 🔄 Partial | Rust side done (plan/split/protect/attach/cleanup, JNI). APK assembles with 3 ABIs, but the Kotlin host is a skeleton (handle 0, no Activity, Android flow not called) — no tunnel on a device yet |
 | **Phase 15: Deploy Scripts** | ✅ Done | install/uninstall from dist + example configs + checks |
-| **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live runbook pending privs |
+| **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live tunnel vs VPS on Windows proven; full live runbook (I6) pending |
 | **Phase 17: GUI endpoint profiles** | ✅ Done (code) | `client.endpoints` + mirror, 49/49 .NET tests, `check_gui_endpoints.ps1`; live switching matrix pending admin/VPS |
-| **Phase I: Assembly (VPN works)** | ⏳ Next | OPEN frames → bind/serve loop → client up tail → FFI threads → live E2E (see PLAN_FINAL_TDD.md) |
+| **Phase I: Assembly (VPN works)** | 🔄 Mostly done | OPEN frames, bind/serve loop, client `up` tail, FFI threads, E2E over localhost (I1–I5, I7) done; live tunnel vs VPS proven; full live checklist I6 (kill -9, DNS no-leak capture, domain-direct) pending |
 
 ## Detailed Status
 
@@ -46,9 +50,19 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] Root `Cargo.toml` with workspace config
 - [x] Individual crate `Cargo.toml` files
 - [x] `protocol/` crate with golden test harness
-- [x] `DECISIONS.md` (DEC-001..DEC-023)
+- [x] `DECISIONS.md` (DEC-001..DEC-024)
 - [x] `STATUS.md` (this file)
 - [x] Basic `README.md`
+
+### Phase 23: FFI boundary & accept-loop hardening (DEC-024)
+
+- [x] Accept loop classifies `accept()` errors: per-peer → retry, resource exhaustion → backoff 10 ms…1 s, broken listener → stop with reason
+- [x] `ServerGuard::is_running/failure` + `aether_server_is_running`; .NET server host exits 1 when the listener dies (systemd restarts it)
+- [x] Server TLS keys passed typed: PKCS#1 and SEC1 accepted (were relabelled as PKCS#8 and rejected)
+- [x] FFI handle table keeps a `Busy` slot during a call; `free` racing a call is deferred, never resurrects the handle; new code `Busy = -12`
+- [x] Every C ABI / JNI export in `catch_unwind` (panic → `InternalError` + `last_error`); poison-tolerant mutexes; invalid UTF-8 arguments are errors
+- [x] Tests: `server/tests/accept_errors.rs` (12), `bind_serve.rs` (+2: SEC1 key served over TLS, PEM helper), unit tests in `ffi/src/handles.rs` (6) and `ffi/src/lib.rs` (6); CI green
+- [ ] Still open: PKCS#1 test (rcgen/ring cannot generate RSA; needs a fixed PEM fixture); GUI/Kotlin do not handle `Busy` explicitly
 
 ### Phase 22: CI gates (DEC-023)
 
@@ -68,7 +82,7 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] **`routes` stores `(String, u16)`**; `getaddrinfo` no longer runs on the tunnel event-loop
 - [x] Resolution moved entirely into the stream worker / relay pool
 - [x] Tests: `server/tests/egress_policy.rs`, `egress_tests.rs`, `accept_loop::unresolvable_target_does_not_stall_the_session`
-- [ ] **Gates not run** — no Rust toolchain in the sandbox
+- [x] Gates green in CI (were not run when this phase was written)
 - [ ] Still open: per-IP rate limiting; DNS cache; IPv6 dial targets (still IPv4-only)
 
 ### Phase 20: Transport authenticity & host hygiene (DEC-016..DEC-020)
@@ -83,11 +97,11 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] Replay window semantics documented: `seen` = duplicates, distance = too old, anchor moves for accepted out-of-order frames
 - [x] Client: rejected DATAGRAM is logged and the flow kept (UDP is lossy; was a propagated error)
 - [x] **`ensure_linux_wan_tuning` → `warn_if_wan_tuning_missing`**: the library no longer writes `/proc/sys`
-- [x] **FFI `HANDLES` lock not held across network I/O** (`take_client` / `return_client`)
+- [x] **FFI handle lock not held across network I/O** (DEC-019; take/return mechanics replaced by `Busy` slots in DEC-024)
 - [x] Tests: `frame/tests/header_auth.rs` (5), `mux/tests/replay_window.rs` (8), `mux/tests/nonce_generation.rs` (8)
 - [x] **Retransmitted OPEN is idempotent** (`MuxManager::generation` gate in `accept.rs`): a duplicate OPEN no longer resets the live flow, its replay window or its relay (DEC-020)
-- [ ] **Gates not run** — no Rust toolchain in the sandbox
-- [ ] Still open: per-IP rate limiting; FFI per-handle lock (narrow free-vs-call window); delayed-frame attack past the replay window
+- [x] Gates green in CI (were not run when this phase was written)
+- [ ] Still open: per-IP rate limiting; delayed-frame attack past the replay window (the free-vs-call window is closed by DEC-024)
 
 ### Phase 19: Server resilience (DEC-015)
 
@@ -101,7 +115,7 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] `server.max_streams` finally applied (`MuxManager::set_max`)
 - [x] `RelayPool`: no `active` underflow on fast workers, panicked jobs refund their slot
 - [x] Tests: `tests/resilience.rs` (6), `relay_pool.rs` (+2), `session_handshake.rs` (+2), `config_schema.rs` (+1)
-- [ ] **Gates not run** — no Rust toolchain in the sandbox
+- [x] Gates green in CI (were not run when this phase was written)
 - [ ] Still open: per-IP rate limiting, TLS-handshake-completion accounting
 
 ### Phase 18: Protocol v2 — AEAD nonce uniqueness (DEC-014)
@@ -115,7 +129,7 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] `PROTOCOL_VERSION = 2`; v1 peers refused at the preface byte
 - [x] Guards: `protocol_version_matches_crypto_copy`, pinned v2 header bytes + nonce layout
 - [x] Tests: `crates/aetherlink-mux/tests/nonce_generation.rs` (8), codec (3), golden (1)
-- [ ] **Gates not run** (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`) — no toolchain in the sandbox
+- [x] Gates green in CI (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`)
 - [ ] Live re-test against the VPS after both sides are rebuilt
 
 ### Phase 17: Windows GUI endpoint profiles
@@ -130,32 +144,40 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 - [x] Docs: `docs/WINDOWS_GUI.md` (usage, YAML, limitations, TDD log), DEC-013
 - [ ] Live acceptance matrix (`PLAN_ENDPOINTS_WINDOWS.md` §5): needs admin + real VPS/PSK
 
-### Crate Compilation Status
-| Crate | Compiles | Tests Pass |
-|-------|----------|------------|
-| aetherlink-crypto | ✅ | ✅ 33 |
-| aetherlink-frame | ✅ | ✅ 19 |
-| aetherlink-mux | ✅ | ✅ 6 + 8 |
-| aetherlink-netstack | ✅ | ✅ 1 + 11 + 6 + 4 |
-| aetherlink-core | ✅ | ✅ 3 + 4 + 4 |
-| aetherlink-server | ✅ | ✅ 4 + 5 + 1 + 1 + 8 + 4 |
-| aetherlink-client | ✅ | ✅ 8 + 1 + 3 + 6 + 4 + 2 + 13 + 10 |
-| aetherlink-ffi | ✅ | ✅ 3 + 5 + 5 (+cdylib) |
-| aetherlink-protocol | ✅ | ✅ 6 + 5 |
+### Tests per crate
+
+Static count of `#[test]` functions (unit + integration, including
+platform-gated ones), 2026-11-25. All crates compile and their suites are
+green in CI on Linux and Windows; exact per-run totals live in the CI logs.
+
+| Crate | `#[test]` |
+|-------|----------:|
+| aetherlink-protocol | 13 |
+| aetherlink-crypto | 33 |
+| aetherlink-frame | 24 |
+| aetherlink-mux | 32 |
+| aetherlink-netstack | 35 |
+| aetherlink-core | 17 |
+| aetherlink-server | 102 |
+| aetherlink-client | 115 |
+| aetherlink-ffi | 38 |
+| **Total** | **409** |
+
+.NET GUI suite: 49 tests (`dotnet test`, DEC-023).
 
 ## DoD Checklist (from AGENT_INSTRUCTIONS.md)
 
 | Item | Description | Status |
 |------|-------------|--------|
 | 1 | Single Rust core; no protocol stack in C#/Kotlin | ✅ (`check_thin_hosts.ps1`) |
-| 2 | FFI up/down/server works | 🔄 (contract smoke green; live wiring needs privs) |
-| 3 | TCP+UDP through tunnel (netstack) | 🔄 (mux+pump green; socket pump + live need privs) |
+| 2 | FFI up/down/server works | ✅ (C ABI/JNI tested; Windows client and server used live via FFI) |
+| 3 | TCP+UDP through tunnel (netstack) | 🔄 (live DNS+TCP+HTTP vs VPS on Windows; upload speed open, §0m) |
 | 4 | DNS when up only through tunnel (no leak test) | 🔄 (policy green; live capture pending privs) |
 | 5 | Domain direct: resolve via tunnel, connect direct | 🔄 (engine green; live pending privs) |
-| 6 | Wintun path Windows (like v2rayN) | 🔄 (crate 0.5.1 open path green; live session pending privs) |
-| 7 | Linux TUN full tunnel + rollback | 🔄 (planner green; live pending privs) |
+| 6 | Wintun path Windows (like v2rayN) | ✅ (wintun 0.5.1; live session and traffic vs VPS proven) |
+| 7 | Linux TUN full tunnel + rollback | ❌ (route/DNS planner exists; `/dev/net/tun` open not implemented) |
 | 8 | .NET hosts self-contained win/linux | ✅ (both build 0/0) |
-| 9 | Android+TV split default all | 🔄 (APK builds; on-device pending) |
+| 9 | Android+TV split default all | 🔄 (core plans all split modes; APK builds; Kotlin host not wired) |
 | 10 | G2 static fallback | ✅ (decision + accept-loop tested) |
 | 11 | force_cleanup restores network+DNS | 🔄 (idempotent core green; live pending privs) |
 | 12 | DEPLOY_LINUX/WINDOWS (personal, from scratch) | ✅ (install/uninstall + checks green) |
@@ -166,17 +188,24 @@ _Last Updated: 2026-11-23 (Protocol v2 `generation` (DEC-014) + server resilienc
 
 1. **Live TUN tests** — need Linux root/CAP_NET_ADMIN or Windows admin
    (run manually per PLAN_FINAL_TDD.md D5/G3)
-2. **On-device Android test** — APK assembles; needs phone/TV for VpnService run
-3. **Gradle JVM** — must run under Java 21 (Rider JBR); Gradle 8.10 refuses
+2. **Android host not wired** — APK assembles, but the Kotlin host is a skeleton
+   (`docs/ANDROID.md` «Текущие ограничения»); on-device testing comes after
+   PLAN_ANDROID Phase 2+
+3. **Linux desktop client** — TUN open not implemented; the client runs on Windows only
+4. **Gradle JVM** — must run under Java 21 (Rider JBR); Gradle 8.10 refuses
    Java 25 from the new Studio bundle
-4. **Windows GUI endpoint acceptance** — 49/49 unit tests and gates green, but
+5. **Windows GUI endpoint acceptance** — 49/49 unit tests and gates green, but
    live `Down → Up` switching, stale-state restore after kill, and PSK-free
    logs were not exercised on real servers; requires admin + VPS credentials
    (`docs/WINDOWS_GUI.md` §Ручная приёмка)
 
 ## Next Steps
 
-1. Live traffic proof: сквозной HTTP через туннель против VPS (DNS уже ходит в обе стороны; текущий фронт — задержки серийного event-loop сервера).
-2. Streaming relay (полный дуплекс TCP вместо запрос-ответ) — после пруфа.
-3. Phase T: TLS-fidelity hardening (DEC-012) — после рабочего трафика.
-4. Phase I6: полный live E2E чек-лист (kill -9, DNS no-leak, domain-direct).
+1. Живой замер аплоада после фикса управления потоком (§0m в `docs/LIVE_ISSUES.md`).
+2. Android: довести Kotlin-хост (PLAN_ANDROID Phase 2+: Activity, настоящий handle,
+   поток `clientConnect` → `clientAttachTun`, `prepare`/`startForeground`).
+3. Phase I6: полный live E2E чек-лист (kill -9, DNS no-leak захватом, domain-direct;
+   `docs/LIVE_W4.md`).
+4. Dead-peer детекция: эхо-Ping на сервере, `keepalive_s` из конфига.
+5. Linux TUN для десктоп-клиента.
+6. Phase T: TLS-fidelity hardening (DEC-012).

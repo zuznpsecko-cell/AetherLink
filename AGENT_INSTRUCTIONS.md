@@ -164,7 +164,7 @@ Android: JNI bridge thin.
 4. Протокол (Rust only)
 4.1 TLS
 TLS 1.3 only в core (rustls).
-ALPN h2,http/1.1.
+ALPN: клиент предлагает h2,http/1.1; сервер — только http/1.1 (fallback отвечает HTTP/1.1, DEC-007 amendment).
 ECH deferred ok.
 4.2 AUTH
 text
