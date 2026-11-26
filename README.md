@@ -8,7 +8,7 @@ VPN with userspace netstack. Single Rust core + thin FFI hosts (.NET/Android).
 |-----------|---------|-------|---------|
 | Server (`AetherLink.Server`) | ✅ runs | ✅ runs (systemd, `docs/DEPLOY_UBUNTU.md`) | — |
 | Desktop client (CLI + GUI) | ✅ runs (Wintun, live-tested against a VPS) | ❌ not yet: `/dev/net/tun` open is not implemented | — |
-| Android client | — | — | 🔄 core + JNI ready; Kotlin host is a skeleton, no tunnel on a device yet |
+| Android client | — | — | 🔄 core + Kotlin host wired end to end, CI-built APK; not yet run on a device |
 
 ## Run (server + client)
 
@@ -45,13 +45,14 @@ old single-server configs migrate to a `default` profile. Logs:
 
 ## Android client
 
-**Status: Rust side ready, Kotlin host is a skeleton.** The core already plans
-the Android interface, split tunneling, `VpnService.protect()`-ed connect and
-TUN attach, all exported over JNI. The Kotlin app has no Activity yet, passes
-handle `0` and calls the desktop path, so it does not tunnel. Target design
-(PLAN_ANDROID Phase 3+): two screens, server settings + Connect and an app
-picker (empty list = all apps in the tunnel, non-empty = allowlist). Thin host:
-no crypto or frame parsing in Kotlin.
+**Status: wired end to end, not yet run on a device.** The core plans the
+Android interface and split tunneling, connects with the socket
+`VpnService.protect()`-ed through a JNI callback, and pumps the detached
+`establish()` fd. The app has two screens: server settings + Connect/status,
+and an app picker (empty list = all apps in the tunnel, non-empty =
+allowlist). The VPN runs as a foreground service; a dead pump tears the
+tunnel down instead of black-holing traffic. Thin host: no crypto or frame
+parsing in Kotlin.
 
 ```powershell
 .\scripts\build_android.ps1        # cargo-ndk for 3 ABIs + assembleDebug
@@ -135,8 +136,8 @@ Hosts (.NET, Kotlin) talk to `aetherlink_core` through a C ABI
   forward secrecy or compartmentalisation (DEC-014 non-goals).
 - **`kill_switch` and `restore_on_exit` are parsed but not enforced** by the
   core; the GUI hosts the YAML keys, the tunnel does not act on them.
-- **Android host is not wired end-to-end** (`AetherVpnService` passes handle 0;
-  `clientConnect`/`clientAttachTun` are not called from Kotlin; no Activity).
+- **Android is not proven on a device**: CI builds the APK and runs the L1
+  suite, the live tunnel still needs a manual run (`docs/ANDROID.md`).
 - **Egress policy is address-based, not a full allowlist.** `deny_private`
   (default on) keeps the server off loopback, LAN, link-local and cloud
   metadata; `allow`/`deny` CIDRs cover the exceptions. It does not restrict
@@ -162,8 +163,9 @@ CI (`.github/workflows/ci.yml`) runs, cheapest first: `cargo fmt --all --check`,
 (Linux **and** Windows), `dotnet test` for the GUI suite, the contract scripts
 and a `cargo audit` report. Rationale and the measured before/after: DEC-023.
 All of these are green on `main` and block PRs; `cargo audit` is advisory.
-Not covered by CI: the Android build (no NDK/SDK in the runner) and anything
-live (TUN, a real VPS).
+The `android` job builds the core for 3 ABIs with the runner's NDK, runs the
+Kotlin L1 suite and uploads the debug APK. Not covered by CI: anything live
+(TUN, a real VPS, a device).
 
 Locally: `cargo fmt --all`, `cargo clippy --workspace --all-targets`,
 `scripts/check_thin_hosts.ps1`, `scripts/check_gui_endpoints.ps1`,

@@ -92,14 +92,6 @@ fn checkout_failed(op: &str, err: CheckoutError) -> c_int {
     }
 }
 
-/// Bare FFI code for a failed checkout (JNI paths that set no error text).
-pub(crate) fn handles_code(err: CheckoutError) -> c_int {
-    match err {
-        CheckoutError::Invalid => AetherError::InvalidHandle as c_int,
-        CheckoutError::Busy => AetherError::Busy as c_int,
-    }
-}
-
 /// Drop host-side staging for a handle that is gone for good.
 pub(crate) fn forget_staged(handle: usize) {
     crate::jni::unstage(handle);
@@ -116,7 +108,9 @@ unsafe fn write_out(json: &str, out: *mut c_char, out_len: usize) -> c_int {
         return AetherError::InvalidArgument as c_int;
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(json.as_ptr(), out as *mut u8, json.len());
+        // `.cast()`, not `as *mut u8`: `c_char` is `i8` on x86 but `u8` on
+        // aarch64/armv7 Android, where the `as` form trips `unnecessary_cast`.
+        std::ptr::copy_nonoverlapping(json.as_ptr(), out.cast::<u8>(), json.len());
         *out.add(json.len()) = 0; // null terminator
     }
     AetherError::Success as c_int

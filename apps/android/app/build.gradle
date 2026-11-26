@@ -45,6 +45,10 @@ android {
 }
 
 dependencies {
+    // ComponentActivity + activity-result API (VPN consent, notification
+    // permission). Views are plain android.widget: no AppCompat/Compose.
+    implementation 'androidx.activity:activity-ktx:1.9.3'
+
     // L1 (JVM/Robolectric) harness. Robolectric 4.14.x covers SDK 26..35.
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.robolectric:robolectric:4.14.1'

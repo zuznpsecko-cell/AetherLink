@@ -7,14 +7,15 @@ _Last Updated: 2026-11-25 (сверка документации с кодом �
 - **Гейты зелёные на `main`.** Каждый PR блокирующе проходит `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace` на Linux
   **и** Windows, `dotnet test` GUI, сборку .NET-хостов и контрактные скрипты (DEC-023).
-  Не гейтятся: сборка Android (нет NDK/SDK в раннере) и всё живое (TUN, VPS).
+  Android-job собирает `.so` под 3 ABI, гоняет Kotlin L1 (Robolectric) и собирает APK;
+  `check_android_host.ps1` в контрактах. Не гейтится всё живое (TUN, VPS, устройство).
 - **Живьём против VPS туннель работает** (Windows-клиент): DNS + TCP + HTTP, egress = VPS
   (`docs/LIVE_ISSUES.md`, §0). Открыт аплоад (§0m): фикс управления потоком в `main`,
   живой замер после него не делался.
 - **Протокол v2** (DEC-014, DEC-016): ломающее изменение, клиент и сервер обновляются
   вместе; v1-пир получает отказ на байте preface.
 - **Платформы:** сервер — Linux/Windows; десктоп-клиент — **только Windows** (Linux TUN
-  не реализован); Android — Rust-часть готова, Kotlin-хост каркас (`docs/ANDROID.md`).
+  не реализован); Android — Rust-часть и Kotlin-хост готовы, на устройстве не проверено (`docs/ANDROID.md`).
 - Решения: DEC-001…DEC-024 в `docs/DECISIONS.md`.
 
 ## Overview
@@ -37,7 +38,7 @@ _Last Updated: 2026-11-25 (сверка документации с кодом �
 | **Phase 11: Testing + Docs** | 🔄 Partial | PLAN_FINAL_TDD.md is the live plan; DoD checklist below |
 | **Phase 12: Windows Wintun** | ✅ Done | Version pinned, host load path + deploy note; session bring-up and live up/down proven (LIVE_W4, live tunnel vs VPS) |
 | **Phase 13: .NET Hosts** | ✅ Done | Server/Client build 0/0, thin (grep-enforced), status cmd, quickstart scripts |
-| **Phase 14: Android** | 🔄 Partial | Rust side done (plan/split/protect/attach/cleanup, JNI). APK assembles with 3 ABIs, but the Kotlin host is a skeleton (handle 0, no Activity, Android flow not called) — no tunnel on a device yet |
+| **Phase 14: Android** | 🔄 Partial | Rust side + Kotlin host done: Activity, app picker, foreground VpnService, `clientConnect` with `VpnService.protect()` → `establish()` → `clientAttachTun`, pump health polling; CI builds the APK and runs L1. Not yet run on a device (L2) |
 | **Phase 15: Deploy Scripts** | ✅ Done | install/uninstall from dist + example configs + checks |
 | **Phase 16: Final Integration** | 🔄 Partial | E2E over localhost green; live tunnel vs VPS on Windows proven; full live runbook (I6) pending |
 | **Phase 17: GUI endpoint profiles** | ✅ Done (code) | `client.endpoints` + mirror, 49/49 .NET tests, `check_gui_endpoints.ps1`; live switching matrix pending admin/VPS |
@@ -73,7 +74,7 @@ _Last Updated: 2026-11-25 (сверка документации с кодом �
 - [x] `dotnet test` for the GUI suite in CI (49 passed) — never ran before
 - [x] Contract scripts (`check_thin_hosts`, `check_gui_endpoints`, `check_quickstart`)
 - [x] `cargo audit` — advisory (loud), blocking once the report is clean
-- [ ] Still open: Android build gate (needs NDK/SDK in the runner)
+- [x] Android gate: `.so` for 3 ABIs (runner NDK), clippy for the Android target, Kotlin L1, APK artifact; `check_android_host.ps1`
 
 ### Phase 21: Egress control & loop hygiene (DEC-021..DEC-022)
 
@@ -177,7 +178,7 @@ green in CI on Linux and Windows; exact per-run totals live in the CI logs.
 | 6 | Wintun path Windows (like v2rayN) | ✅ (wintun 0.5.1; live session and traffic vs VPS proven) |
 | 7 | Linux TUN full tunnel + rollback | ❌ (route/DNS planner exists; `/dev/net/tun` open not implemented) |
 | 8 | .NET hosts self-contained win/linux | ✅ (both build 0/0) |
-| 9 | Android+TV split default all | 🔄 (core plans all split modes; APK builds; Kotlin host not wired) |
+| 9 | Android+TV split default all | 🔄 (core + host: all/allow from the picker; device check pending) |
 | 10 | G2 static fallback | ✅ (decision + accept-loop tested) |
 | 11 | force_cleanup restores network+DNS | 🔄 (idempotent core green; live pending privs) |
 | 12 | DEPLOY_LINUX/WINDOWS (personal, from scratch) | ✅ (install/uninstall + checks green) |
@@ -188,9 +189,9 @@ green in CI on Linux and Windows; exact per-run totals live in the CI logs.
 
 1. **Live TUN tests** — need Linux root/CAP_NET_ADMIN or Windows admin
    (run manually per PLAN_FINAL_TDD.md D5/G3)
-2. **Android host not wired** — APK assembles, but the Kotlin host is a skeleton
-   (`docs/ANDROID.md` «Текущие ограничения»); on-device testing comes after
-   PLAN_ANDROID Phase 2+
+2. **Android not proven on a device** — host is wired end to end and CI-built,
+   but the live tunnel (L2) needs a phone/emulator and a server
+   (`docs/ANDROID.md` «Проверка на устройстве»)
 3. **Linux desktop client** — TUN open not implemented; the client runs on Windows only
 4. **Gradle JVM** — must run under Java 21 (Rider JBR); Gradle 8.10 refuses
    Java 25 from the new Studio bundle
@@ -202,8 +203,8 @@ green in CI on Linux and Windows; exact per-run totals live in the CI logs.
 ## Next Steps
 
 1. Живой замер аплоада после фикса управления потоком (§0m в `docs/LIVE_ISSUES.md`).
-2. Android: довести Kotlin-хост (PLAN_ANDROID Phase 2+: Activity, настоящий handle,
-   поток `clientConnect` → `clientAttachTun`, `prepare`/`startForeground`).
+2. Android: проверка на устройстве (L2, `docs/ANDROID.md` «Проверка на устройстве»);
+   затем автопереподключение при смене сети.
 3. Phase I6: полный live E2E чек-лист (kill -9, DNS no-leak захватом, domain-direct;
    `docs/LIVE_W4.md`).
 4. Dead-peer детекция: эхо-Ping на сервере, `keepalive_s` из конфига.

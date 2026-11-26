@@ -77,7 +77,7 @@ Check "gui has no crypto stack" ($guiCrypto.Count -eq 0)
 
 # --- Android: VpnService fd -> core, split default all, no crypto in Kotlin ---
 Check "vpn establishes Builder" (Has-Text $vpnService "Builder")
-Check "vpn passes tun fd to core" (Has-Text $vpnService "setTunFd|SetTunFd|tunFd")
+Check "vpn passes tun fd to core" (Has-Text $vpnService "clientAttachTun\(")
 Check "split default all" (Has-Text $vpnService "MODE_ALL|mode.*all")
 Check "kotlin has no javax.crypto" (No-Text $vpnService "javax\.crypto")
 Check "kotlin has no javax.crypto (bridge)" (No-Text $jniBridge "javax\.crypto")
@@ -97,7 +97,7 @@ if ($SkipArtifacts) {
     $nm = "$sdkRoot/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
     if (Test-Path -LiteralPath $nm) {
         $syms = & $nm -D --defined-only --format=posix "$jniLibs/arm64-v8a/libaetherlink_core.so" 2>$null
-        foreach ($sym in @("clientCreate", "clientUp", "clientDown", "setTunFd", "setSplitConfig", "forceCleanup")) {
+        foreach ($sym in @("clientCreate", "clientPlan", "clientConnect", "clientAttachTun", "clientStatus", "clientDisconnect", "clientFree", "lastError", "forceCleanup")) {
             Check "jni symbol Java_link_aether_client_AetherCore_$sym" ($syms -match "Java_link_aether_client_AetherCore_$sym")
         }
     } else {

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AetherLink Android UI strings (Russian UI). -->
+<resources>
+    <string name="app_name">AetherLink</string>
+    <string name="title_apps">Приложения</string>
+
+    <string name="hint_server">Сервер (host или host:port)</string>
+    <string name="hint_sni">SNI (необязательно)</string>
+    <string name="hint_psk">PSK</string>
+    <string name="hint_ca">CA сертификат PEM (необязательно)</string>
+    <string name="hint_search">Поиск</string>
+
+    <string name="action_connect">Подключить</string>
+    <string name="action_disconnect">Отключить</string>
+
+    <string name="apps_all">Приложения: все</string>
+    <string name="apps_selected">Приложения: выбрано %1$d</string>
+    <string name="apps_all_hint">Ничего не выбрано: через туннель идут все приложения</string>
+    <string name="apps_reset">Все приложения</string>
+    <string name="apps_loading">Загрузка списка…</string>
+    <string name="app_row">%1$s\n%2$s</string>
+
+    <string name="state_idle">Отключено</string>
+    <string name="state_connecting">Подключение…</string>
+    <string name="state_connected">Подключено</string>
+    <string name="state_disconnecting">Отключение…</string>
+    <string name="state_failed">Ошибка</string>
+    <string name="state_revoked">VPN отключён системой или другим VPN</string>
+    <string name="state_bad_settings">Настройки неполные: %1$s</string>
+    <string name="state_tunnel_lost">Туннель оборвался: %1$s</string>
+
+    <string name="scope_all_apps">все приложения</string>
+    <string name="scope_some_apps">выбранные приложения</string>
+    <string name="skipped_apps">Не установлены: %1$s</string>
+
+    <string name="problem_server_missing">укажите сервер</string>
+    <string name="problem_server_invalid">адрес сервера: host или host:port</string>
+    <string name="problem_psk_missing">укажите PSK</string>
+    <string name="problem_ca_invalid">CA должен быть PEM (BEGIN CERTIFICATE)</string>
+
+    <string name="consent_denied">Без разрешения на VPN подключиться нельзя</string>
+
+    <string name="channel_name">VPN</string>
+    <string name="notif_connecting">Подключение…</string>
+    <string name="notif_connected">Подключено к %1$s</string>
+</resources>
