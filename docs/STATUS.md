@@ -73,7 +73,7 @@ _Last Updated: 2026-11-26 (DEC-025: dead-peer, PSK floor, NonceCache, `--locked`
 - [x] PSK minimum 16 bytes at config parse (client + server)
 - [x] `NonceCache`: O(1) `HashSet` + ordered queue, poison-tolerant lock
 - [x] PKCS#1 RSA key regression test (committed throwaway fixture)
-- [ ] Not yet run: authored without a local toolchain — CI is the first run
+- [x] CI green on PR #22 (fmt, clippy, Rust tests Linux+Windows, .NET GUI suite, Android .so/clippy/Kotlin L1, contracts); live dead-peer check on a VPS still pending
 
 ### Phase 22: CI gates (DEC-023)
 

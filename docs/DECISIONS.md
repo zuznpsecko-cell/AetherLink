@@ -1148,7 +1148,7 @@ Review follow-ups, each small, each a real gap:
 
 ### Tests
 - Lock: reconciled by inspection (no cargo in the authoring sandbox); the
-  `--locked` gates are the check.
+  `--locked` gates accept it (CI green on PR #22).
 - `crates/aetherlink-server/tests/e2e_tunnel.rs`: zero-length and 16-byte
   PINGs are echoed verbatim and the session keeps working.
 - `crates/aetherlink-client/tests/pump.rs`: a PING echo is accepted without
