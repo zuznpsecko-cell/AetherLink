@@ -74,6 +74,7 @@ _Last Updated: 2026-11-26 (DEC-025: dead-peer, PSK floor, NonceCache, `--locked`
 - [x] `NonceCache`: O(1) `HashSet` + ordered queue, poison-tolerant lock
 - [x] PKCS#1 RSA key regression test (committed throwaway fixture)
 - [x] CI green on PR #22 (fmt, clippy, Rust tests Linux+Windows, .NET GUI suite, Android .so/clippy/Kotlin L1, contracts); live dead-peer check on a VPS still pending
+- [x] Host forms enforce the 16-byte PSK floor before connecting (Windows GUI `EndpointRules`, Android `ConfigCodec`)
 
 ### Phase 22: CI gates (DEC-023)
 

@@ -11,7 +11,7 @@ public sealed class EndpointSwitcherTests
         Name = name,
         ServerAddr = "backup.example.com:443",
         OuterSni = "backup.example.com",
-        Psk = "psk",
+        Psk = "psk-0123456789abcdef",
     };
 
     [Fact]

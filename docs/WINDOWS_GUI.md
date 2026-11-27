@@ -114,7 +114,7 @@ routing: { ... }       # общее для всех профилей
 | `name` | trim, 1..64, уникален без учёта регистра | `endpoint name is empty`, `endpoint name 'x' is used twice` |
 | `server_addr` | `host:port`, порт 1..65535 | `endpoint 'x': server address must be host:port` |
 | `outer_sni` | может быть пустым → host адреса | — |
-| `psk` | непустой (ядро дополнительно требует ≥ 16 байт: `psk too short` при подключении, DEC-025) | `endpoint 'x': PSK is empty` |
+| `psk` | непустой, ≥ 16 байт UTF-8 (как в ядре, DEC-025) | `endpoint 'x': PSK is empty`, `endpoint 'x': PSK is too short (min 16 bytes)` |
 | список | ≥ 1 профиля | `add at least one endpoint` |
 
 Ошибка показывается как `config error: <текст>`; native при этом не

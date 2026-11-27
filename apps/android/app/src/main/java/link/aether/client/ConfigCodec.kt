@@ -18,7 +18,7 @@ data class ClientSettings(
             "caPem=${caPem.length} chars, allowedApps=$allowedApps)"
 }
 
-enum class SettingsProblem { SERVER_MISSING, SERVER_INVALID, PSK_MISSING, CA_INVALID }
+enum class SettingsProblem { SERVER_MISSING, SERVER_INVALID, PSK_MISSING, PSK_TOO_SHORT, CA_INVALID }
 
 /**
  * Settings -> the JSON document `clientCreate` accepts (the §8 client
@@ -27,6 +27,13 @@ enum class SettingsProblem { SERVER_MISSING, SERVER_INVALID, PSK_MISSING, CA_INV
  */
 object ConfigCodec {
     const val DEFAULT_PORT = 443
+
+    /**
+     * Shortest PSK the core accepts, in UTF-8 bytes — what HMAC/HKDF consume
+     * (`aetherlink_crypto::MIN_PSK_LEN`, DEC-025). Checked here so the form
+     * shows the problem instead of a failed connect.
+     */
+    const val MIN_PSK_BYTES = 16
 
     private val HOST_PORT = Regex("""^([A-Za-z0-9.\-]+):(\d{1,5})$""")
     private val HOST_ONLY = Regex("""^[A-Za-z0-9.\-]+$""")
@@ -50,7 +57,12 @@ object ConfigCodec {
             settings.server.isBlank() -> problems += SettingsProblem.SERVER_MISSING
             normalizeServer(settings.server) == null -> problems += SettingsProblem.SERVER_INVALID
         }
-        if (settings.psk.isEmpty()) problems += SettingsProblem.PSK_MISSING
+        when {
+            settings.psk.isEmpty() -> problems += SettingsProblem.PSK_MISSING
+            // Counted as the core sees it: the value is sent verbatim.
+            settings.psk.toByteArray(Charsets.UTF_8).size < MIN_PSK_BYTES ->
+                problems += SettingsProblem.PSK_TOO_SHORT
+        }
         if (settings.caPem.isNotBlank() && !settings.caPem.contains(CERT_BEGIN)) {
             problems += SettingsProblem.CA_INVALID
         }

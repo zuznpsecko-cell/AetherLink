@@ -36,6 +36,7 @@
     <string name="problem_server_missing">укажите сервер</string>
     <string name="problem_server_invalid">адрес сервера: host или host:port</string>
     <string name="problem_psk_missing">укажите PSK</string>
+    <string name="problem_psk_too_short">PSK короче 16 байт — возьмите ключ с сервера</string>
     <string name="problem_ca_invalid">CA должен быть PEM (BEGIN CERTIFICATE)</string>
 
     <string name="consent_denied">Без разрешения на VPN подключиться нельзя</string>

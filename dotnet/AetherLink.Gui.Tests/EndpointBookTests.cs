@@ -7,7 +7,7 @@ namespace AetherLink.Gui.Tests;
 public sealed class EndpointBookTests
 {
     private static EndpointProfile Profile(string name, string addr = "example.com:443")
-        => new() { Name = name, ServerAddr = addr, OuterSni = "example.com", Psk = "psk" };
+        => new() { Name = name, ServerAddr = addr, OuterSni = "example.com", Psk = "psk-0123456789abcdef" };
 
     [Fact]
     public void EmptyBook_RequiresAtLeastOneEndpoint()
@@ -43,7 +43,7 @@ public sealed class EndpointBookTests
         Assert.Equal("home (copy 2)", copy2.Name);
         Assert.Equal("example.com:443", copy.ServerAddr);
         Assert.Equal("example.com", copy.OuterSni);
-        Assert.Equal("psk", copy.Psk);
+        Assert.Equal("psk-0123456789abcdef", copy.Psk);
         Assert.Same(copy2, book.Active);
         Assert.Equal(3, book.Items.Count);
     }
