@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using AetherLink.Gui.Models;
 
 namespace AetherLink.Gui.Services;
@@ -11,6 +12,13 @@ namespace AetherLink.Gui.Services;
 public static class EndpointRules
 {
     public const int MaxNameLength = 64;
+
+    /// <summary>
+    /// Shortest PSK the core accepts, in UTF-8 bytes — what HMAC/HKDF consume
+    /// (aetherlink_crypto::MIN_PSK_LEN, DEC-025). Checked here so the user sees
+    /// the problem in the form instead of a failed connect.
+    /// </summary>
+    public const int MinPskBytes = 16;
 
     /// <summary>Null when valid, otherwise a user-facing message.</summary>
     public static string? Validate(EndpointProfile endpoint, IEnumerable<EndpointProfile> all)
@@ -34,6 +42,12 @@ public static class EndpointRules
         if (string.IsNullOrWhiteSpace(endpoint.Psk))
         {
             return $"endpoint '{name}': PSK is empty";
+        }
+
+        // Counted as the core will see it: the value is written verbatim.
+        if (Encoding.UTF8.GetByteCount(endpoint.Psk) < MinPskBytes)
+        {
+            return $"endpoint '{name}': PSK is too short (min {MinPskBytes} bytes)";
         }
 
         foreach (var other in all)

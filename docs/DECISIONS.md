@@ -1137,9 +1137,11 @@ Review follow-ups, each small, each a real gap:
 
 ### Consequences
 - Configs with a PSK under 16 bytes now fail to load (server: no start;
-  client: `aether_client_create` fails with "psk too short"). The GUI endpoint
-  editor and the Android form still only check "non-empty", so the user sees
-  the core's error on connect. The shipped examples (22 bytes) and
+  client: `aether_client_create` fails with "psk too short"). The Windows GUI
+  (`EndpointRules.MinPskBytes`) and the Android form
+  (`ConfigCodec.MIN_PSK_BYTES` → `PSK_TOO_SHORT`) check the same 16-byte
+  floor before calling native, so the user sees it in the form and nothing
+  connects. The shipped examples (22 bytes) and
   `openssl rand -base64 32` (44 bytes) pass.
 - Protocol compatibility both ways: an old client logs the server's echo as a
   dropped frame and carries on; a new client never times out a server that

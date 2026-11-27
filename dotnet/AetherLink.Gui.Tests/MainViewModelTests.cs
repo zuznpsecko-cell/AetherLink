@@ -14,14 +14,14 @@ public sealed class MainViewModelTests : IDisposable
             - name: home
               server_addr: home.example.com:443
               outer_sni: home.example.com
-              psk: psk-home
+              psk: psk-home-0123456789
             - name: backup
               server_addr: backup.example.com:8443
               outer_sni: backup.example.com
-              psk: psk-backup
+              psk: psk-backup-0123456789
           server_addr: home.example.com:443
           outer_sni: home.example.com
-          psk: psk-home
+          psk: psk-home-0123456789
         full_tunnel:
           enabled: true
         routing:
@@ -65,7 +65,7 @@ public sealed class MainViewModelTests : IDisposable
             egress: () => Task.FromResult("203.0.113.9"));
     }
 
-    private static void Fill(EndpointProfile endpoint, string name, string addr, string psk = "psk")
+    private static void Fill(EndpointProfile endpoint, string name, string addr, string psk = "psk-0123456789abcdef")
     {
         endpoint.Name = name;
         endpoint.ServerAddr = addr;
@@ -90,7 +90,7 @@ public sealed class MainViewModelTests : IDisposable
     {
         var vm = Create();
         vm.AddEndpointCommand.Execute(null);
-        Fill(vm.SelectedEndpoint!, "home", "home.example.com:443", "psk-home");
+        Fill(vm.SelectedEndpoint!, "home", "home.example.com:443", "psk-home-0123456789");
 
         await vm.ConnectDisconnectCommand.ExecuteAsync(null);
 
@@ -99,7 +99,7 @@ public sealed class MainViewModelTests : IDisposable
         var raw = call["up:home:".Length..];
         Assert.Contains("active_endpoint: home", raw);
         Assert.Contains("server_addr: home.example.com:443", raw);
-        Assert.Contains("psk: psk-home", raw);
+        Assert.Contains("psk: psk-home-0123456789", raw);
 
         var saved = ConfigService.Load(_path);
         var endpoint = Assert.Single(saved.Client.Endpoints);
@@ -122,6 +122,20 @@ public sealed class MainViewModelTests : IDisposable
 
         Assert.Empty(_tunnel.Calls);
         Assert.Contains("server address must be host:port", vm.LastError);
+    }
+
+    [Fact]
+    public async Task Connect_WithShortPsk_DoesNotCallNative()
+    {
+        var vm = Create();
+        vm.AddEndpointCommand.Execute(null);
+        Fill(vm.SelectedEndpoint!, "home", "home.example.com:443", "short-psk");
+        _tunnel.Calls.Clear();
+
+        await vm.ConnectDisconnectCommand.ExecuteAsync(null);
+
+        Assert.Empty(_tunnel.Calls);
+        Assert.Contains("PSK is too short", vm.LastError);
     }
 
     [Fact]
@@ -205,10 +219,10 @@ public sealed class MainViewModelTests : IDisposable
               endpoints:
                 - name: home
                   server_addr: home.example.com:443
-                  psk: psk-home
+                  psk: psk-home-0123456789
                 - name: HOME
                   server_addr: backup.example.com:443
-                  psk: psk-backup
+                  psk: psk-backup-0123456789
             """);
 
         await vm.ConnectDisconnectCommand.ExecuteAsync(null);
@@ -227,7 +241,7 @@ public sealed class MainViewModelTests : IDisposable
         Assert.Equal(3, vm.Endpoints.Count);
         Assert.Equal("home (copy)", vm.SelectedEndpoint!.Name);
         Assert.Equal("home.example.com:443", vm.SelectedEndpoint.ServerAddr);
-        Assert.Equal("psk-home", vm.SelectedEndpoint.Psk);
+        Assert.Equal("psk-home-0123456789", vm.SelectedEndpoint.Psk);
     }
 
     [Fact]
@@ -252,7 +266,7 @@ public sealed class MainViewModelTests : IDisposable
             client:
               server_addr: legacy.example.com:443
               outer_sni: legacy.example.com
-              psk: legacy-psk
+              psk: legacy-psk-0123456789
             """);
 
         var only = Assert.Single(vm.Endpoints);

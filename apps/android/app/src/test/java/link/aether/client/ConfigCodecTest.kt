@@ -35,18 +35,35 @@ class ConfigCodecTest {
         )
         assertEquals(
             listOf(SettingsProblem.SERVER_INVALID, SettingsProblem.CA_INVALID),
-            ConfigCodec.validate(ClientSettings(server = "a b", psk = "k", caPem = "garbage")),
+            ConfigCodec.validate(ClientSettings(server = "a b", psk = "psk-0123456789abcdef", caPem = "garbage")),
         )
-        assertTrue(ConfigCodec.validate(ClientSettings(server = "vpn.example.com", psk = "k")).isEmpty())
+        assertTrue(ConfigCodec.validate(ClientSettings(server = "vpn.example.com", psk = "psk-0123456789abcdef")).isEmpty())
+    }
+
+    @Test
+    fun shortPskIsReportedInUtf8Bytes() {
+        val server = "vpn.example.com"
+        val short = "k".repeat(ConfigCodec.MIN_PSK_BYTES - 1)
+        assertEquals(
+            listOf(SettingsProblem.PSK_TOO_SHORT),
+            ConfigCodec.validate(ClientSettings(server = server, psk = short)),
+        )
+        assertTrue(ConfigCodec.validate(ClientSettings(server = server, psk = "k".repeat(16))).isEmpty())
+        // 8 Cyrillic letters = 16 bytes (accepted); 7 = 14 bytes (rejected).
+        assertTrue(ConfigCodec.validate(ClientSettings(server = server, psk = "ж".repeat(8))).isEmpty())
+        assertEquals(
+            listOf(SettingsProblem.PSK_TOO_SHORT),
+            ConfigCodec.validate(ClientSettings(server = server, psk = "ж".repeat(7))),
+        )
     }
 
     @Test
     fun minimalSettingsBecomeAClientSectionWithSplitAll() {
-        val doc = JSONObject(ConfigCodec.toCoreJson(ClientSettings(server = "vpn.example.com", psk = "secret")))
+        val doc = JSONObject(ConfigCodec.toCoreJson(ClientSettings(server = "vpn.example.com", psk = "secret-0123456789")))
         val client = doc.getJSONObject("client")
 
         assertEquals("vpn.example.com:443", client.getString("server_addr"))
-        assertEquals("secret", client.getString("psk"))
+        assertEquals("secret-0123456789", client.getString("psk"))
         assertFalse(client.has("outer_sni"))
         assertFalse(client.has("tls"))
         val split = client.getJSONObject("android").getJSONObject("split")
@@ -59,7 +76,7 @@ class ConfigCodecTest {
         val settings = ClientSettings(
             server = "203.0.113.10:443",
             sni = "cdn.example.com",
-            psk = "secret",
+            psk = "secret-0123456789",
             caPem = pem,
             allowedApps = setOf("org.b", "org.a"),
         )
@@ -75,8 +92,8 @@ class ConfigCodecTest {
 
     @Test
     fun settingsNeverPrintThePsk() {
-        val text = ClientSettings(server = "s", psk = "hunter2").toString()
-        assertFalse(text, text.contains("hunter2"))
+        val text = ClientSettings(server = "s", psk = "hunter2-0123456789").toString()
+        assertFalse(text, text.contains("hunter2-0123456789"))
     }
 
     @Test

@@ -34,7 +34,7 @@ public sealed class ConfigServiceTests : IDisposable
     }
 
     private static EndpointProfile Endpoint(
-        string name, string addr, string sni = "", string psk = "psk")
+        string name, string addr, string sni = "", string psk = "psk-0123456789abcdef")
         => new() { Name = name, ServerAddr = addr, OuterSni = sni, Psk = psk };
 
     [Fact]
@@ -47,14 +47,14 @@ public sealed class ConfigServiceTests : IDisposable
                 - name: home
                   server_addr: home.example.com:443
                   outer_sni: home.example.com
-                  psk: psk-home
+                  psk: psk-home-0123456789
                 - name: backup
                   server_addr: backup.example.com:8443
                   outer_sni: backup.example.com
-                  psk: psk-backup
+                  psk: psk-backup-0123456789
               server_addr: home.example.com:443
               outer_sni: home.example.com
-              psk: psk-home
+              psk: psk-home-0123456789
             full_tunnel:
               enabled: true
             routing:
@@ -68,7 +68,7 @@ public sealed class ConfigServiceTests : IDisposable
         Assert.Equal("home", cfg.Client.Endpoints[0].Name);
         Assert.Equal("backup.example.com:8443", cfg.Client.Endpoints[1].ServerAddr);
         Assert.Equal("backup.example.com", cfg.Client.Endpoints[1].OuterSni);
-        Assert.Equal("psk-backup", cfg.Client.Endpoints[1].Psk);
+        Assert.Equal("psk-backup-0123456789", cfg.Client.Endpoints[1].Psk);
     }
 
     [Fact]
@@ -78,7 +78,7 @@ public sealed class ConfigServiceTests : IDisposable
             client:
               server_addr: legacy.example.com:443
               outer_sni: legacy.example.com
-              psk: legacy-psk
+              psk: legacy-psk-0123456789
             """);
 
         var cfg = ConfigService.Load(path);
@@ -87,7 +87,7 @@ public sealed class ConfigServiceTests : IDisposable
         Assert.Equal("default", only.Name);
         Assert.Equal("legacy.example.com:443", only.ServerAddr);
         Assert.Equal("legacy.example.com", only.OuterSni);
-        Assert.Equal("legacy-psk", only.Psk);
+        Assert.Equal("legacy-psk-0123456789", only.Psk);
         Assert.Equal("default", cfg.Client.ActiveEndpoint);
     }
 
@@ -100,7 +100,7 @@ public sealed class ConfigServiceTests : IDisposable
               endpoints: []
               server_addr: legacy.example.com:443
               outer_sni: legacy.example.com
-              psk: legacy-psk
+              psk: legacy-psk-0123456789
             """);
 
         var cfg = ConfigService.Load(path);
@@ -119,10 +119,10 @@ public sealed class ConfigServiceTests : IDisposable
               endpoints:
                 - name: home
                   server_addr: home.example.com:443
-                  psk: psk-home
+                  psk: psk-home-0123456789
                 - name: backup
                   server_addr: backup.example.com:443
-                  psk: psk-backup
+                  psk: psk-backup-0123456789
             """);
 
         var cfg = ConfigService.Load(path);
@@ -140,10 +140,10 @@ public sealed class ConfigServiceTests : IDisposable
                 - name: home
                   server_addr: home.example.com:443
                   outer_sni: home-sni.example.com
-                  psk: psk-home
+                  psk: psk-home-0123456789
               server_addr: stale.example.com:443
               outer_sni: stale.example.com
-              psk: stale-psk
+              psk: stale-psk-0123456789
             """);
 
         var cfg = ConfigService.Load(path);
@@ -151,7 +151,7 @@ public sealed class ConfigServiceTests : IDisposable
         var only = Assert.Single(cfg.Client.Endpoints);
         Assert.Equal("home.example.com:443", only.ServerAddr);
         Assert.Equal("home-sni.example.com", only.OuterSni);
-        Assert.Equal("psk-home", only.Psk);
+        Assert.Equal("psk-home-0123456789", only.Psk);
         Assert.Equal("home", cfg.Client.ActiveEndpoint);
     }
 
@@ -161,8 +161,8 @@ public sealed class ConfigServiceTests : IDisposable
         var cfg = new GuiClientConfig();
         cfg.Client.Endpoints = new List<EndpointProfile>
         {
-            Endpoint("home", "home.example.com:443", "home.example.com", "psk-home"),
-            Endpoint("backup", "backup.example.com:8443", "", "psk-backup"),
+            Endpoint("home", "home.example.com:443", "home.example.com", "psk-home-0123456789"),
+            Endpoint("backup", "backup.example.com:8443", "", "psk-backup-0123456789"),
         };
         cfg.Client.ActiveEndpoint = "backup";
         cfg.Client.PadMultiple = 64;
@@ -183,7 +183,7 @@ public sealed class ConfigServiceTests : IDisposable
         Assert.Equal("backup.example.com:8443", reloaded.Client.ServerAddr);
         // Empty SNI is mirrored as the host so core reads a usable SNI.
         Assert.Equal("backup.example.com", reloaded.Client.OuterSni);
-        Assert.Equal("psk-backup", reloaded.Client.Psk);
+        Assert.Equal("psk-backup-0123456789", reloaded.Client.Psk);
         Assert.Equal(64, reloaded.Client.PadMultiple);
         Assert.Equal(20, reloaded.Client.KeepaliveS);
         Assert.Equal("./custom.dll", reloaded.Client.WintunDllPath);
@@ -196,7 +196,7 @@ public sealed class ConfigServiceTests : IDisposable
         var cfg = new GuiClientConfig();
         cfg.Client.Endpoints = new List<EndpointProfile>
         {
-            Endpoint("home", "home.example.com:443", psk: "psk-home"),
+            Endpoint("home", "home.example.com:443", psk: "psk-home-0123456789"),
         };
         cfg.Client.ActiveEndpoint = "home";
         cfg.Routing.Rules.Add(new RouteRule

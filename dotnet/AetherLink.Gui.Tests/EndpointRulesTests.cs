@@ -10,7 +10,7 @@ public sealed class EndpointRulesTests
         string name = "home",
         string addr = "server.example.com:443",
         string sni = "server.example.com",
-        string psk = "secret")
+        string psk = "secret-0123456789")
         => new() { Name = name, ServerAddr = addr, OuterSni = sni, Psk = psk };
 
     [Fact]
@@ -61,6 +61,32 @@ public sealed class EndpointRulesTests
     {
         var p = Profile(psk: "   ");
         Assert.Equal("endpoint 'home': PSK is empty", EndpointRules.Validate(p, new[] { p }));
+    }
+
+    [Fact]
+    public void ShortPsk_IsRejected()
+    {
+        // One byte under the core's minimum: blocked before native is called.
+        var p = Profile(psk: new string('k', EndpointRules.MinPskBytes - 1));
+        Assert.Equal("endpoint 'home': PSK is too short (min 16 bytes)",
+            EndpointRules.Validate(p, new[] { p }));
+    }
+
+    [Fact]
+    public void MinimumLengthPsk_IsAccepted()
+    {
+        var p = Profile(psk: new string('k', EndpointRules.MinPskBytes));
+        Assert.Null(EndpointRules.Validate(p, new[] { p }));
+    }
+
+    [Fact]
+    public void PskLength_IsCountedInUtf8Bytes()
+    {
+        // 8 Cyrillic letters = 16 bytes (accepted); 7 = 14 bytes (rejected).
+        var ok = Profile(psk: new string('ж', 8));
+        var shortOne = Profile(psk: new string('ж', 7));
+        Assert.Null(EndpointRules.Validate(ok, new[] { ok }));
+        Assert.Contains("PSK is too short", EndpointRules.Validate(shortOne, new[] { shortOne }));
     }
 
     [Fact]

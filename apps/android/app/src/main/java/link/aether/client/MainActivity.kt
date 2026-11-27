@@ -135,6 +135,7 @@ class MainActivity : ComponentActivity() {
             SettingsProblem.SERVER_MISSING -> R.string.problem_server_missing
             SettingsProblem.SERVER_INVALID -> R.string.problem_server_invalid
             SettingsProblem.PSK_MISSING -> R.string.problem_psk_missing
+            SettingsProblem.PSK_TOO_SHORT -> R.string.problem_psk_too_short
             SettingsProblem.CA_INVALID -> R.string.problem_ca_invalid
         },
     )
